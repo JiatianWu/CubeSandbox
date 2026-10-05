@@ -16,9 +16,8 @@ from ._filesystem import Filesystem
 from ._models import Execution, ExecutionError, OutputMessage, Result, SandboxInfo, SnapshotInfo
 from ._policy import (
     Rule,
-    _normalize_rules_arg,
-    _serialize_rule,
-    _validate_allow_out_domains_require_deny_all,
+    _build_network_payload,
+    _build_network_update_body,
 )
 from ._pty import Pty
 from ._stream import _parse_line
@@ -190,6 +189,7 @@ class Sandbox:
         env_vars: Dict[str, str] | None = None,
         envs: Dict[str, str] | None = None,
         metadata: Dict[str, str] | None = None,
+        distribution_scope: list[str] | None = None,
         allow_internet_access: bool = True,
         network: Dict[str, Any] | None = None,
         lifecycle: Dict[str, Any] | None = None,
@@ -207,6 +207,8 @@ class Sandbox:
             envs: E2B-compatible alias for ``env_vars``. When both aliases are
                 provided, they must contain the same values.
             metadata: Arbitrary key-value metadata (e.g. network-policy, host-mount).
+            distribution_scope: Compute node IDs or host IPs eligible to run the
+                sandbox. Pass a single entry to pin the sandbox to one node.
             allow_internet_access: When ``False``, the sandbox is blocked from
                 making outbound traffic to the public internet.
             network: Egress network policy. Accepts keys:
@@ -237,14 +239,21 @@ class Sandbox:
                 are killed).
             volume_mounts: Optional dict mapping mount paths to volumes
                 (e2b-compatible). Key is the sandbox mount path, value is a
-                :class:`~cubesandbox.Volume` instance (or a plain ``volumeID``
-                string)::
+                :class:`~cubesandbox.Volume`,
+                :class:`~cubesandbox.VolumeInfo`, or plain ``volumeID`` string.
+                Wrap any of those in :class:`~cubesandbox.VolumeMount` to set
+                Cube-specific attachment options such as ``read_only``::
 
                     Sandbox.create(volume_mounts={"/workspace": vol})
                     Sandbox.create(volume_mounts={"/workspace": "vol-123"})
+                    Sandbox.create(
+                        volume_mounts={"/dataset": VolumeMount(vol, read_only=True)}
+                    )
 
                 Each value must resolve to an existing ``volumeID`` created via
-                :meth:`cubesandbox.Volume.create`.
+                :meth:`cubesandbox.Volume.create`. ``read_only`` applies to this
+                sandbox attachment; it does not make the volume an immutable
+                snapshot.
             config: SDK config. Uses default (env-based) config if omitted.
 
         Returns:
@@ -272,31 +281,12 @@ class Sandbox:
             payload["envVars"] = sandbox_env_vars
         if metadata:
             payload["metadata"] = metadata
+        if distribution_scope:
+            payload["distributionScope"] = distribution_scope
         if not allow_internet_access:
             payload["allow_internet_access"] = False
         if network:
-            _validate_allow_out_domains_require_deny_all(
-                network.get("allow_out"),
-                network.get("deny_out"),
-                default_deny_all=not allow_internet_access,
-            )
-            net: dict = {}
-            if "allow_out" in network:
-                net["allowOut"] = network["allow_out"]
-            if "deny_out" in network:
-                net["denyOut"] = network["deny_out"]
-            if "allow_public_traffic" in network:
-                net["allowPublicTraffic"] = network["allow_public_traffic"]
-            if "mask_request_host" in network:
-                net["maskRequestHost"] = network["mask_request_host"]
-            if "rules" in network and network["rules"]:
-                # ``rules`` accepts either CubeEgress's list-of-Rule shape or
-                # E2B's per-host transform mapping (``{host: [{transform: {...}}]}``).
-                # ``_normalize_rules_arg`` collapses both into a list of rule
-                # dicts that ``_serialize_rule`` understands.
-                normalized_rules = _normalize_rules_arg(network["rules"])
-                if normalized_rules:
-                    net["rules"] = [_serialize_rule(r) for r in normalized_rules]
+            net = _build_network_payload(network, allow_internet_access=allow_internet_access)
             if net:
                 payload["network"] = net
         # Lifecycle: opt-in. Wire shape mirrors e2b
@@ -315,13 +305,24 @@ class Sandbox:
         return cls(resp.json(), config=cfg)
 
     @classmethod
-    def connect(cls, sandbox_id: str, *, config: Config | None = None) -> "Sandbox":
+    def connect(
+        cls,
+        sandbox_id: str,
+        timeout: int | None = None,
+        *,
+        config: Config | None = None,
+    ) -> "Sandbox":
         """POST /sandboxes/:sandboxID/connect - Connect to an existing sandbox.
 
         Resumes the sandbox if it is currently paused.
 
         Args:
             sandbox_id: Sandbox identifier.
+            timeout: Sandbox idle timeout in seconds after connecting. ``None``
+                keeps the current timeout, ``-1`` disables idle expiry, and a
+                positive value ensures at least that much remaining lifetime
+                (running and paused sandboxes are never shortened). ``0`` and
+                values below ``-1`` are rejected.
             config: SDK config. Uses default (env-based) config if omitted.
 
         Returns:
@@ -329,13 +330,17 @@ class Sandbox:
 
         Raises:
             SandboxNotFoundError: If the sandbox does not exist (HTTP 404).
-            ApiError: On unexpected backend error (HTTP 500).
+            ApiError: If the timeout is ``0`` or below ``-1`` (HTTP 400), an
+                overlapping lifecycle transition prevents the connection
+                (HTTP 409), or an unexpected backend error occurs.
         """
         cfg = config or Config()
         s = requests.Session()
-        # Connect omits timeout; see docs/guide/lifecycle.md.
+        body: dict[str, int] = {}
+        if timeout is not None:
+            body["timeout"] = timeout
         resp = s.post(f"{cfg.api_url}/sandboxes/{sandbox_id}/connect",
-                      json={},
+                      json=body,
                       headers={"Content-Type": "application/json", **_auth_headers(cfg)})
         _check_response(resp)
         return cls(resp.json(), config=cfg)
@@ -533,6 +538,39 @@ class Sandbox:
         resp = self._session.post(
             f"{self._config.api_url}/sandboxes/{self.sandbox_id}/timeout",
             json={"timeout": timeout},
+        )
+        _check_response(resp)
+
+    def update_network(self, network: Dict[str, Any] | None = None) -> None:
+        """PUT /sandboxes/:sandboxID/network - Replace the egress policy.
+
+        Takes the whole policy as one object, including
+        ``allow_internet_access``, matching E2B's ``SandboxNetworkUpdate``. The
+        create path keeps ``allow_internet_access`` as a separate argument
+        because E2B's create does too; the asymmetry is upstream's, and matching
+        it is what lets code written against either SDK work unchanged.
+
+        Takes effect on established connections too, not just new ones: a
+        connection the new policy no longer allows is reset rather than left
+        running until it closes.
+
+        Args:
+            network: The complete desired policy. A replacement, not a patch —
+                an omitted key is cleared, and ``None`` clears everything.
+                Accepts ``allow_out``, ``deny_out``, ``rules``,
+                ``allow_internet_access``, plus the CubeSandbox extensions
+                ``allow_public_traffic`` and ``mask_request_host``. ``rules``
+                takes either CubeEgress's list of rules or E2B's
+                ``{host: [{transform: ...}]}`` mapping.
+
+        Raises:
+            SandboxNotFoundError: If the sandbox does not exist (HTTP 404).
+            ApiError: If the policy is invalid (HTTP 400), the sandbox is not
+                running (HTTP 409), or on unexpected backend error.
+        """
+        resp = self._session.put(
+            f"{self._config.api_url}/sandboxes/{self.sandbox_id}/network",
+            json=_build_network_update_body(network or {}),
         )
         _check_response(resp)
 
@@ -868,7 +906,7 @@ class Sandbox:
         When the sandbox was created with ``network.allow_public_traffic=False``,
         CubeProxy rejects unauthenticated traffic with 403. Attaching the token
         as a default header on the httpx client covers run_code, the Connect
-        fallback path, and filesystem read/write in one place.
+        commands path, and filesystem read/write in one place.
 
         Data-plane requests are also routed through CubeAPI's auth middleware,
         which requires ``X-API-Key`` (or ``Authorization: Bearer``) whenever the

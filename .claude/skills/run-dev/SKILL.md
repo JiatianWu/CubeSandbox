@@ -51,6 +51,17 @@ This builds: cubemaster, cubelet, cubevsmapdump, network-agent, agent, cubeapi, 
 | `make cubevsmapdump` | eBPF map dump tool | Go | ~20s |
 | `make cube-proxy-sidecar` | Proxy sidecar (dev only) | Go | ~20s |
 | `make cubecow-smoke` | CubeCoW smoke test | Go + Rust | ~60s |
+| `make cube-init` / `make guest-init` | Guest PID1 (`cube-init`) | Rust (musl) | ~30s |
+| `make agent-ext4` / `make cube-agent-ext4` | Independent `cube-agent.ext4` (+ version) | Rust + e2fsprogs | ~2min |
+| `make pmem-assets` | `cube-init` + `agent-ext4` | — | ~2min |
+
+Agent-independent pmem outputs:
+
+```bash
+make cube-init     # → _output/bin/cube-init
+make agent-ext4    # → _output/cube-agent/cube-agent.ext4 (+ version)
+make pmem-assets   # both of the above
+```
 
 ### Verify a build
 
@@ -70,11 +81,15 @@ Tests run inside the builder container. Some tests need external services
 # Agent tests (Rust) — 101+ tests, most pass without KVM
 make builder-run BUILDER_CMD='cd /workspace/agent && make test'
 
-# CubeMaster tests (Go) — needs Redis at minimum
-make builder-run BUILDER_CMD='cd /workspace/CubeMaster && make proto && CI=true CUBE_MASTER_CONFIG_PATH=/workspace/CubeMaster/test/conf.yaml go test -short ./api/... ./pkg/...'
+# CubeMaster tests (Go) — unit-style cmd and pkg packages
+make cubemaster-test
 
-# Cubelet tests (Go)
-make builder-run BUILDER_CMD='cd /workspace/Cubelet && make proto && go test -short ./pkg/...'
+# Cubelet tests (Go) — full self-contained set (all packages except api/ and
+# integration/); root/host-capability tests probe and skip themselves
+make cubelet-test
+
+# Cubelet mount tests — focused privileged lane for CAP_SYS_ADMIN tests
+make cubelet-mount-test
 
 # CubeCoW native tests (Go + CGO, needs cubecow SDK built)
 make cubecow-test-native
@@ -174,7 +189,7 @@ make web-api-sync
 | Symptom | Fix |
 |---|---|
 | `docker: Cannot connect` | Docker daemon not running. `sudo systemctl start docker` |
-| `make: *** [builder-image] Error` | Docker build failed. Check network, retry with `make builder-image BUILDER_FORCE_REBUILD=1`. From China, add `MIRROR=cn` to fetch the llvm.sh installer and clang-14 apt packages from a China mirror (the LLVM GPG key still comes from apt.llvm.org) |
+| `make: *** [builder-image] Error` | Docker build failed. Check network, retry with `make builder-image BUILDER_FORCE_REBUILD=1`. From China, add `MIRROR=cn` to source the clang-14 apt packages from a China mirror |
 | `error: protoc not installed` inside builder | Builder image is outdated. Rebuild: `make builder-image BUILDER_FORCE_REBUILD=1` |
 | `go: no such tool "covdata"` | Don't use `-coverprofile` flag with `make test` in CubeMaster. Use raw `go test` instead. |
 | `cargo: command not found` on host | Rust builds run inside Docker. Use `make <target>`, not raw `cargo`. |

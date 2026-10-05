@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 from framework.exceptions import UnsupportedCapability
@@ -46,16 +47,46 @@ class SandboxAdapter(ABC):
     def read_file(self, path: str, *, user: str = "root") -> str:
         raise NotImplementedError
 
-    @abstractmethod
-    def run_code(self, code: str, *, timeout: int = 60) -> CodeResult:
-        raise NotImplementedError
+    def list_files(self, path: str) -> list[dict[str, Any]]:
+        raise UnsupportedCapability(self.backend, "filesystem_extended")
 
-    def get_host(self, port: int) -> str:
-        """Return the public virtual hostname for a sandbox port."""
-        method = getattr(self.raw_sandbox, "get_host", None)
-        if not callable(method):
-            raise UnsupportedCapability(self.backend, "get_host")
-        return str(method(port))
+    def stat_file(self, path: str) -> dict[str, Any]:
+        raise UnsupportedCapability(self.backend, "filesystem_extended")
+
+    def file_exists(self, path: str) -> bool:
+        raise UnsupportedCapability(self.backend, "filesystem_extended")
+
+    def remove_file(self, path: str) -> None:
+        raise UnsupportedCapability(self.backend, "filesystem_extended")
+
+    def rename_file(self, old_path: str, new_path: str) -> dict[str, Any]:
+        raise UnsupportedCapability(self.backend, "filesystem_extended")
+
+    def make_dir(self, path: str) -> None:
+        raise UnsupportedCapability(self.backend, "filesystem_extended")
+
+    def write_files(self, files: list[tuple[str, str | bytes]]) -> int:
+        raise UnsupportedCapability(self.backend, "filesystem_extended")
+
+    def watch_dir_events(
+        self,
+        path: str,
+        operation: Callable[[], None],
+        *,
+        timeout: float = 5,
+        until: Callable[[list[dict[str, str]]], bool] | None = None,
+    ) -> list[dict[str, str]]:
+        raise UnsupportedCapability(self.backend, "filesystem_extended")
+
+    @abstractmethod
+    def run_code(
+        self,
+        code: str,
+        *,
+        env_vars: dict[str, str] | None = None,
+        timeout: int = 60,
+    ) -> CodeResult:
+        raise NotImplementedError
 
     def pause(self, *, timeout: int = 60) -> None:
         raise UnsupportedCapability(self.backend, "pause_resume")
@@ -63,11 +94,46 @@ class SandboxAdapter(ABC):
     def resume_or_connect(self, *, timeout: int = 60) -> "SandboxAdapter":
         raise UnsupportedCapability(self.backend, "pause_resume")
 
+    def resume_idle_timeout(self, timeout: int | None) -> "SandboxAdapter":
+        """Resume a paused sandbox and apply an explicit idle TTL.
+
+        Unlike ``resume_or_connect``, this forwards ``timeout`` as the sandbox
+        idle TTL (``None`` omits the field). The ``timeout`` argument on
+        ``resume_or_connect`` is only a wait budget.
+        """
+        raise UnsupportedCapability(self.backend, "pause_resume")
+
+    def set_timeout(self, timeout: int) -> None:
+        raise UnsupportedCapability(self.backend, "set_timeout")
+
+    def create_snapshot(self) -> str:
+        raise UnsupportedCapability(self.backend, "rollback_clone")
+
+    def delete_snapshot(self, snapshot_id: str) -> None:
+        raise UnsupportedCapability(self.backend, "rollback_clone")
+
+    def rollback(self, snapshot_id: str) -> dict[str, Any]:
+        raise UnsupportedCapability(self.backend, "rollback_clone")
+
+    def clone(self, n: int = 1, *, concurrency: int = 1) -> list["SandboxAdapter"]:
+        raise UnsupportedCapability(self.backend, "rollback_clone")
+
+    def list_snapshot_ids(self) -> set[str]:
+        raise UnsupportedCapability(self.backend, "rollback_clone")
+
     def get_host(self, port: int) -> str:
         raise UnsupportedCapability(self.backend, "network_public_access")
 
     def traffic_access_token(self) -> str | None:
         raise UnsupportedCapability(self.backend, "network_public_access")
+
+    def update_network(self, network: dict | None = None) -> None:
+        """Replace the egress policy of the running sandbox.
+
+        Takes the whole policy as one object, ``allow_internet_access``
+        included, so the signature matches E2B's ``update_network``.
+        """
+        raise UnsupportedCapability(self.backend, "network_dynamic_update")
 
     @abstractmethod
     def kill(self) -> None:

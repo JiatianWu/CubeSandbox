@@ -4,7 +4,7 @@
 import { fetch, type Dispatcher } from "undici";
 
 import { Commands } from "./commands.js";
-import { Config, DEFAULT_SANDBOX_TIMEOUT_S, resolveConfig, type ConfigOptions } from "./config.js";
+import { Config, NEVER_TIMEOUT, resolveConfig, type ConfigOptions } from "./config.js";
 import {
   ApiError,
   AuthenticationError,
@@ -23,6 +23,7 @@ import {
 import { Pty } from "./pty.js";
 import { createIdleTimeout, parseNdjsonStream, type RunCodeCallbacks } from "./stream.js";
 import { buildDataDispatcher, controlFetch, dataScheme } from "./transport.js";
+import { serializeVolumeMounts, type VolumeMountsArg } from "./volume.js";
 
 export const JUPYTER_PORT = 49999;
 
@@ -43,6 +44,23 @@ export interface LifecycleOptions {
 }
 
 /** Options for {@link Sandbox.create}. */
+/**
+ * Desired egress policy for {@link Sandbox.updateNetwork}, carrying
+ * `allowInternetAccess` alongside the rest rather than beside the object.
+ *
+ * This mirrors E2B's `SandboxNetworkUpdate` so code written against either SDK
+ * works unchanged. It differs from {@link CreateOptions}, where the flag is a
+ * sibling of `network` — E2B's create draws the same line, and following it
+ * matters more than being internally symmetric.
+ *
+ * The whole object is the desired state, not a patch: an omitted field is
+ * cleared rather than left as it was. `allowInternetAccess` is presence-based —
+ * omitting it is not the same as sending `true`.
+ */
+export interface UpdateNetworkOptions extends NetworkOptions {
+  allowInternetAccess?: boolean;
+}
+
 export interface CreateOptions {
   template?: string;
   /** Alias for {@link CreateOptions.template}, matching the Issue #760 / E2B shape. */
@@ -53,6 +71,16 @@ export interface CreateOptions {
   allowInternetAccess?: boolean;
   network?: NetworkOptions;
   lifecycle?: LifecycleOptions;
+  /**
+   * Persistent volumes to mount at creation — an e2b-style mapping of mount
+   * path → volume (a `Volume`/`VolumeInfo` instance or volume-ID string, or a
+   * `VolumeMount` wrapper for the read-only Cube extension):
+   *
+   * ```ts
+   * volumeMounts: { "/workspace": vol, "/dataset": new VolumeMount(vol2, { readOnly: true }) }
+   * ```
+   */
+  volumeMounts?: VolumeMountsArg;
   config?: Config | ConfigOptions;
   /** Extra fields forwarded verbatim into the create request body. */
   extra?: Record<string, unknown>;
@@ -177,6 +205,34 @@ async function checkControlResponse(resp: {
     throw new SandboxNotFoundError(msg, code);
   }
   throw new ApiError(msg, code);
+}
+
+/**
+ * Translate NetworkOptions into the API's camelCase network object, running the
+ * same client-side validation the server applies. Shared by sandbox creation
+ * and `Sandbox.updateNetwork` so both accept identical input.
+ */
+function buildNetworkPayload(
+  net: NetworkOptions,
+  internetAccessDisabled: boolean,
+): Record<string, unknown> {
+  validateAllowOutDomainsRequireDenyAll(net.allowOut, net.denyOut, internetAccessDisabled);
+  const wire: Record<string, unknown> = {};
+  if (net.allowOut !== undefined) wire.allowOut = net.allowOut;
+  if (net.denyOut !== undefined) wire.denyOut = net.denyOut;
+  if (net.allowPublicTraffic !== undefined) {
+    wire.allowPublicTraffic = net.allowPublicTraffic;
+  }
+  if (net.maskRequestHost !== undefined) {
+    wire.maskRequestHost = net.maskRequestHost;
+  }
+  if (net.rules) {
+    const normalized = normalizeRulesArg(net.rules);
+    if (normalized.length > 0) {
+      wire.rules = normalized.map(serializeRule);
+    }
+  }
+  return wire;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -352,10 +408,10 @@ export class Sandbox {
       );
     }
 
-    const payload: Record<string, unknown> = {
-      templateID: tpl,
-      timeout: options.timeout ?? cfg.timeout,
-    };
+    const payload: Record<string, unknown> = { templateID: tpl };
+    if (options.timeout !== undefined) {
+      payload.timeout = options.timeout;
+    }
     if (options.envVars) {
       payload.envVars = options.envVars;
     }
@@ -366,33 +422,16 @@ export class Sandbox {
       payload.allow_internet_access = false;
     }
     if (options.network) {
-      const net = options.network;
-      validateAllowOutDomainsRequireDenyAll(
-        net.allowOut,
-        net.denyOut,
-        options.allowInternetAccess === false,
-      );
-      const wire: Record<string, unknown> = {};
-      if (net.allowOut !== undefined) wire.allowOut = net.allowOut;
-      if (net.denyOut !== undefined) wire.denyOut = net.denyOut;
-      if (net.allowPublicTraffic !== undefined) {
-        wire.allowPublicTraffic = net.allowPublicTraffic;
-      }
-      if (net.maskRequestHost !== undefined) {
-        wire.maskRequestHost = net.maskRequestHost;
-      }
-      if (net.rules) {
-        const normalized = normalizeRulesArg(net.rules);
-        if (normalized.length > 0) {
-          wire.rules = normalized.map(serializeRule);
-        }
-      }
+      const wire = buildNetworkPayload(options.network, options.allowInternetAccess === false);
       if (Object.keys(wire).length > 0) {
         payload.network = wire;
       }
     }
     if (options.lifecycle) {
       payload.lifecycle = serializeLifecycle(options.lifecycle);
+    }
+    if (options.volumeMounts && Object.keys(options.volumeMounts).length > 0) {
+      payload.volumeMounts = serializeVolumeMounts(options.volumeMounts);
     }
     if (options.extra) {
       Object.assign(payload, options.extra);
@@ -416,7 +455,7 @@ export class Sandbox {
     const resp = await controlFetch(cfg, `${cfg.apiUrl}/sandboxes/${sandboxId}/connect`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ timeout: cfg.timeout }),
+      body: JSON.stringify({}),
     });
     await checkControlResponse(resp);
     return new Sandbox((await resp.json()) as Record<string, any>, cfg);
@@ -570,12 +609,66 @@ export class Sandbox {
    * @deprecated Use {@link Sandbox.connect} which auto-resumes and returns a
    * fresh instance.
    */
-  async resume(timeout = DEFAULT_SANDBOX_TIMEOUT_S): Promise<void> {
+  async resume(timeout?: number): Promise<void> {
+    const payload: Record<string, unknown> = {};
+    if (timeout !== undefined) {
+      payload.timeout = timeout;
+    }
     const resp = await controlFetch(this.config, `${this.config.apiUrl}/sandboxes/${this.sandboxId}/resume`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ timeout }),
+      body: JSON.stringify(payload),
     });
+    await checkControlResponse(resp);
+  }
+
+  /** POST /sandboxes/:id/timeout — set sandbox idle timeout. */
+  async setTimeout(timeout: number): Promise<void> {
+    if (!Number.isFinite(timeout)) {
+      throw new Error(`timeout must be a finite number of seconds, got ${timeout}`);
+    }
+    if (timeout < 0 && timeout !== NEVER_TIMEOUT) {
+      throw new Error(`timeout must be >= 0 or NEVER_TIMEOUT (-1), got ${timeout}`);
+    }
+
+    const seconds = Math.ceil(timeout);
+    const resp = await controlFetch(
+      this.config,
+      `${this.config.apiUrl}/sandboxes/${this.sandboxId}/timeout`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ timeout: seconds }),
+      },
+    );
+    await checkControlResponse(resp);
+  }
+
+  /**
+   * PUT /sandboxes/:id/network — replace the sandbox's egress policy.
+   *
+   * `network` is the complete desired policy, not a patch: an omitted field
+   * clears whatever the sandbox currently has. The new policy also applies to
+   * established connections, which are reset if it no longer permits them.
+   */
+  async updateNetwork(network: UpdateNetworkOptions = {}): Promise<void> {
+    const { allowInternetAccess, ...policy } = network;
+    const payload: Record<string, unknown> = buildNetworkPayload(
+      policy,
+      allowInternetAccess === false,
+    );
+    if (allowInternetAccess !== undefined) {
+      payload.allowInternetAccess = allowInternetAccess;
+    }
+    const resp = await controlFetch(
+      this.config,
+      `${this.config.apiUrl}/sandboxes/${this.sandboxId}/network`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+    );
     await checkControlResponse(resp);
   }
 

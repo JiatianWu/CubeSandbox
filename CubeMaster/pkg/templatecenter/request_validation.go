@@ -12,10 +12,10 @@ import (
 	"sort"
 	"strings"
 
-	cubeboxv1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter/image"
+	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 func resolveTemplateNodes(instanceType string, scope []string) ([]*node.Node, error) {
@@ -78,7 +78,7 @@ func normalizeTemplateImageRequest(req *types.CreateTemplateFromImageReq) (*type
 	if sourceImageRef == "" {
 		return nil, errors.New("source_image_ref is required")
 	}
-	if err := image.ValidateImageRef(sourceImageRef); err != nil {
+	if err := ValidateImageRef(sourceImageRef); err != nil {
 		return nil, fmt.Errorf("source_image_ref: %w", err)
 	}
 	if strings.TrimSpace(req.WritableLayerSize) == "" {
@@ -107,6 +107,13 @@ func normalizeTemplateImageRequest(req *types.CreateTemplateFromImageReq) (*type
 	if cloned.EnableIvshmem != nil && !*cloned.EnableIvshmem {
 		cloned.EnableIvshmem = nil
 	}
+	if strings.TrimSpace(cloned.Backend) != "" {
+		backend, err := constants.NormalizeSnapshotBackend(cloned.Backend)
+		if err != nil {
+			return nil, err
+		}
+		cloned.Backend = backend
+	}
 	if err := validateTemplateCubeNetworkConfig(cloned.CubeNetworkConfig); err != nil {
 		return nil, err
 	}
@@ -127,7 +134,10 @@ func validateTemplateAlias(alias string) error {
 	if alias == "" {
 		return nil
 	}
-	if hasValidTemplateIDPrefix(alias) {
+	// Reject any alias that collides with a template/snapshot ID prefix,
+	// including the bare "tpl-"/"snap-" (hasValidTemplateIDPrefix only flags
+	// prefix+suffix). Matches CubeAPI's is_valid_alias so the two layers agree.
+	if strings.HasPrefix(alias, "tpl-") || strings.HasPrefix(alias, "snap-") {
 		return fmt.Errorf("alias %q must not start with 'tpl-' or 'snap-'", alias)
 	}
 	if !aliasValidationRe.MatchString(alias) {
@@ -248,26 +258,5 @@ func normalizeTemplateExposedPorts(ports []int32) ([]int32, error) {
 	sort.Slice(normalized, func(i, j int) bool {
 		return normalized[i] < normalized[j]
 	})
-	if countCustomTemplateExposedPorts(normalized) > 3 {
-		return nil, fmt.Errorf("at most 3 custom exposed ports are supported")
-	}
 	return normalized, nil
-}
-
-func countCustomTemplateExposedPorts(ports []int32) int {
-	reserved := defaultTemplateExposedPorts()
-	count := 0
-	for _, port := range ports {
-		if _, ok := reserved[port]; ok {
-			continue
-		}
-		count++
-	}
-	return count
-}
-
-func defaultTemplateExposedPorts() map[int32]struct{} {
-	return map[int32]struct{}{
-		49983: {},
-	}
 }

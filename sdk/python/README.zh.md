@@ -105,6 +105,17 @@ sb.pause(timeout=60, interval=0.5) # 自定义轮询参数
 sb2 = Sandbox.connect(sb.sandbox_id)
 ```
 
+### 指定计算节点
+
+通过计算节点 ID 或 Host IP 限定调度范围。只传一个节点即可将沙箱固定到
+该节点；如果目标节点无法运行对应模板，创建会失败。
+
+```python
+sb = Sandbox.create(
+    distribution_scope=["node-a"],
+)
+```
+
 ### 网络策略
 
 `network=` 内部可以组合两个层次：
@@ -230,7 +241,7 @@ with Sandbox.create(metadata={"host-mount": mounts}) as sb:
 也可在多个沙箱之间共享。
 
 ```python
-from cubesandbox import Sandbox, Volume
+from cubesandbox import Sandbox, Volume, VolumeMount
 
 # 创建卷 —— name 可选（省略时服务端生成 UUID）。
 # 省略 driver 即 e2b 兼容：不发送 driver，后端使用第一个已配置的插件。
@@ -247,6 +258,11 @@ with Sandbox.create(
     print(sb.files.read("/workspace/note.txt"))
 
 # 值可以是 Volume、VolumeInfo 或 volume_id 字符串。
+# 包装某个值可将本次沙箱挂载设为只读；原有写法继续保持读写且兼容 e2b。
+with Sandbox.create(
+    volume_mounts={"/dataset": VolumeMount(vol, read_only=True)},
+) as sb:
+    print(sb.files.read("/dataset/note.txt"))
 
 # 列出 / 查询信息 / 连接 / 销毁
 for v in Volume.list():                 # list[VolumeInfo]（token 恒为 ""）
@@ -255,6 +271,8 @@ Volume.get_info(vol.volume_id)          # -> VolumeInfo（含 token）
 vol = Volume.connect(vol.volume_id)     # -> 返回 Volume 实例
 Volume.destroy(vol.volume_id)           # -> bool；先杀掉所有挂载它的沙箱（不会自动 detach）
 ```
+
+访问模式按沙箱挂载设置。同一个 Volume 可以在一个沙箱中读写，在另一个沙箱中只读；原有 e2b 形式无需修改。
 
 卷的 `name` 必须匹配 `^[a-zA-Z0-9_-]+$` 且不超过 128 字符；非法名称
 会在任何网络请求之前抛出 `ValueError`。完整 API、参数和错误码请参阅
@@ -300,8 +318,8 @@ with Sandbox.create(config=cfg) as sb:
 
 | 方法 | 说明 |
 |---|---|
-| `Sandbox.create(template, *, timeout, env_vars, metadata, volume_mounts, config)` | `POST /sandboxes` — 创建新沙箱（可选挂载卷） |
-| `Sandbox.connect(sandbox_id, *, config)` | `POST /sandboxes/:id/connect` — 连接（暂停状态下自动恢复） |
+| `Sandbox.create(template, *, timeout, env_vars, metadata, distribution_scope, volume_mounts, config)` | `POST /sandboxes` — 创建新沙箱（可限定计算节点或挂载卷） |
+| `Sandbox.connect(sandbox_id, timeout=None, *, config)` | `POST /sandboxes/:id/connect` — 连接（暂停状态下自动恢复），并可选地重置空闲超时 |
 | `Sandbox.list(config)` | `GET /sandboxes` — 列出运行中沙箱（v1） |
 | `Sandbox.list_v2(config)` | `GET /v2/sandboxes` — 列出沙箱（v2） |
 | `Sandbox.health(config)` | `GET /health` — 服务健康检查 |
@@ -343,10 +361,7 @@ with Sandbox.create(config=cfg) as sb:
 | `Volume.get_info(volume_id, *, config)` | `GET /volumes/:id` — 查询单个卷信息（含 token）→ `VolumeInfo` |
 | `Volume.destroy(volume_id, *, config)` | `DELETE /volumes/:id` — 删除卷 → `bool` |
 
-通过 `Sandbox.create(volume_mounts={path: vol})` 将卷挂载进沙箱。
-`Volume.create` / `connect` 返回 `Volume` 实例，`list` / `get_info` 返回
-`VolumeInfo`；二者都暴露 `.volume_id`、`.name`、`.token`。完整参考：
-[`docs/volume.zh.md`](docs/volume.zh.md)。
+通过 `Sandbox.create(volume_mounts={path: vol})` 将卷挂载进沙箱。使用 `VolumeMount(vol, read_only=True)` 可将单次挂载设为只读；这不会把卷变成不可变快照。`Volume.create` / `connect` 返回 `Volume` 实例，`list` / `get_info` 返回 `VolumeInfo`；二者都暴露 `.volume_id`、`.name`、`.token`。完整参考：[`docs/volume.zh.md`](docs/volume.zh.md)。
 
 ### `Execution` 对象
 

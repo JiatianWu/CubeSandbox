@@ -6,11 +6,29 @@ common:
   http_readtimeout: 120
   http_writetimeout: 360
   http_idletimeout: 360
-  sync_meta_data_interval: 30s
+  # CubeOps node-management base URL. Empty falls back to local DB loader.
+  cube_ops_addr: "__CUBEMASTER_CUBE_OPS_ADDR__"
+  # Shorter sync interval when pulling nodes from CubeOps.
+  sync_meta_data_interval: 1s
   sync_metric_data_interval: 1s
   collect_metric_interval: 1s
   default_headless_service_nodes_num: 1
   enable_check_com_net_id_param: false
+  # CubeMaster no longer builds templates in-process: every template-from-image
+  # build is forwarded to the standalone CubeTemplateCenter process. There is
+  # no local fallback and no "templatecenter_enabled" switch anymore -- a
+  # template build fails outright if CubeTemplateCenter is unreachable.
+  #
+  # CubeTemplateCenter's address is deliberately NOT a key here: it is a
+  # deployment fact, so CubeMaster reads it from the CUBE_TEMPLATE_CENTER_ADDR
+  # environment variable (the counterpart of CUBE_MASTER_ADDR, which TC uses to
+  # call back). cubemaster-start.sh already exports CUBE_TEMPLATE_CENTER_ADDR
+  # with a default of http://127.0.0.1:8090, and the TC unit
+  # (cube-sandbox-cube-templatecenter.service) is part of the default
+  # control-plane target, so template builds work out of the box.
+  #   * (optional) override CUBE_TEMPLATE_CENTER_ADDR in
+  #     /usr/local/services/cubetoolbox/.one-click.env for a split deployment.
+  # TC reports build status back over http://127.0.0.1:8089.
 
 log:
   module: "cubemaster"
@@ -24,11 +42,12 @@ cubelet_conf:
     grpc_port: 9999
   common_timeout_insec: 30
   create_image_timeout_insec: 300
+  app_snapshot_timeout_insec: 300
   # Sandbox idle TTL when the client omits timeout; unset or <=0 = no cluster default (never idle-timeout).
   # Shipped default: no cluster-wide idle timeout. Set e.g. 300 in production if needed.
   default_timeout_insec: -1
   # Create/scheduling RPC deadline only (not sandbox idle TTL).
-  create_timeout_insec: 300
+  create_timeout_insec: 600
   create_concurrent_limit: 100
   destroy_concurent_limit: 100
   enable_exposed_port: true
@@ -50,19 +69,9 @@ req_template_conf:
   cube_box_req_template: >-
     {"volumes":[{"name":"tmp","volume_source":{"empty_dir":{"medium":0}}}],"containers":[{"name":"cubebox-default","envs":[{"key":"TZ","value":"Asia/Shanghai"},{"key":"TERM","value":"xterm"}],"volume_mounts":[{"name":"tmp","container_path":"/"}],"security_context":{"privileged":true,"readonly_rootfs":false,"no_new_privs":false}}],"network_type":"tap","cube_network_config":{"allowInternetAccess":true,"denyOut":["10.0.0.0/8","100.64.0.0/10","172.16.0.0/12","192.168.0.0/16"]}}
 
-ossdb_config:
-  addr: "127.0.0.1:__CUBE_SANDBOX_MYSQL_PORT__"
-  user: "__CUBE_SANDBOX_MYSQL_USER__"
-  pwd: "__CUBE_SANDBOX_MYSQL_PASSWORD__"
-  db_name: "__CUBE_SANDBOX_MYSQL_DB__"
-  conn_timeout: 5
-  read_timeout: 5
-  write_timeout: 5
-  max_idle_conns: 5
-  max_open_conns: 20
-  max_conn_life_time_seconds: 300
-
 instance_db_config:
+  # mysql (default / bundled) or postgres (external only; one-click never ships PG).
+  driver: "mysql"
   addr: "127.0.0.1:__CUBE_SANDBOX_MYSQL_PORT__"
   user: "__CUBE_SANDBOX_MYSQL_USER__"
   pwd: "__CUBE_SANDBOX_MYSQL_PASSWORD__"
@@ -101,8 +110,15 @@ scheduler:
       - "template_locality"
       - "realtime_create_num"
 
-# Volume plugin (COS binary reference). Credentials: CubeMaster/plugin/volume-cos.conf
+# Volume plugin (S3 / COS binary reference). Credentials:
+#   CubeMaster/plugin/volume-s3.conf (written by one-click from MinIO or CUBE_S3_*)
+#   CubeMaster/plugin/volume-cos.conf
+# List order sets the default driver when Volume.create() omits `driver`;
+# S3 is first so the default install (bundled MinIO) works out of the box.
 volume_plugins:
+  - name: s3
+    type: binary
+    binary_path: /usr/local/services/cubetoolbox/CubeMaster/plugin/cube-volume-s3
   - name: cos
     type: binary
     binary_path: /usr/local/services/cubetoolbox/CubeMaster/plugin/cube-volume-cos

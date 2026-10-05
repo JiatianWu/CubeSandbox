@@ -2,15 +2,18 @@ APPS=cubelet cubecli
 COVERAGE_PROFILE=coverage.profile
 ROOT_DIR=$(shell pwd)
 BUILD_DIR=$(ROOT_DIR)/build
-PROTO=services/errorcode services/version services/cubebox services/images services/nbi services/multimetadb services/volumeplugin types
+PROTO=services/cubehost services/multimetadb services/nbi services/version
 PACK_DIR=$(BUILD_DIR)/cube-let
 
 export GO111MODULE=on
 export GOARCH ?= $(shell go env GOARCH)
 export GOOS=linux
 GO_BIN_DIR := $(shell if [ -n "$$(go env GOBIN)" ]; then printf "%s" "$$(go env GOBIN)"; else printf "%s/bin" "$$(go env GOPATH)"; fi)
-PROTOBUF_INCLUDE_DIR := $(shell python3 -c 'import glob, os, subprocess; candidates = ["/usr/include", "/usr/local/include"]; gopath = subprocess.check_output(["go", "env", "GOPATH"], text=True).strip(); extras = glob.glob(os.path.join(gopath, "pkg/mod/github.com/google/gnostic-models@*/third_party")) if gopath else []; candidates.extend(extras); print(next((c for c in candidates if os.path.exists(os.path.join(c, "google/protobuf/empty.proto")) and os.path.exists(os.path.join(c, "google/protobuf/any.proto"))), ""))')
-PROTOC_INCLUDE_FLAGS=-I=.
+# Well-known types (empty.proto/any.proto) are vendored in pkgs/proto/third_party;
+# shared protos (cubebox/errorcode/images/snapshot/volumeplugin/types) resolve
+# through pkgs/proto. Only private protos remain in this module.
+PROTOBUF_INCLUDE_DIR := $(abspath ../pkgs/proto/third_party)
+PROTOC_INCLUDE_FLAGS=-I=. -I=../pkgs/proto
 ifneq ($(strip $(PROTOBUF_INCLUDE_DIR)),)
 PROTOC_INCLUDE_FLAGS += -I=$(PROTOBUF_INCLUDE_DIR)
 endif
@@ -31,12 +34,10 @@ PKG=github.com/tencentcloud/CubeSandbox/Cubelet/pkg
 
 PWD = $(shell pwd)
 
-# COVERAGE_PACKAGES is the coverage we care about.
+# COVERAGE_PACKAGES excludes generated api/ code and integration/ (needs a
+# live cluster); everything else is unit-testable in the builder.
 COVERAGE_PACKAGES=$(shell go list ./... \
 	| grep -v github.com/tencentcloud/CubeSandbox/Cubelet/api \
-	| grep -v github.com/tencentcloud/CubeSandbox/Cubelet/cmd \
-	| grep -v github.com/tencentcloud/CubeSandbox/Cubelet/shimlog \
-	| grep -v github.com/tencentcloud/CubeSandbox/Cubelet/runtime \
 	| grep -v /integration)
 
 # Version — injected at build time via ldflags.
@@ -117,9 +118,6 @@ proto: check-proto-tools
 		protoc $(PROTOC_INCLUDE_FLAGS) $(PROTOC_GO_FLAGS) \
 		api/$$pkg/v1/*.proto ;\
 	done)
-	@echo pkg/networkagentclient/pb
-	$(Q)protoc $(PROTOC_INCLUDE_FLAGS) $(PROTOC_GO_FLAGS) \
-		pkg/networkagentclient/pb/network_agent.proto
 	@if command -v protoc-gen-doc >/dev/null 2>&1; then \
 		printf '  %-8s %s\n' "Generate" "proto doc"; \
 		protoc $(PROTOC_INCLUDE_FLAGS) --doc_out=./doc/ --doc_opt=markdown,cubelet-api.md $(PROTO_DOC_FILES); \
@@ -172,4 +170,3 @@ clean:
 .PHONY: unittest
 unittest:
 	@echo "unittest"
-

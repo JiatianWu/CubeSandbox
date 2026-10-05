@@ -17,8 +17,8 @@ For install steps, see [Helm Install](./install.md). For compute image upgrades,
 | Ops backend | CubeOps | Deployment + Service | JWT ops API + WebUI SDK; listens on `0.0.0.0:3010`; reads/writes MySQL; talks to CubeMaster |
 | Admin entry | WebUI | Deployment + Service + ConfigMap | Static console; reverse-proxies `/opsapi/` and `/cubeapi/v1/` to CubeOps (depends on `cubeOps.enabled`) |
 | Ops entry | cubemastercli | Deployment | CLI for `kubectl exec`; injects this Release’s CubeMaster endpoint |
-| Dependent storage | MySQL / Redis | Built-in StatefulSet or third-party | Business data / Proxy and lifecycle state |
-| Compute · runtime | `cube-node` (Big Pod) | Native `apps/v1` DaemonSet | `wait-node-prep` init + cubelet / network-agent + optional egress |
+| Dependent storage | MySQL / Redis / MinIO | Built-in StatefulSet or third-party | Business data / Proxy and lifecycle state / S3 volume backend |
+| Compute · runtime | `cube-node` (Big Pod) | Native `apps/v1` DaemonSet | `wait-node-prep` init + cubelet with embedded network runtime + optional egress / s3lvol |
 | Compute · artifacts | `cube-node-installer` | Native `apps/v1` DaemonSet | Installs shim / kernel / guest into the host toolbox |
 | Compute · node bootstrap | `cube-node-bootstrap` | Native `apps/v1` DaemonSet | `wait-pvm-host`, `cube-node-init`, writes `node-prep-ready` |
 | Compute · PVM host | `cube-node-pvm` | Native `apps/v1` DaemonSet (`placement.pvm` only) | PVM host kernel install (may reboot); manages L0 taints and writes fingerprints |
@@ -37,6 +37,7 @@ flowchart TB
     CLI["cubemastercli"]
     MYSQL[("MySQL")]
     REDIS[("Redis")]
+    MINIO[("MinIO")]
     PROXY["cube-proxy"]
   end
 
@@ -60,8 +61,9 @@ flowchart TB
     end
     subgraph NODE["cube-node Big Pod"]
       WAIT["init: wait-node-prep (exits when ready)"]
-      RUN["cubelet + network-agent"]
+      RUN["cubelet + embedded network runtime"]
       EG["cube-egress + cube-egress-net"]
+      S3L["optional cube-s3lvol"]
     end
   end
 
@@ -74,6 +76,8 @@ flowchart TB
   API --> MYSQL
   CM --> MYSQL
   CM --> REDIS
+  CM --> MINIO
+  RUN --> MINIO
   PROXY --> REDIS
   PROXY --> CM
   KDNS --> PROXY
@@ -101,10 +105,11 @@ flowchart TB
 | `cube-ops` | `templates/ops.yaml` | `images.ops`; ClusterIP; bind `0.0.0.0:3010` |
 | `cubemastercli` | `templates/cubemastercli.yaml` | `images.cubemastercli` |
 | `cube-webui` | `templates/webui.yaml` | `images.webui` + nginx ConfigMap (upstream CubeOps) |
-| `cube-secret` | `templates/secret.yaml` | MySQL / Redis / Proxy passwords, etc. |
+| `cube-secret` | `templates/secret.yaml` | MySQL / Redis / Proxy / MinIO passwords, etc. |
 | `volume-cos` (optional) | `templates/volume-cos-secret.yaml` | COS credentials (`volume-cos.conf`); mounted on Master + Cubelet when `volumeCos.enabled` |
+| `volume-s3` | `templates/secret.yaml` (auto-filled from the built-in MinIO) / `templates/volume-s3-secret.yaml` (operator-set `volumeS3.*`) | S3 credentials (`volume-s3.conf`); mounted on Master + Cubelet when the built-in MinIO is enabled or `volumeS3.endpoint` / `existingSecret` is set |
 
-### 2.2 MySQL / Redis
+### 2.2 MySQL / Redis / MinIO
 
 | Mode | Behavior |
 | --- | --- |
@@ -112,27 +117,30 @@ flowchart TB
 | Third-party MySQL | Non-empty `mysql.host` → do not install built-in MySQL |
 | Built-in Redis | `redis.host=""` and control plane or Proxy needs it → install |
 | Third-party Redis | Non-empty `redis.host` → do not install built-in Redis |
+| Built-in MinIO | `minio.enabled=true` → deploy StatefulSet + Headless Service (`minio.*` only deploys MinIO itself; an empty `rootPassword` is auto-generated). If `volumeS3.endpoint` / `existingSecret` are not set, the chart derives the S3 config from the built-in MinIO and writes `volume-s3.conf` |
+| External S3 | `minio.enabled=false` plus `volumeS3.endpoint` / `volumeS3.existingSecret` → do not deploy the built-in MinIO; `volume-s3.conf` is generated from `volumeS3.*` |
+| Local-disk blobstore | `artifactStore.backend=fs` / `cubeOps.store.backend=fs` for templates and warehouse (default `s3`); S3 volumes unchanged |
 
 ### 2.3 Compute plane: four DaemonSets
 
 `cube-node` / `cube-node-installer` / `cube-node-bootstrap` use `placement.compute` (**without** `allow-pvm-bootstrap`). `cube-node-pvm` uses `placement.pvm` (includes `allow-pvm-bootstrap`), so non-PVM nodes do not pull the large `cube-pvm-host-bootstrap` image.
 
-All four compute lines (Big Pod / installer / bootstrap / PVM) are native `apps/v1` DaemonSets. Stateless control plane (master/api/ops/webui/proxy/lifecycle/cubemastercli) uses native Deployments; MySQL/Redis continue to use native StatefulSets.
+All four compute lines (Big Pod / installer / bootstrap / PVM) are native `apps/v1` DaemonSets. Stateless control plane (master/api/ops/webui/proxy/lifecycle/cubemastercli) uses native Deployments; MySQL/Redis/MinIO continue to use native StatefulSets.
 
 #### Big Pod: `cube-node`
 
-- `hostNetwork: false` (Pod network); native `apps/v1` DaemonSet.
+- `hostNetwork: true` (host network by default; `cubeNode.hostNetwork: false` opts into the Pod network); native `apps/v1` DaemonSet.
 - **initContainer**: `wait-node-prep` (**exits 0** when the fingerprint matches; not a long-running sidecar).
-- Image / resource / Pod template changes **recreate** the Big Pod (PodIP/netns change; existing sandboxes interrupt). See [Upgrade](./upgrade.md).
-- **NodeID** = `spec.nodeName`; **Endpoint** = `status.podIP`.
+- Image / resource / Pod template changes **recreate** the Big Pod. Sandbox tap devices and cubevs hooks live in the Pod netns: on the host network they survive that, on the Pod network they do not. See [Upgrade](./upgrade.md).
+- **NodeID** = `spec.nodeName`; **Endpoint** = `status.podIP` (the node IP on the host network).
 - toolbox **whole tree** hostPath: `/usr/local/services/cubetoolbox`.
 
 | Container | Image | Responsibility |
 | --- | --- | --- |
 | `wait-node-prep` (init) | `images.waitNodePrep` | Read-only hostPath `node-prep-ready` self-describing fingerprint; exits when matched so run containers can start |
-| `network-agent` | `images.networkAgent` | Starts after self-stage |
-| `cubelet` | `images.cubelet` | Starts after self-stage |
+| `cubelet` | `images.cubelet` | Starts after self-stage; includes embedded network runtime and CubeVS tools |
 | `cube-egress` / `cube-egress-net` | matching images | Optional; transparent egress / TPROXY |
+| `cube-s3lvol` | `images.cubeS3lvol` | Optional; SPDK NVMe/TCP target for S3 CoW / cross-node snapshots |
 
 **Container names / volumeMount / securityContext / imagePullPolicy changes also recreate**.
 
@@ -186,6 +194,12 @@ Guest kernel selection: first check `effective-pvm`; if missing, try to keep the
 
 CubeProxy forwards to the target compute-node sandbox via owner metadata in Redis.
 
+### 2.5 cube-lifecycle-manager HA
+
+The chart defaults to `lifecycleManager.replicas=2` with `leaderElection.enabled=true`, running active-standby: every replica consumes lifecycle events and serves resume callbacks, while a Redis lease elects one leader to run the idle sweep/kill and stale-registry pruning. Only the leader writes shared sandbox state. Setting `replicas` above 1 with leader election disabled fails Helm validation. Terraform one-click defaults to the same two-replica active-standby layout.
+
+On leader failover the new leader recovers shared state conservatively: where the state records disagree, it records the safe answer, `paused`, and the sandbox auto-resumes on its next request. See the [FAQ](faq.md) for the user-visible effect.
+
 ## 3. DNS
 
 The Chart **does not** deploy its own CoreDNS. When Proxy is enabled and `configureClusterDNS=true` (default):
@@ -220,7 +234,7 @@ flowchart TD
   B --> C{"values valid?"}
   C -- no --> X["fail render"]
   C -- yes --> D["Secret / ConfigMap / persistence"]
-  D --> E["MySQL / Redis or external"]
+  D --> E["MySQL / Redis / MinIO or external"]
   E --> F["Control-plane Deployment"]
   F --> G["Proxy / cluster-dns"]
   G --> H["cube-node + installer + bootstrap + pvm"]
@@ -232,7 +246,7 @@ Main validations:
 - `configureClusterDNS=true` requires `cubeProxy.domain`.
 - compute-only requires `externalControlPlane.masterEndpoint`.
 - When `pvmHostKernel.enabled=true`, `placement.pvm` must include `allow-pvm-bootstrap`, and it **must not** be written under `placement.compute`.
-- `security.hostNetwork` has been removed; cube-node is fixed to Pod network.
+- `security.hostNetwork` has been removed; cube-node's mode is `cubeNode.hostNetwork` (default true = host network).
 
 Scheduling: control plane uses `placement.controlPlane`; `cube-node` / installer / bootstrap use `placement.compute`; `cube-node-pvm` uses `placement.pvm`. Chart-managed containers get `TZ` injected via `global.timezone` (default `Asia/Shanghai`).
 
@@ -294,9 +308,11 @@ sequenceDiagram
 
 Probe conventions:
 
-- cubelet: startup waits on 9999; readiness defaults to exec (9999 + network-agent `/readyz` + sock); liveness checks 9999.
-- `cube-egress`: `127.0.0.1:9090/admin/v1/health`.
+- cubelet: startup waits on 9999; readiness defaults to exec (9999 + Cubelet local socket); liveness checks 9999.
+- After network-agent was embedded into Cubelet, node readiness / `NotReady` no longer probes a standalone network daemon. Runtime network degradation (for example TAP pool exhaustion or sustained CubeEgress push failures) is surfaced on create/release paths and local diagnostics instead of flipping the node to NotReady. Monitor create failure rates, TAP pool state (`cubecli container taps` / loopback `GET /v1/network/taps`), and CubeEgress health rather than relying on node Ready alone.
+- `cube-egress`: `127.0.0.1:9091/admin/v1/health` (default; `cubeEgress.adminPort`).
 - `cube-egress-net`: `cube-dev`, ip rule, table 100, mangle `TRANSPROXY`.
+- `cube-s3lvol` (when enabled): startup and readiness probe the Unix socket `/var/run/s3lvol/s3lvol.sock` plus a light `s3lvol_rpc.py` RPC. There is no liveness probe — the entrypoint exits when the target dies so kubelet restarts the container.
 
 ### 4.4 Registration and acceptance checkpoints
 
@@ -378,7 +394,7 @@ externalControlPlane:
   apiEndpoint: http://<external-api>:3000  # optional, for helm test
 ```
 
-Does not install built-in Master / API / MySQL / Redis / WebUI; by default does not install Proxy (to avoid inconsistency with an external data plane). When `apiEndpoint` is set, helm test validates the external API and node registration.
+Does not install built-in Master / API / MySQL / Redis / MinIO / WebUI; by default does not install Proxy (to avoid inconsistency with an external data plane). When `apiEndpoint` is set, helm test validates the external API and node registration.
 
 ## 7. Key values toggles
 
@@ -386,8 +402,8 @@ Does not install built-in Master / API / MySQL / Redis / WebUI; by default does 
 | --- | --- | --- |
 | `global.timezone` | `Asia/Shanghai` | Injects `TZ` into Chart-managed containers |
 | `storageClass.create` / `name` / `provisioner` | `create=false` | Whether the chart creates a StorageClass; default is no (PVCs use cluster default SC; TKE uses `values-tke.yaml`) |
-| `persistence.storageClassName` | `""` | Shared SC for the three PVCs; `""` → cluster default |
-| `*.persistence.storageClassName` (master/mysql/redis) | `""` | Per-component override; non-empty wins over top-level |
+| `persistence.storageClassName` | `""` | Shared SC for the four PVCs; `""` → cluster default |
+| `*.persistence.storageClassName` (master/mysql/redis/minio) | `""` | Per-component override; non-empty wins over top-level |
 | `controlPlane.enabled` | `true` | Built-in control plane |
 | `externalControlPlane.enabled` | `false` | External CubeMaster |
 | `placement.controlPlane.nodeSelector` | `cube-control=true` | Control-plane scheduling |
@@ -397,14 +413,18 @@ Does not install built-in Master / API / MySQL / Redis / WebUI; by default does 
 | `cubeProxy.configureClusterDNS` | `true` | Whether to write cluster CoreDNS |
 | `cubeNode.dns.sandbox.followNodeDns` | `true` | guest follows node DNS |
 | `cubeNode.pvmGuestKernel.enabled` | `true` | Whether first-install default prefers PVM guest |
+| `cubeNode.hostNetwork` | `true` | Host network; on the Pod network a Pod recreate breaks every sandbox's networking on the node |
+| `cubeNode.hostNetworkChangeAck` | `false` | One-time acknowledgement for the network-mode preflight Hook |
 | `bootstrap.pvmHostKernel.enabled` | `true` | host kernel bootstrap (may reboot nodes) |
 | `bootstrap.pvmHostKernel.startupGate.enabled` | `true` | Hard NoSchedule node taint gate when PVM is not ready |
 | `bootstrap.pvmHostKernel.bootArgs` | `nopti pti=off` | Current `kvm_pvm` does not support host KPTI |
 | `bootstrap.nodeInit.*` | several | Preflight, XFS, KVM, CIDR |
 | `mysql.host` / `redis.host` | `""` | Non-empty → use third-party |
+| `volumeS3.endpoint` / `existingSecret` | `""` | S3 config source: auto-filled from the built-in MinIO when both are empty and `minio.enabled=true`; setting either explicitly requires `minio.enabled=false` (pick one, mutually exclusive) |
 | `cubeProxy.enabled` / `ingress.enabled` | `true` | Proxy / Ingress |
 | `lifecycleManager.enabled` | `true` | Required when Proxy is enabled |
 | `cubeEgress.enabled` | `true` | Big Pod egress sidecar |
+| `cubeS3lvol.enabled` | `false` | Big Pod s3lvol sidecar (recreates the Pod; ~2 CPU / 19 GiB / 512 GiB sparse WAL, including the default 1 GiB RAM cache) |
 | `cubeOps.enabled` | `true` | CubeOps (JWT ops API; WebUI upstream) |
 | `webui.enabled` | `true` | WebUI (requires `cubeOps.enabled=true`) |
 
@@ -412,11 +432,11 @@ Does not install built-in Master / API / MySQL / Redis / WebUI; by default does 
 
 | Test Pod | Coverage |
 | --- | --- |
-| `<release>-health-test` | Master / Ops / API / node registration / WebUI / Proxy / workload Ready / Egress presence |
+| `<release>-health-test` | Master / Ops / API / node registration / WebUI / Proxy / workload Ready / Egress presence / s3lvol presence when enabled |
 | `<release>-mysql-test` / `redis-test` | Built-in dependency connectivity |
 | `<release>-dns-test` | `cube.app` / wildcard → Proxy Service |
 | `<release>-node-image-test` | Runtime tools and assets inside the image |
-| `<release>-node-runtime-test` | `/dev/kvm`, cubelet / network-agent sockets |
+| `<release>-node-runtime-test` | `/dev/kvm`, cubelet socket, embedded network runtime |
 
 ```bash
 helm test <release> -n <namespace> --timeout 20m --logs
@@ -424,7 +444,7 @@ helm test <release> -n <namespace> --timeout 20m --logs
 
 ## 9. Ownership and uninstall boundaries
 
-The Chart manages and removes with the release: control- and compute-plane workloads, built-in MySQL/Redis, Proxy, CA/TLS/config Secrets, Helm test RBAC, diagnostics ConfigMap, etc.
+The Chart manages and removes with the release: control- and compute-plane workloads, built-in MySQL/Redis/MinIO, Proxy, CA/TLS/config Secrets, Helm test RBAC, diagnostics ConfigMap, etc.
 
 The Chart **does not** manage: node labels/taints, third-party DBs, external DNS/LB, hostPath data, host kernel / GRUB / udev / fstab / XFS and other node-level persistent changes. After uninstall, clean host leftovers per platform runbook.
 

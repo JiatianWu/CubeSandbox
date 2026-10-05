@@ -21,12 +21,11 @@ import (
 	fwk "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/framework"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/nodehealth"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/rediskey"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/utils"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/wrapredis"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 type EventType string
@@ -56,7 +55,7 @@ func Init(ctx context.Context) error {
 	l.imageCache = cache.New(0, 0)
 	l.templateNodeCache = cache.New(0, 0)
 	l.db = db.Init(config.GetDbConfig())
-	l.dbAddr = config.GetConfig().OssDBConfig.Addr
+	l.dbAddr = config.GetDbConfig().Addr
 	l.totalSelfNodes = config.GetConfig().Common.DefaultHeadlessServiceNodesNum
 	l.sortedNodesByClusters = make(map[string]node.NodeList)
 	l.sortedNodesByClusters[constants.DefaultInstanceTypeName] = node.NodeList{}
@@ -64,7 +63,7 @@ func Init(ctx context.Context) error {
 		l.sortedNodesByClusters[k] = node.NodeList{}
 	}
 
-	if err := l.loadAllFromDB(); err != nil {
+	if err := l.loadAllFromDB(context.Background()); err != nil {
 		return fmt.Errorf("loadAllFromDB:%v", err)
 	}
 
@@ -179,19 +178,13 @@ func GetNode(id string) (*node.Node, bool) {
 	return nil, false
 }
 
-func metadataHealthTimeout() time.Duration {
-	return nodehealth.MetadataTimeout(config.GetConfig().Common.SyncMetaDataInterval)
-}
-
-func cloneNodeWithCurrentHealth(n *node.Node, now time.Time) *node.Node {
+// cloneNodeWithCurrentHealth returns a defensive copy of n; CubeMaster trusts
+// the CubeOps Healthy verdict without overriding it on sync staleness.
+func cloneNodeWithCurrentHealth(n *node.Node, _ time.Time) *node.Node {
 	if n == nil {
 		return nil
 	}
-	current := n.Clone()
-	status := nodehealth.EvaluateFromFacts(n.ReportedReady, n.MetaDataUpdateAt, now, metadataHealthTimeout())
-	current.Healthy = status.Healthy
-	current.UnhealthyReason = status.UnhealthyReason
-	return current
+	return n.Clone()
 }
 
 func GetNodesByIp(ip string) (*node.Node, bool) {

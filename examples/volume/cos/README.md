@@ -3,7 +3,7 @@
 This guide is for **first-time Volume Plugin users**: follow the steps in order to use COS as persistent storage (create Volume → mount in sandbox → read/write → unmount → delete).
 
 > **Version requirement:** Cube platform **≥ 0.6.0**, Python SDK **`cubesandbox` ≥ 0.6.0**.  
-> Protocol and Hook details: [Volume Plugin framework](../../docs/guide/volume-plugin.md).
+> Protocol and Hook details: [Volume Plugin framework](../../../docs/guide/volume-plugin.md).
 
 **Default path: binary plugin** (`driver=cos`, Shell + coscmd + cosfs — easiest to run). For the Go rpc plugin (`driver=cos-rpc`), see [rpc path](#rpc-path-optional) at the end.
 
@@ -120,6 +120,8 @@ The install script runs similar checks when using `--cosfs` / `--coscmd` / `--jq
 
 One-click install places the binary plugin under **`/usr/local/services/cubetoolbox/CubeMaster/plugin/`** (Controller) and **`/usr/local/services/cubetoolbox/Cubelet/plugin/`** (Node), and seeds `volume-cos.conf` from `volume-cos.conf.example` in each directory. After install, edit credentials on the matching node:
 
+> **Third-party plugins:** install outside the cubetoolbox tree, otherwise they are reset on Cube upgrade.
+
 ```bash
 # CubeMaster node (create / destroy)
 sudo chmod 600 /usr/local/services/cubetoolbox/CubeMaster/plugin/volume-cos.conf
@@ -173,7 +175,7 @@ volume_plugins:
 
 Notes:
 
-- `name: cos` is the API/SDK **`driver`**; when `Volume.create("x")` omits driver, the **first** list entry is used.
+- `name: cos` is the API/SDK **`driver`**. The default install now lists `s3` first, so `Volume.create("x")` without `driver` routes to S3 — **pass `driver="cos"` explicitly** to use COS.
 - For binary-only setup, the snippet above is enough; do not duplicate `cos`.
 
 Save and restart together with Cubelet ([§5](#5-restart-services-and-verify)).
@@ -278,7 +280,7 @@ Full lifecycle (create Volume → mount → read/write → destroy sandbox → d
 from cubesandbox import Sandbox, Volume
 
 # ① Create Volume (COS gets volumes/<id>/.keep)
-vol = Volume.create("my-data")          # omit driver → first cos in conf
+vol = Volume.create("my-data", driver="cos")   # cos is no longer the default; pass driver explicitly
 print("volume_id:", vol.volume_id)
 
 # ② Create sandbox with mount
@@ -354,9 +356,9 @@ The script prints a grouped report (PASS / FAIL / SKIP). Exit code is non-zero i
 | `no plugin registered for driver "cos"` | Cubelet missing same-name plugin or not restarted |
 | Sandbox create / attach fails | Cubelet logs: `[plugin_volume]`, `cosfs`; cosfs, FUSE, `volume-cos.conf` |
 | SDK write fails | `CUBE_PROXY_NODE_IP`; CubeAPI / template READY |
-| `Volume.create` without driver not using cos | **First** entry in `volume_plugins` is the default driver |
+| `Volume.create` without driver not using cos | The default driver is now `s3` (first `volume_plugins` entry); use COS by passing `driver="cos"` explicitly |
 
-More: [Framework §8 Troubleshooting](../../docs/guide/volume-plugin.md#8-debugging-and-troubleshooting).
+More: [Framework §8 Troubleshooting](../../../docs/guide/volume-plugin.md#debugging-and-troubleshooting).
 
 ---
 
@@ -420,4 +422,4 @@ examples/volume/cos/
 | [binary/README.md](binary/README.md) | Script implementation, manual attach/detach |
 | [rpc/README.md](rpc/README.md) | rpc build, systemd, running both plugins |
 | [verify_volume.py](verify_volume.py) | Automated Python SDK verification |
-| [Volume Plugin framework](../../docs/guide/volume-plugin.md) | Protocol, RefCount, Hook semantics |
+| [Volume Plugin framework](../../../docs/guide/volume-plugin.md) | Protocol, RefCount, Hook semantics |

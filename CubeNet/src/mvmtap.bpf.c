@@ -14,6 +14,7 @@
 #include "map.h"
 #include "skb.h"
 #include "tcp.h"
+#include "tcp_reset.h"
 #include "udp.h"
 #include "dns_query.h"
 
@@ -106,42 +107,131 @@ static __always_inline bool should_do_nat(const struct iphdr *l3)
 	return true;
 }
 
-/*
- * Check whether a TCP flow should be redirected to the L7 proxy.
- *
- * Looks up allow_out_v2 for the given ifindex/daddr and returns true iff
- * the entry carries NET_POLICY_FLAG_L7_REQUIRED and the destination port
- * is 80 or 443. This is a fast, self-contained lookup — the general
- * egress policy check (allow / deny) is enforced later inside
- * create_nat_session().
- */
-static __always_inline bool should_redirect_to_l7_proxy(__u32 ifindex, __u32 daddr,
-							const struct tcphdr *l4)
+/* Primary IPv4 prefix of the node NIC. Direct mode only. */
+static __always_inline bool direct_egress_is_onlink(__u32 daddr)
 {
-	struct lpm_key key = { .prefixlen = 32, .ip = daddr };
-	struct net_policy_value_v2 *value;
-	void *inner_map;
-
-	if (l4->dest != bpf_htons(80) && l4->dest != bpf_htons(443))
-		return false;
-
-	inner_map = bpf_map_lookup_elem(&allow_out_v2, &ifindex);
-	if (!inner_map)
-		return false;
-
-	value = bpf_map_lookup_elem(inner_map, &key);
-	if (!value)
-		return false;
-	if (value->expires_at_ns != 0 && value->expires_at_ns <= bpf_ktime_get_ns())
-		return false;
-
-	return value->flags & NET_POLICY_FLAG_L7_REQUIRED;
+	return egress_redirect_flags == 0 &&
+	       (daddr & nodenic_netmask) == (nodenic_ip & nodenic_netmask);
 }
 
+static __always_inline bool direct_neighbor_is_zero(const struct direct_neighbor *neighbor)
+{
+	const union macaddr *macaddr = (const union macaddr *)neighbor->addr;
+
+	return macaddr->p1 == 0 && macaddr->p2 == 0;
+}
+
+/* Resolve the external L2 addresses for an on-link direct-egress destination.
+ *
+ * The kernel neighbor table is the only source of truth for the MAC:
+ *   - a fresh positive entry in direct_neigh is used as-is (no fib lookup);
+ *   - a fresh negative entry (recent fib failure) skips fib and falls back;
+ *   - otherwise bpf_fib_lookup() refreshes the cache, and on failure the cache
+ *     is invalidated and the gateway MAC is used as a fallback.
+ *
+ * There is no packet drop or packet-into-ARP conversion: an unresolved on-link
+ * destination is forwarded to the gateway (zero loss on hairpin networks; a
+ * bounded blackhole elsewhere until the scanner's trigger makes the kernel ARP
+ * resolve and the next fib refresh caches the MAC). It only rewrites the skb's
+ * L2 addresses; the packet is always forwarded.
+ */
+static __always_inline void prepare_egress_l2(struct __sk_buff *skb,
+					      struct ethhdr *l2, __u32 daddr)
+{
+	struct bpf_fib_lookup fib = {
+		.family = AF_INET,
+		.ifindex = nodenic_ifindex,
+		.ipv4_src = nodenic_ip,
+		.ipv4_dst = daddr,
+	};
+	struct direct_neighbor pending = {};
+	struct direct_neighbor *neighbor;
+	union macaddr *mac;
+	__u64 now;
+	long err;
+
+	if (!direct_egress_is_onlink(daddr)) {
+		set_mac_pair(l2, egress_smacaddr_p1, egress_smacaddr_p2,
+			     egress_dmacaddr_p1, egress_dmacaddr_p2);
+		return;
+	}
+
+	now = bpf_ktime_get_ns();
+	neighbor = bpf_map_lookup_elem(&direct_neigh, &daddr);
+	if (!neighbor) {
+		/* Untracked destination: only register for the scanner, never
+		 * disturb its scheduling fields. Seed last_used_ns so the
+		 * scanner's GC (idle > GC_AFTER) never reclaims a freshly
+		 * created entry in the window before the end-of-function
+		 * touch, while the datapath still holds its pointer. */
+		pending.last_used_ns = now;
+		bpf_map_update_elem(&direct_neigh, &daddr, &pending, BPF_NOEXIST);
+		neighbor = bpf_map_lookup_elem(&direct_neigh, &daddr);
+	}
+	if (!neighbor) {
+		/* Map full or vanished: untracked, pure gateway fallback. */
+		set_mac_pair(l2, egress_smacaddr_p1, egress_smacaddr_p2,
+			     egress_dmacaddr_p1, egress_dmacaddr_p2);
+		return;
+	}
+
+	if (now < neighbor->valid_until_ns) {
+		if (!direct_neighbor_is_zero(neighbor)) {
+			/* Positive cache hit: use the cached MAC, no fib. */
+			mac = (union macaddr *)neighbor->addr;
+			set_mac_pair(l2, nodenic_macaddr_p1, nodenic_macaddr_p2,
+				     mac->p1, mac->p2);
+		} else {
+			/* Negative cache hit (recent fib failure): skip fib. */
+			set_mac_pair(l2, egress_smacaddr_p1, egress_smacaddr_p2,
+				     egress_dmacaddr_p1, egress_dmacaddr_p2);
+		}
+	} else {
+		err = bpf_fib_lookup(skb, &fib, sizeof(fib),
+				     BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_OUTPUT);
+		if (err == BPF_FIB_LKUP_RET_SUCCESS &&
+		    fib.ifindex == nodenic_ifindex) {
+			const union macaddr *dmac = (const union macaddr *)fib.dmac;
+			const union macaddr *smac = (const union macaddr *)fib.smac;
+
+			/* Cache the MAC; valid_until is written ONLY on a fib
+			 * result, never renewed on a cache hit. */
+			mac = (union macaddr *)neighbor->addr;
+			mac->p1 = dmac->p1;
+			mac->p2 = dmac->p2;
+			neighbor->valid_until_ns = now + DIRECT_NEIGH_CACHE_TTL_NS;
+			neighbor->fib_ok = 1;
+			set_mac_pair(l2, smac->p1, smac->p2, dmac->p1, dmac->p2);
+		} else {
+			/* Invalidate the cache and fall back to the gateway. A
+			 * short negative TTL keeps a dead destination from
+			 * triggering a fib lookup on every packet. */
+			mac = (union macaddr *)neighbor->addr;
+			mac->p1 = 0;
+			mac->p2 = 0;
+			neighbor->valid_until_ns = now + DIRECT_NEIGH_NEG_TTL_NS;
+			neighbor->fib_ok = 0;
+			set_mac_pair(l2, egress_smacaddr_p1, egress_smacaddr_p2,
+				     egress_dmacaddr_p1, egress_dmacaddr_p2);
+		}
+	}
+
+	/* Throttle last_used writes to 1s granularity; never renew valid_until. */
+	if (now > neighbor->last_used_ns + DIRECT_NEIGH_TOUCH_THROTTLE_NS)
+		neighbor->last_used_ns = now;
+}
+
+/* Egress flow classification now lives in classify_egress_flow() (session.h),
+ * which merges the former l7_scheme_for_flow() and session_policy_allowed()
+ * into a single policy verdict (reject / accept-SNAT / accept-HTTP /
+ * accept-HTTPS). It is applied once, when a new flow is created, and the
+ * result is cached in nat_session for reuse on every later packet.
+ */
 enum tcp_nat_result {
 	TCP_NAT_DROP = 0,
 	TCP_NAT_OK,
 	TCP_NAT_RESET,
+	TCP_L7PROXY_OK,
 };
 
 /* do_tcp_nat() returns a 64-bit value that encodes both the status enum
@@ -153,216 +243,6 @@ enum tcp_nat_result {
 	((((__u64)(ifindex)) << 32) | (__u32)(status))
 #define TCP_NAT_STATUS(ret)	((enum tcp_nat_result)((__u32)(ret)))
 #define TCP_NAT_IFINDEX(ret)	((__u32)((__u64)(ret) >> 32))
-
-static __always_inline bool tcp_segment_len(const struct iphdr *l3, const struct tcphdr *l4,
-					    __u32 *seg_len)
-{
-	__u16 ip_hlen, tcp_hlen, total_len;
-
-	ip_hlen = BPF_CORE_READ_BITFIELD(l3, ihl);
-	ip_hlen <<= 2;
-	tcp_hlen = BPF_CORE_READ_BITFIELD(l4, doff);
-	tcp_hlen <<= 2;
-	total_len = bpf_ntohs(l3->tot_len);
-	if (ip_hlen < sizeof(struct iphdr) || tcp_hlen < sizeof(struct tcphdr) ||
-	    total_len < ip_hlen + tcp_hlen)
-		return false;
-
-	*seg_len = total_len - ip_hlen - tcp_hlen;
-	if (l4->syn)
-		(*seg_len)++;
-	if (l4->fin)
-		(*seg_len)++;
-
-	return true;
-}
-
-/* Update the IP tot_len field together with the IP header checksum.
- * Uses bpf_l3_csum_replace for the incremental csum update and
- * bpf_skb_store_bytes to write the new value, instead of touching the
- * packet pointer directly.
- */
-static __always_inline int rewrite_l3_tot_len(struct __sk_buff *skb,
-					      __be16 old_tot_len, __be16 new_tot_len)
-{
-	long err;
-
-	err = bpf_l3_csum_replace(skb, IP_CSUM_OFF, old_tot_len, new_tot_len,
-				  sizeof(new_tot_len));
-	if (err)
-		return err;
-
-	return bpf_skb_store_bytes(skb, IP_TOT_LEN_OFF, &new_tot_len,
-				   sizeof(new_tot_len), 0);
-}
-
-/* Set the TCP checksum field of a freshly written TCP header.
- *
- * Pre-condition: the TCP header at @tcp_csum_off..+sizeof(*tcp) is already
- * present in skb with the check field cleared to 0. This helper folds the
- * IPv4 pseudo-header (saddr, daddr, proto, length) and the on-wire TCP
- * header bytes into the checksum via bpf_l4_csum_replace.
- *
- * Per the bpf-helpers(7) man page, calling bpf_l4_csum_replace with
- * from = 0 makes the helper recompute the csum against `to` only — i.e.
- * accumulates `to` into the existing in-place checksum. We start from a
- * zeroed check field and add each 32-bit word in turn.
- */
-static __always_inline int tcp_ipv4_set_checksum(struct __sk_buff *skb,
-						 __u32 tcp_csum_off,
-						 __be32 saddr, __be32 daddr,
-						 const struct tcphdr *tcp)
-{
-	const __u32 *words = (const __u32 *)tcp;
-	/* zero | proto | length, in network byte order */
-	__be32 proto_len = bpf_htonl(((__u32)IPPROTO_TCP << 16) | sizeof(*tcp));
-	__u64 ph_flags = BPF_F_PSEUDO_HDR | sizeof(__u32);
-	__u64 hdr_flags = sizeof(__u32);
-	long err;
-
-	/* Pseudo-header words */
-	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, saddr, ph_flags);
-	if (err)
-		return err;
-	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, daddr, ph_flags);
-	if (err)
-		return err;
-	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, proto_len, ph_flags);
-	if (err)
-		return err;
-
-	/* TCP header words: source|dest, seq, ack_seq, doff/flags/window,
-	 * check|urg_ptr. The check word currently contains 0 (caller wrote
-	 * a zeroed check field), so adding it is a no-op for the csum.
-	 */
-	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[0], hdr_flags);
-	if (err)
-		return err;
-	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[1], hdr_flags);
-	if (err)
-		return err;
-	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[2], hdr_flags);
-	if (err)
-		return err;
-	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[3], hdr_flags);
-	if (err)
-		return err;
-	return bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[4], hdr_flags);
-}
-
-static __always_inline int tcp_reply_reset(struct __sk_buff *skb, __u32 ifindex)
-{
-	struct tcphdr new_tcp = {};
-	struct ethhdr *l2;
-	struct iphdr *l3;
-	struct tcphdr *l4;
-	__be32 old_saddr, old_daddr, new_saddr, new_daddr;
-	__be16 old_tot_len, new_tot_len;
-	__u32 seq, ack_seq, new_skb_len;
-	__u32 seg_len, tcp_off, tcp_csum_off;
-	__u16 ip_hlen, new_ip_len;
-	long err;
-
-	/* bpf_skb_change_tail() may fail on GSO skbs or leave segmentation
-	 * state inconsistent. Fall back to drop instead of sending RST.
-	 */
-	if (skb->gso_segs)
-		return TC_ACT_SHOT;
-
-	if (!__pull_headers(skb, &l2, &l3, &l4))
-		return TC_ACT_SHOT;
-
-	if ((l3->frag_off & IP_FLAG_MF) || (l3->frag_off & IP_FRAG_OFF_MASK))
-		return TC_ACT_SHOT;
-
-	/* Never send a reset in response to a reset. */
-	if (l4->rst)
-		return TC_ACT_SHOT;
-
-	ip_hlen = BPF_CORE_READ_BITFIELD(l3, ihl);
-	ip_hlen <<= 2;
-	seq = l4->seq;
-	ack_seq = l4->ack_seq;
-	if (!tcp_segment_len(l3, l4, &seg_len))
-		return TC_ACT_SHOT;
-
-	new_saddr = l3->daddr;
-	new_daddr = mvm_inner_ip;
-	new_tcp.source = l4->dest;
-	new_tcp.dest = l4->source;
-	new_tcp.doff = sizeof(new_tcp) >> 2;
-	new_tcp.rst = 1;
-	if (l4->ack) {
-		new_tcp.seq = ack_seq;
-	} else {
-		new_tcp.ack_seq = bpf_htonl(bpf_ntohl(seq) + seg_len);
-		new_tcp.ack = 1;
-	}
-	/* Build the new TCP header with check = 0; tcp_ipv4_set_checksum()
-	 * folds the pseudo-header and TCP header words into the checksum
-	 * incrementally via bpf_l4_csum_replace.
-	 */
-
-	new_ip_len = ip_hlen + sizeof(new_tcp);
-	new_skb_len = sizeof(struct ethhdr) + new_ip_len;
-	if (bpf_skb_change_tail(skb, new_skb_len, 0))
-		return TC_ACT_SHOT;
-
-	/* bpf_skb_change_tail invalidates all packet pointers. */
-	if (!__pull_headers(skb, &l2, &l3, &l4))
-		return TC_ACT_SHOT;
-
-	/* Snapshot old IP header fields and rewrite the L2 MAC pair before
-	 * touching the packet via BPF helpers — bpf_skb_store_bytes() and
-	 * bpf_l{3,4}_csum_replace() invalidate l2/l3/l4 pointers.
-	 */
-	old_saddr = l3->saddr;
-	old_daddr = l3->daddr;
-	old_tot_len = l3->tot_len;
-	new_tot_len = bpf_htons(new_ip_len);
-	tcp_off = sizeof(struct ethhdr) + ip_hlen;
-	tcp_csum_off = TCP_CSUM_OFF(ip_hlen);
-	set_mac_pair(l2, cubegw0_macaddr_p1, cubegw0_macaddr_p2,
-		     mvm_macaddr_p1, mvm_macaddr_p2);
-
-	/* Write the new TCP header (with check = 0). */
-	err = bpf_skb_store_bytes(skb, tcp_off, &new_tcp, sizeof(new_tcp), 0);
-	if (err)
-		return TC_ACT_SHOT;
-
-	/* Update IP tot_len + IP csum. */
-	err = rewrite_l3_tot_len(skb, old_tot_len, new_tot_len);
-	if (err)
-		return TC_ACT_SHOT;
-
-	/* Update IP saddr + IP csum. */
-	err = bpf_l3_csum_replace(skb, IP_CSUM_OFF, old_saddr, new_saddr,
-				  sizeof(new_saddr));
-	if (err)
-		return TC_ACT_SHOT;
-	err = bpf_skb_store_bytes(skb, IP_SADDR_OFF, &new_saddr,
-				  sizeof(new_saddr), 0);
-	if (err)
-		return TC_ACT_SHOT;
-
-	/* Update IP daddr + IP csum. */
-	err = bpf_l3_csum_replace(skb, IP_CSUM_OFF, old_daddr, new_daddr,
-				  sizeof(new_daddr));
-	if (err)
-		return TC_ACT_SHOT;
-	err = bpf_skb_store_bytes(skb, IP_DADDR_OFF, &new_daddr,
-				  sizeof(new_daddr), 0);
-	if (err)
-		return TC_ACT_SHOT;
-
-	/* Compute the TCP checksum into the (currently zero) check field. */
-	err = tcp_ipv4_set_checksum(skb, tcp_csum_off, new_saddr, new_daddr,
-				    &new_tcp);
-	if (err)
-		return TC_ACT_SHOT;
-
-	return bpf_redirect(ifindex, 0);
-}
 
 static __always_inline struct snat_ip *pick_snat_ip_port(__u32 mvm_ip, const struct session_key *ekey,
 							 __u16 *selected_port)
@@ -410,6 +290,53 @@ static __always_inline struct snat_ip *pick_snat_ip_port(__u32 mvm_ip, const str
 	return NULL;
 }
 
+/* Reserve the reverse-flow key for an L7 proxy session. L7 traffic is not
+ * source-NATed, so the reply tuple is the exact reverse of the sandbox's
+ * original tuple. create_nat_session() later inserts the matching egress value
+ * and rolls this reservation back if that insertion fails.
+ *
+ * TAP reuse / rollback can leave that reverse slot occupied. Copy the occupant
+ * version first, delete that generation's egress so the reaper cannot later
+ * tear down this ingress, then delete the stale ingress and re-insert with
+ * BPF_NOEXIST. Same-generation L7 TIME_WAIT never reaches here: do_tcp_nat
+ * finds that egress first and RSTs.
+ */
+static __always_inline bool create_l7_ingress_session(const struct session_key *ekey)
+{
+	struct ingress_session isess = {
+		.version = ekey->version,
+		.vm_ip = ekey->src_ip,
+		.vm_port = ekey->src_port,
+	};
+	struct session_key ikey = {
+		.src_ip = ekey->dst_ip,
+		.dst_ip = ekey->src_ip,
+		.src_port = ekey->dst_port,
+		.dst_port = ekey->src_port,
+		.version = 0,
+		.protocol = ekey->protocol,
+	};
+	struct ingress_session *old;
+	struct session_key old_ekey = {};
+	__u32 old_version;
+
+	old = bpf_map_lookup_elem(&ingress_sessions, &ikey);
+	if (old) {
+		old_version = old->version;
+		old_ekey.src_ip = ikey.dst_ip;
+		old_ekey.dst_ip = ikey.src_ip;
+		old_ekey.src_port = ikey.dst_port;
+		old_ekey.dst_port = ikey.src_port;
+		old_ekey.version = old_version;
+		old_ekey.protocol = ikey.protocol;
+		bpf_map_delete_elem(&egress_sessions, &old_ekey);
+		bpf_map_delete_elem(&ingress_sessions, &ikey);
+	}
+
+	return bpf_map_update_elem(&ingress_sessions, &ikey, &isess,
+				   BPF_NOEXIST) == 0;
+}
+
 static __always_inline void del_session(struct session_key *ekey, struct nat_session *sess)
 {
 	struct session_key ikey = {
@@ -440,6 +367,7 @@ static __always_inline __u32 do_icmp_nat(struct __sk_buff *skb, struct mvm_meta 
 	struct ethhdr *l2;
 	struct iphdr *l3;
 	struct icmphdr *l4;
+	__u32 policy_version;
 	__u16 ip_hlen;
 	__u16 snat_id;
 	__u64 flags;
@@ -455,6 +383,11 @@ static __always_inline __u32 do_icmp_nat(struct __sk_buff *skb, struct mvm_meta 
 		return 0;
 
 	now = bpf_ktime_get_ns();
+	/* Read the generation once, before any classification: userspace can bump
+	 * it mid-packet, and judging under one generation while stamping another
+	 * would retire the re-check that the newer generation is owed.
+	 */
+	policy_version = mvm_meta->policy_version;
 	/* Use ICMP identifier as the "port" identifier in the session key */
 	key.src_ip = mvm_meta->ip;
 	key.dst_ip = l3->daddr;
@@ -465,15 +398,27 @@ static __always_inline __u32 do_icmp_nat(struct __sk_buff *skb, struct mvm_meta 
 
 	sess = bpf_map_lookup_elem(&egress_sessions, &key);
 	if (sess) {
+		/* revoked by a policy update: retire the pair and drop, since
+		 * there is nothing to reset on ICMP
+		 */
+		if (session_policy_revoked(sess, policy_version, skb->ingress_ifindex,
+					   key.dst_ip, key.dst_port, key.protocol)) {
+			del_session(&key, sess);
+			return 0;
+		}
 		update_icmp_session(IP_CT_DIR_ORIGINAL, sess, now);
 		goto do_nat;
 	}
 
 	/* create new session */
+	if (classify_egress_flow(skb->ingress_ifindex, key.dst_ip,
+				 key.dst_port, key.protocol) == FLOW_REJECT)
+		return 0;
 	snat_ip = pick_snat_ip_port(mvm_meta->ip, &key, &snat_id);
 	if (!snat_ip || !snat_ip->ip || !snat_id)
 		return 0;
-	ok = create_icmp_sessions(skb, &key, now, skb->ingress_ifindex, snat_ip, snat_id);
+	ok = create_icmp_sessions(skb, &key, now, skb->ingress_ifindex, snat_ip, snat_id,
+				  policy_version);
 	if (!ok)
 		return 0;
 	sess = bpf_map_lookup_elem(&egress_sessions, &key);
@@ -489,10 +434,6 @@ do_nat:
 	ip_hlen = BPF_CORE_READ_BITFIELD(l3, ihl);
 	ip_hlen <<= 2;
 	icmp_csum_off = ICMP_CSUM_OFF(ip_hlen);
-
-	/* update L2 first: csum/store helpers may invalidate packet pointers */
-	set_mac_pair(l2, egress_smacaddr_p1, egress_smacaddr_p2,
-		     egress_dmacaddr_p1, egress_dmacaddr_p2);
 
 	/* update ICMP csum: ICMP has no pseudo-header, so no BPF_F_PSEUDO_HDR.
 	 * Only the echo identifier change affects the csum (IP saddr is not
@@ -543,6 +484,7 @@ static __always_inline __u32 do_udp_nat_inline(struct __sk_buff *skb,
 	struct ethhdr *l2;
 	struct iphdr *l3;
 	struct udphdr *l4;
+	__u32 policy_version;
 	__u16 ip_hlen;
 	__u16 snat_port;
 	__u64 flags;
@@ -554,6 +496,8 @@ static __always_inline __u32 do_udp_nat_inline(struct __sk_buff *skb,
 		return 0;
 
 	now = bpf_ktime_get_ns();
+	/* See do_icmp_nat(): one read per packet, taken before any classification. */
+	policy_version = mvm_meta->policy_version;
 	key.src_ip = mvm_meta->ip;
 	key.dst_ip = l3->daddr;
 	key.src_port = l4->source;
@@ -563,15 +507,27 @@ static __always_inline __u32 do_udp_nat_inline(struct __sk_buff *skb,
 
 	sess = bpf_map_lookup_elem(&egress_sessions, &key);
 	if (sess) {
+		/* revoked by a policy update: retire the pair and drop, since
+		 * there is nothing to reset on UDP
+		 */
+		if (session_policy_revoked(sess, policy_version, skb->ingress_ifindex,
+					   key.dst_ip, key.dst_port, key.protocol)) {
+			del_session(&key, sess);
+			return 0;
+		}
 		update_udp_session(IP_CT_DIR_ORIGINAL, sess, now);
 		goto do_nat;
 	}
 
 	/* create new session */
+	if (classify_egress_flow(skb->ingress_ifindex, key.dst_ip,
+				 key.dst_port, key.protocol) == FLOW_REJECT)
+		return 0;
 	snat_ip = pick_snat_ip_port(mvm_meta->ip, &key, &snat_port);
 	if (!snat_ip || !snat_ip->ip || !snat_port)
 		return 0;
-	ok = create_udp_sessions(skb, &key, now, skb->ingress_ifindex, snat_ip, snat_port);
+	ok = create_udp_sessions(skb, &key, now, skb->ingress_ifindex, snat_ip, snat_port,
+				 policy_version);
 	if (!ok)
 		return 0;
 	sess = bpf_map_lookup_elem(&egress_sessions, &key);
@@ -588,10 +544,6 @@ do_nat:
 	ip_hlen = BPF_CORE_READ_BITFIELD(l3, ihl);
 	ip_hlen <<= 2;
 	udp_csum_off = UDP_CSUM_OFF(ip_hlen);
-
-	/* update L2 first: csum/store helpers may invalidate packet pointers */
-	set_mac_pair(l2, egress_smacaddr_p1, egress_smacaddr_p2,
-		     egress_dmacaddr_p1, egress_dmacaddr_p2);
 
 	/* update UDP csum only if it was non-zero (UDP csum is optional over IPv4).
 	 * BPF_F_MARK_MANGLED_0 keeps a 0 csum (= disabled) intact in case the
@@ -681,14 +633,21 @@ static __always_inline __u64 do_tcp_nat(struct __sk_buff *skb, struct mvm_meta *
 	struct session_key key = {};
 	struct nat_session *sess;
 	struct snat_ip *snat_ip;
+	struct snat_ip l7_endpoint = {};
 	bool syn, ack, fin, rst;
 	struct ethhdr *l2;
 	struct iphdr *l3;
 	struct tcphdr *l4;
+	__u32 policy_version;
 	__u16 ip_hlen;
 	__u16 snat_port;
 	__u64 flags;
 	__u64 now;
+	__u32 l7_mark;
+	__u8 packet_class = SNAT_PACKET;
+	__u8 l7_scheme = L7_SCHEME_NONE;
+	__u8 verdict = FLOW_SNAT;
+	bool create_snat = false;
 	long err;
 	bool ok;
 
@@ -696,6 +655,8 @@ static __always_inline __u64 do_tcp_nat(struct __sk_buff *skb, struct mvm_meta *
 		return TCP_NAT_DROP;
 
 	now = bpf_ktime_get_ns();
+	/* See do_icmp_nat(): one read per packet, taken before any classification. */
+	policy_version = mvm_meta->policy_version;
 	syn = l4->syn;
 	ack = l4->ack;
 	fin = l4->fin;
@@ -711,6 +672,16 @@ static __always_inline __u64 do_tcp_nat(struct __sk_buff *skb, struct mvm_meta *
 		sess = bpf_map_lookup_elem(&egress_sessions, &key);
 		if (sess) {
 			if (sess->state == TCP_CONNTRACK_CLOSE || sess->state == TCP_CONNTRACK_TIME_WAIT) {
+				/* L7 sessions use an identity reverse tuple, so immediately
+				 * replacing a terminal session would let delayed packets from
+				 * the old connection mutate the new session. Keep the old pair
+				 * until the userspace reaper removes it and reject premature
+				 * tuple reuse. Ordinary SNAT sessions remain safe to recreate
+				 * because they allocate a fresh reverse-side source port.
+				 */
+				if (sess->packet_class == L7PROXY_PACKET)
+					return TCP_NAT_PACK(0, TCP_NAT_RESET);
+
 				/* guest kernel reuse source port too fast */
 				del_session(&key, sess);
 				goto do_create;
@@ -719,35 +690,117 @@ static __always_inline __u64 do_tcp_nat(struct __sk_buff *skb, struct mvm_meta *
 			goto do_update;
 		}
 do_create:
-		/* create new session */
-		snat_ip = pick_snat_ip_port(mvm_meta->ip, &key, &snat_port);
-		if (!snat_ip || !snat_ip->ip || !snat_port)
+	/* Classify the flow with the unified egress policy. The verdict is
+	 * cached in nat_session and reused for every later packet.
+	 */
+	verdict = classify_egress_flow(skb->ingress_ifindex, key.dst_ip,
+				       key.dst_port, key.protocol);
+	switch (verdict) {
+	case FLOW_HTTP:
+	case FLOW_HTTPS:
+		if (!create_l7_ingress_session(&key))
 			return TCP_NAT_DROP;
-		ok = create_new_sessions(skb, &key, now, skb->ingress_ifindex, snat_ip, snat_port);
-		if (!ok) {
-			/* Preserve RST-on-deny: create_nat_session stamps
-			 * skb->cb when the failure is due to net policy.
-			 */
-			if (nat_cb_get(skb) == NAT_CB_DENIED_BY_POLICY)
-				return TCP_NAT_PACK(0, TCP_NAT_RESET);
-			return TCP_NAT_DROP;
-		}
-		sess = bpf_map_lookup_elem(&egress_sessions, &key);
-		if (!sess)
-			return TCP_NAT_DROP;
-		goto do_nat;
+		l7_endpoint.ifindex = cubegw0_ifindex;
+		l7_endpoint.ip = key.src_ip;
+		snat_ip = &l7_endpoint;
+		snat_port = key.src_port;
+		packet_class = L7PROXY_PACKET;
+		l7_scheme = (verdict == FLOW_HTTP) ? L7_SCHEME_HTTP :
+						     L7_SCHEME_HTTPS;
+		break;
+	case FLOW_REJECT:
+		/* Denied by egress policy: signal the caller so it can emit an
+		 * RST, exactly as the old create_nat_session path did.
+		 */
+		nat_cb_set(skb, NAT_CB_DENIED_BY_POLICY);
+		return TCP_NAT_PACK(0, TCP_NAT_RESET);
+	case FLOW_SNAT:
+	default:
+		create_snat = true;
+		goto prepare_snat;
+	}
+create_session:
+	ok = create_new_sessions(skb, &key, now, skb->ingress_ifindex,
+				 snat_ip, snat_port, packet_class, l7_scheme,
+				 policy_version);
+	if (!ok)
+		return TCP_NAT_DROP;
+	sess = bpf_map_lookup_elem(&egress_sessions, &key);
+	if (!sess)
+		return TCP_NAT_DROP;
+	goto do_nat;
 	} else {
 		/* lookup existing session */
 		sess = bpf_map_lookup_elem(&egress_sessions, &key);
-		if (!sess)
+		if (!sess) {
+			/* No session: the flow was never authorized, or it was retired
+			 * (reaped, or revoked by a policy update). Either way there is no
+			 * record that this connection is allowed, so answer like every
+			 * other unreachable TCP packet here instead of trusting that a
+			 * live proxy socket implies a past authorization.
+			 */
 			return rst ? TCP_NAT_DROP : TCP_NAT_RESET;
+		}
 	}
 
 do_update:
+	/* A policy update revoked this flow: retire the session pair so the tuple is
+	 * free for an immediate reconnect, and answer with an RST like every other
+	 * unreachable TCP packet here, so the guest learns now instead of stalling
+	 * until its retransmit timer gives up. Never RST an RST, or two peers that
+	 * both consider the flow dead would trade resets forever.
+	 *
+	 * Taken before the L7 branch below so proxied flows are revocable too, and
+	 * before prepare_egress_l2() because resolving L2 for a flow that is about to
+	 * be retired is wasted work -- and a cold ARP miss would consume this packet
+	 * as a probe, deferring the revocation by one more packet.
+	 */
+	if (session_policy_revoked(sess, policy_version, skb->ingress_ifindex,
+				   key.dst_ip, key.dst_port, key.protocol)) {
+		del_session(&key, sess);
+		return rst ? TCP_NAT_DROP : TCP_NAT_RESET;
+	}
+
+	if (sess->packet_class == L7PROXY_PACKET)
+		goto update_existing;
+
+prepare_snat:
+	/* Resolve external L2 before allocating or mutating TCP session state.
+	 * prepare_egress_l2 never drops the packet (unresolved on-link falls back
+	 * to the gateway MAC), so session state can be installed right after. */
+	prepare_egress_l2(skb, l2, key.dst_ip);
+
+	if (create_snat) {
+		snat_ip = pick_snat_ip_port(mvm_meta->ip, &key, &snat_port);
+		if (!snat_ip || !snat_ip->ip || !snat_port)
+			return TCP_NAT_DROP;
+		goto create_session;
+	}
+
+	/* prepare_egress_l2() may update the neighbor map. Reacquire the session
+	 * value before updating it or using it for the NAT rewrite.
+	 */
+	sess = bpf_map_lookup_elem(&egress_sessions, &key);
+	if (!sess || sess->packet_class == L7PROXY_PACKET)
+		return TCP_NAT_DROP;
+
+update_existing:
 	/* update session */
 	update_session(IP_CT_DIR_ORIGINAL, sess, now, syn, ack, fin, rst);
 
 do_nat:
+	if (sess->packet_class == L7PROXY_PACKET) {
+		if (sess->l7_scheme == L7_SCHEME_HTTP)
+			l7_mark = cube_l7_mark_http;
+		else if (sess->l7_scheme == L7_SCHEME_HTTPS)
+			l7_mark = cube_l7_mark_https;
+		else
+			return TCP_NAT_DROP;
+
+		skb->mark = (skb->mark & ~cube_l7_mark_mask) | l7_mark;
+		return TCP_NAT_PACK(sess->node_ifindex, TCP_L7PROXY_OK);
+	}
+
 	old_saddr = l3->saddr;
 	new_saddr = sess->node_ip;
 	old_sport = l4->source;
@@ -756,10 +809,6 @@ do_nat:
 	ip_hlen = BPF_CORE_READ_BITFIELD(l3, ihl);
 	ip_hlen <<= 2;
 	tcp_csum_off = TCP_CSUM_OFF(ip_hlen);
-
-	/* update L2 first: csum/store helpers may invalidate packet pointers */
-	set_mac_pair(l2, egress_smacaddr_p1, egress_smacaddr_p2,
-		     egress_dmacaddr_p1, egress_dmacaddr_p2);
 
 	/* update TCP csum: IP saddr is part of pseudo-header, so BPF_F_PSEUDO_HDR */
 	flags = BPF_F_PSEUDO_HDR | sizeof(old_saddr);
@@ -880,7 +929,7 @@ int dns_finish(struct __sk_buff *skb)
 	if (!dns_policy_enabled(mvm_meta))
 		return finish_udp_nat(skb, mvm_meta);
 
-	inner_map = bpf_map_lookup_elem(&dns_allow, &ifindex);
+	inner_map = bpf_map_lookup_elem(&dns_allow_v2, &ifindex);
 	if (!inner_map)
 		return finish_udp_nat(skb, mvm_meta);
 
@@ -895,7 +944,7 @@ int dns_finish(struct __sk_buff *skb)
 	if (!matched)
 		return finish_udp_nat(skb, mvm_meta);
 
-	dns_track_allowed_query(skb, state, matched->flags, qname_hash);
+	dns_track_allowed_query(skb, state, matched, qname_hash);
 	return finish_udp_nat(skb, mvm_meta);
 }
 
@@ -907,10 +956,10 @@ int from_cube(struct __sk_buff *skb)
 {
 	__u32 daddr, ifindex, dst_ifindex;
 	__u64 tcp_ret;
-	struct bpf_sock_tuple tuple = {};
 	struct mvm_port mvm_port = {};
+	struct nat_session *sess;
+	struct session_key pmkey = {};
 	struct mvm_meta *mvm_meta;
-	struct bpf_sock *sk;
 	struct ethhdr *l2;
 	struct iphdr *l3;
 	struct tcphdr *l4;
@@ -986,28 +1035,23 @@ int from_cube(struct __sk_buff *skb)
 			if (l4->syn && !l4->ack)
 				return TC_ACT_SHOT;
 
+			/* A port_mapping session whose gen differs from the VM's current
+			 * mvm_meta->version is stale (the sandbox was rolled back); reset
+			 * the guest side so the application unblocks. A miss forwards
+			 * statelessly (today's behaviour). port_mapping sessions have no
+			 * ingress entry. */
+			port_mapping_key(&pmkey, l3->daddr, l4->dest, l4->source);
+			sess = bpf_map_lookup_elem(&egress_sessions, &pmkey);
+			if (sess && session_is_stale(sess)) {
+				bpf_map_delete_elem(&egress_sessions, &pmkey);
+				return tcp_send_reset(skb, skb->ingress_ifindex, mvm_inner_ip);
+			}
+
 			err = snat_tcp(skb, ifindex, l2, l3, l4, l4->source, *host_port);
 			if (err)
 				return TC_ACT_SHOT;
 
 			return bpf_redirect(nodenic_ifindex, 0);
-		}
-	}
-
-	if (proto == IPPROTO_TCP &&
-	    __pull_headers(skb, &l2, &l3, &l4) &&
-	    (l4->dest == bpf_htons(80) || l4->dest == bpf_htons(443))) {
-		tuple.ipv4.saddr = mvm_meta->ip;
-		tuple.ipv4.daddr = daddr;
-		tuple.ipv4.sport = l4->source;
-		tuple.ipv4.dport = l4->dest;
-		sk = bpf_skc_lookup_tcp(skb, &tuple, sizeof(tuple.ipv4), BPF_F_CURRENT_NETNS, 0);
-		if (sk) {
-			__u32 state = sk->state;
-
-			bpf_sk_release(sk);
-			if (state == BPF_TCP_ESTABLISHED)
-				return bpf_redirect(cubegw0_ifindex, BPF_F_INGRESS);
 		}
 	}
 
@@ -1020,29 +1064,35 @@ int from_cube(struct __sk_buff *skb)
 
 	if (l3->daddr == nodenic_ip) {
 		/* This branch bypasses do_*_nat() and therefore the policy
-		 * check inside create_nat_session(). Enforce policy inline.
-		 * TCP callers get an RST to match the guest-visible behavior
-		 * of the do_tcp_nat() path; UDP/ICMP silently drop.
+		 * check applied there. Enforce the unified egress policy
+		 * inline. TCP callers get an RST to match the guest-visible
+		 * behavior of the do_tcp_nat() path; UDP/ICMP silently drop.
+		 * dport is 0 because the original check was port-agnostic.
 		 */
-		if (!session_policy_allowed(ifindex, daddr)) {
+		switch (classify_egress_flow(ifindex, daddr, 0, proto)) {
+		case FLOW_REJECT:
 			if (proto == IPPROTO_TCP)
-				return tcp_reply_reset(skb, ifindex);
+				return tcp_send_reset(skb, skb->ingress_ifindex, mvm_inner_ip);
 			return TC_ACT_SHOT;
+		default:
+			return bpf_redirect(cubegw0_ifindex, BPF_F_INGRESS);
 		}
-		return bpf_redirect(cubegw0_ifindex, BPF_F_INGRESS);
 	}
 
 	if (proto == IPPROTO_TCP) {
-		if (!__pull_headers(skb, &l2, &l3, &l4))
-			return TC_ACT_SHOT;
-		if (should_redirect_to_l7_proxy(ifindex, daddr, l4))
-			return bpf_redirect(cubegw0_ifindex, BPF_F_INGRESS);
 		tcp_ret = do_tcp_nat(skb, mvm_meta);
 		if (TCP_NAT_STATUS(tcp_ret) == TCP_NAT_OK)
 			return bpf_redirect(TCP_NAT_IFINDEX(tcp_ret), egress_redirect_flags);
+		if (TCP_NAT_STATUS(tcp_ret) == TCP_L7PROXY_OK)
+			return bpf_redirect(TCP_NAT_IFINDEX(tcp_ret), BPF_F_INGRESS);
 		if (TCP_NAT_STATUS(tcp_ret) == TCP_NAT_RESET)
-			return tcp_reply_reset(skb, ifindex);
+			return tcp_send_reset(skb, skb->ingress_ifindex, mvm_inner_ip);
+		return TC_ACT_SHOT;
 	}
+
+	/* Unresolved on-link destinations fall back to the gateway MAC inside
+	 * prepare_egress_l2 (no drop/probe), so the packet always forwards. */
+	prepare_egress_l2(skb, l2, daddr);
 
 	if (proto == IPPROTO_UDP) {
 		if (!__pull_headers_udp(skb, &l2, &l3, &udp))

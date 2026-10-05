@@ -7,9 +7,9 @@ package types
 
 import (
 	jsoniter "github.com/json-iterator/go"
-	cubeboxv1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
-	imagev1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/images/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
+	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	imagev1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/images/v1"
 )
 
 // NeverTimeout is the never-timeout idle TTL sentinel (-1).
@@ -65,6 +65,9 @@ type CreateCubeSandboxReq struct {
 	DistributionScope []string          `json:"distribution_scope,omitempty"`
 	InstanceType      string            `json:"instance_type,omitempty"`
 	NetworkType       string            `json:"network_type,omitempty"`
+	// Backend is the CoW store (xfs｜s3) for snapshot restore / create-from-snap.
+	// Empty means xfs.
+	Backend string `json:"backend,omitempty"`
 
 	RuntimeHandler string `json:"runtime_handler,omitempty"`
 	Namespace      string `json:"namespace,omitempty"`
@@ -157,12 +160,21 @@ type EgressRule struct {
 
 // EgressRuleMatch holds the per-request match conditions for an EgressRule.
 // All fields are optional; an empty match matches any request.
+//
+// Port + Scheme together select which TCP port CubeEgress intercepts:
+//   - both nil: legacy behavior — CubeEgress captures the default {80/http,
+//     443/https} pair.
+//   - both set: CubeEgress captures the specific (host, port) tuple, routing
+//     via skb->mark to the HTTP (scheme="http") or HTTPS (scheme="https")
+//     TPROXY listener. Every rule sharing the same (host, port) MUST agree on
+//     scheme; the server rejects the whole policy if it detects a mismatch.
 type EgressRuleMatch struct {
 	SNI    *string  `json:"sni,omitempty"`
 	Host   *string  `json:"host,omitempty"`
 	Method []string `json:"method,omitempty"`
 	Path   *string  `json:"path,omitempty"`
 	Scheme *string  `json:"scheme,omitempty"`
+	Port   *int     `json:"port,omitempty"`
 }
 
 // EgressRuleAction holds the action taken when an EgressRule matches.
@@ -215,6 +227,7 @@ func (r *EgressRule) DeepCopy() *EgressRule {
 			Method: append([]string(nil), r.Match.Method...),
 			Path:   cloneStringPtr(r.Match.Path),
 			Scheme: cloneStringPtr(r.Match.Scheme),
+			Port:   cloneIntPtr(r.Match.Port),
 		}
 	}
 	if r.Action != nil {
@@ -248,6 +261,14 @@ func cloneBoolPtr(value *bool) *bool {
 }
 
 func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneIntPtr(value *int) *int {
 	if value == nil {
 		return nil
 	}
@@ -539,19 +560,31 @@ type ListCubeSandboxRes struct {
 }
 
 type SandboxBriefData struct {
-	SandboxID   string            `json:"sandbox_id,omitempty"`
-	Status      int32             `json:"status,omitempty"`
-	HostID      string            `json:"host_id,omitempty"`
-	HostIP      string            `json:"host_ip,omitempty"`
-	TemplateID  string            `json:"template_id,omitempty"`
-	CpuCount    int32             `json:"cpu_count,omitempty"`
-	MemoryMB    int32             `json:"memory_mb,omitempty"`
-	Annotations map[string]string `json:"annotations,omitempty"`
-	Labels      map[string]string `json:"labels,omitempty"`
-	NameSpace   string            `json:"namespace,omitempty"`
-	CreateAt    int64             `json:"create_at,omitempty"`
-	PauseAt     int64             `json:"pause_at,omitempty"`
-	EndAt       int64             `json:"end_at,omitempty"`
+	SandboxID  string `json:"sandbox_id,omitempty"`
+	Status     int32  `json:"status,omitempty"`
+	HostID     string `json:"host_id,omitempty"`
+	HostIP     string `json:"host_ip,omitempty"`
+	TemplateID string `json:"template_id,omitempty"`
+	Backend    string `json:"backend,omitempty"`
+	// PauseSnapshotID / RemoteStatus / PauseStatus come from the Master pause
+	// binding, not from the node. RemoteStatus is the S3 upload state of the
+	// pause snapshot (empty on xfs); cross-node Resume needs "ready".
+	// PauseStatus is only worth showing when it is not READY, e.g.
+	// DELETE_FAILED for a package the node could not sweep.
+	PauseSnapshotID string             `json:"pause_snapshot_id,omitempty"`
+	RemoteStatus    string             `json:"remote_status,omitempty"`
+	PauseStatus     string             `json:"pause_status,omitempty"`
+	CpuCount        int32              `json:"cpu_count,omitempty"`
+	MemoryMB        int32              `json:"memory_mb,omitempty"`
+	CPUMilli        int32              `json:"cpu_milli,omitempty"`
+	MemoryMiB       int32              `json:"memory_mib,omitempty"`
+	Annotations     map[string]string  `json:"annotations,omitempty"`
+	Labels          map[string]string  `json:"labels,omitempty"`
+	NameSpace       string             `json:"namespace,omitempty"`
+	CreateAt        int64              `json:"create_at,omitempty"`
+	PauseAt         int64              `json:"pause_at,omitempty"`
+	EndAt           int64              `json:"end_at,omitempty"`
+	VolumeMounts    []*VolumeMountInfo `json:"volume_mounts,omitempty"`
 }
 
 type GetCubeSandboxReq struct {
@@ -569,20 +602,28 @@ type GetCubeSandboxRes struct {
 }
 
 type SandboxData struct {
-	SandboxID              string            `json:"sandbox_id,omitempty"`
-	Status                 int32             `json:"status,omitempty"`
-	HostID                 string            `json:"host_id,omitempty"`
-	HostIP                 string            `json:"host_ip,omitempty"`
-	SandboxIP              string            `json:"sandbox_ip,omitempty"`
-	TemplateID             string            `json:"template_id,omitempty"`
-	Annotations            map[string]string `json:"annotations,omitempty"`
-	Labels                 map[string]string `json:"labels,omitempty"`
-	Containers             []*ContainerInfo  `json:"containers,omitempty"`
-	NameSpace              string            `json:"namespace,omitempty"`
-	ExposedPortEndpoint    string            `json:"exposed_port_endpoint,omitempty"`
-	ExposedPortMode        string            `json:"exposed_port_mode,omitempty"`
-	RequestedContainerPort int32             `json:"requested_container_port,omitempty"`
-	EndAt                  int64             `json:"end_at,omitempty"`
+	SandboxID              string             `json:"sandbox_id,omitempty"`
+	Status                 int32              `json:"status,omitempty"`
+	HostID                 string             `json:"host_id,omitempty"`
+	HostIP                 string             `json:"host_ip,omitempty"`
+	SandboxIP              string             `json:"sandbox_ip,omitempty"`
+	TemplateID             string             `json:"template_id,omitempty"`
+	Annotations            map[string]string  `json:"annotations,omitempty"`
+	Labels                 map[string]string  `json:"labels,omitempty"`
+	Containers             []*ContainerInfo   `json:"containers,omitempty"`
+	NameSpace              string             `json:"namespace,omitempty"`
+	ExposedPortEndpoint    string             `json:"exposed_port_endpoint,omitempty"`
+	ExposedPortMode        string             `json:"exposed_port_mode,omitempty"`
+	RequestedContainerPort int32              `json:"requested_container_port,omitempty"`
+	EndAt                  int64              `json:"end_at,omitempty"`
+	VolumeMounts           []*VolumeMountInfo `json:"volume_mounts,omitempty"`
+}
+
+// VolumeMountInfo is one container volume mount exposed in sandbox info/list APIs.
+type VolumeMountInfo struct {
+	Name          string `json:"name,omitempty"`
+	ContainerPath string `json:"container_path,omitempty"`
+	Readonly      bool   `json:"readonly,omitempty"`
 }
 
 type ContainerInfo struct {
@@ -593,6 +634,8 @@ type ContainerInfo struct {
 	CreateAt    int64  `json:"create_at,omitempty"`
 	Cpu         string `json:"cpu,omitempty"`
 	Mem         string `json:"mem,omitempty"`
+	CpuMilli    int32  `json:"cpu_milli,omitempty"`
+	MemoryMiB   int32  `json:"memory_mib,omitempty"`
 	Type        string `json:"type,omitempty"`
 	PauseAt     int64  `json:"pause_at,omitempty"`
 }
@@ -658,6 +701,10 @@ type CreateTemplateFromImageReq struct {
 	// with ivshmem enabled so the captured snapshot already contains the
 	// device topology.
 	EnableIvshmem *bool `json:"enable_ivshmem,omitempty"`
+
+	// Backend is the CoW store (xfs｜s3) for this template and every
+	// sandbox / pause-snap / commit snapshot created from it. Empty means xfs.
+	Backend string `json:"backend,omitempty"`
 }
 
 type RedoTemplateFromImageReq struct {
@@ -779,6 +826,31 @@ type UpdateRequest struct {
 	SandboxID    string `json:"sandbox_id"`
 	InstanceType string `json:"instance_type"`
 	Action       string `json:"action"`
+	// Timeout is the optional idle TTL for resume. nil or 0 keeps the stored
+	// timeout; -1 (NeverTimeout) disables expiry; N>0 opens an N-second
+	// window from now. Values below -1 are rejected. Immediate expiry is
+	// set_timeout(0) only. See docs/guide/lifecycle.md — Timeout semantics (canonical).
+	Timeout *int `json:"timeout,omitempty"`
+	// Backend is the CoW store (xfs｜s3) forwarded to Cubelet as
+	// cube.master.storage.backend. Empty means xfs.
+	Backend string `json:"backend,omitempty"`
+}
+
+// UpdateNetworkRequest is the wire shape for POST /cube/sandbox/network. The
+// config is the complete desired egress policy, not a patch: an omitted or
+// empty field clears whatever the sandbox currently has.
+type UpdateNetworkRequest struct {
+	RequestID         string             `json:"requestID"`
+	SandboxID         string             `json:"sandboxID"`
+	InstanceType      string             `json:"instanceType"`
+	CubeNetworkConfig *CubeNetworkConfig `json:"cube_network_config"`
+}
+
+// UpdateNetworkRes is the master-side response for /cube/sandbox/network.
+type UpdateNetworkRes struct {
+	RequestID string `json:"requestID,omitempty"`
+	SandboxID string `json:"sandboxID,omitempty"`
+	Ret       *Ret   `json:"ret,omitempty"`
 }
 
 // SetTimeoutRequest is the wire shape for POST /cube/sandbox/timeout.

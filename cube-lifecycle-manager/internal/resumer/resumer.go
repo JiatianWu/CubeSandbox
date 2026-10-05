@@ -18,19 +18,28 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/cubemasterclient"
+	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/lifecycle"
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/registry"
 )
 
 // Options bundles dependencies for the Resumer. Concrete production wiring
-// lives in cmd/sidecar/main.go; the interface types defined in iface.go let
-// tests substitute fakes for Redis / CubeMaster / CubeProxy.
+// lives in cmd/cube-lifecycle-manager/main.go; the interface types defined
+// in iface.go let tests substitute fakes for Redis / CubeMaster / CubeProxy.
 type Options struct {
 	Registry     *registry.Registry
 	Redis        stateStore
 	CubeMaster   resumePauser
 	ProxyPush    stateNotifier
 	StateLockTTL time.Duration
+	// AmbiguityTTL bounds how long an unknown-result resume keeps the
+	// "resuming" marker. Sized to one CubeMaster RPC, not StateLockTTL.
+	AmbiguityTTL time.Duration
 	Log          *zap.Logger
+	// EventBus, when non-nil, wakes waitForRunning via cross-replica
+	// StateNotify events. Nil is legal — the wait path degrades to
+	// polling only (the 100ms ticker), which is what happens when the
+	// eventbus feature flag is off.
+	EventBus waitBus
 }
 
 // Resumer coalesces concurrent resume requests for the same sandbox into a
@@ -45,8 +54,10 @@ type Resumer struct {
 }
 
 const (
-	proxyStatePushTimeout = 3 * time.Second
-	proxyStatePushRetries = 2
+	proxyStatePushTimeout   = 3 * time.Second
+	stateBookkeepingTimeout = 3 * time.Second
+	proxyStatePushRetries   = 2
+	waitPollInterval        = 100 * time.Millisecond
 )
 
 // call represents one in-flight resume operation. Every goroutine waiting on
@@ -127,7 +138,7 @@ func (r *Resumer) doResume(ctx context.Context, sandboxID string) error {
 		// auto-resume, and release the lock we just SET so the sweeper
 		// doesn't skip decisions for its TTL window.
 		if !entry.Meta.AutoResume {
-			_ = r.o.Redis.ClearState(ctx, sandboxID)
+			r.clearState(sandboxID)
 			return errors.New("auto_resume not enabled for sandbox")
 		}
 		if err := r.callCubeMasterResume(ctx, sandboxID, entry.Meta.InstanceType); err != nil {
@@ -150,8 +161,8 @@ func (r *Resumer) doResume(ctx context.Context, sandboxID string) error {
 
 	// Success bookkeeping. Three writes, all best-effort:
 	//
-	//  1. Redis state → "running" so the next request from any sidecar
-	//     instance sees the right state.
+	//  1. Redis state → "running" so the next request from any CLM replica
+	//     sees the right state.
 	//  2. CubeProxy local state dict → "running" so the rewrite_phase gate
 	//     stops triggering resumes for this sandbox.
 	//  3. In-memory registry LastActiveMs → now. Without (3) the sweeper
@@ -163,7 +174,9 @@ func (r *Resumer) doResume(ctx context.Context, sandboxID string) error {
 	//     misleading. The proxy's log_phase will eventually overwrite
 	//     this via the periodic last_active poll, but we want the right
 	//     answer immediately, not 5–10 seconds later.
-	if err := r.o.Redis.SetState(ctx, sandboxID, "running", r.o.StateLockTTL); err != nil {
+	bookkeepingCtx, cancel := context.WithTimeout(context.Background(), stateBookkeepingTimeout)
+	defer cancel()
+	if err := r.o.Redis.WriteState(bookkeepingCtx, sandboxID, "running", r.o.StateLockTTL); err != nil {
 		r.o.Log.Warn("write running state failed",
 			zap.String("sandbox_id", sandboxID), zap.Error(err))
 	}
@@ -173,6 +186,7 @@ func (r *Resumer) doResume(ctx context.Context, sandboxID string) error {
 	// replica to respond. Use an independent bounded context because the
 	// request context is about to be returned (and may already be cancelled).
 	go r.pushRunningState(sandboxID)
+	r.o.Registry.SetRuntimeState(sandboxID, lifecycle.StateRunning)
 	r.o.Registry.MergeLastActive(sandboxID, time.Now().UnixMilli())
 
 	r.o.Log.Info("auto-resumed sandbox",
@@ -224,8 +238,10 @@ func (r *Resumer) callCubeMasterResume(ctx context.Context, sandboxID, instanceT
 		// from under us. Evict everywhere and surface as an error to
 		// the HTTP caller so CubeProxy returns 5xx (the dataplane
 		// request can't be served either way).
-		_ = r.o.Redis.ClearState(ctx, sandboxID)
-		_ = r.o.ProxyPush.DeleteMeta(ctx, sandboxID)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), stateBookkeepingTimeout)
+		_ = r.o.Redis.ClearStateNotify(cleanupCtx, sandboxID)
+		_ = r.o.ProxyPush.DeleteMeta(cleanupCtx, sandboxID)
+		cancel()
 		r.o.Registry.Delete(sandboxID)
 		r.o.Log.Info("sandbox not found on cubemaster during resume; evicted",
 			zap.String("sandbox_id", sandboxID),
@@ -240,10 +256,35 @@ func (r *Resumer) callCubeMasterResume(ctx context.Context, sandboxID, instanceT
 			zap.Int("ret_code", apiErr.RetCode))
 		return nil
 	default:
-		// Real failure: clear the resuming key so a future request can
-		// retry, and surface the error.
-		_ = r.o.Redis.ClearState(ctx, sandboxID)
+		// A transport or timeout error has an unknown server-side result.
+		// Preserve ownership only for the ambiguity window (AmbiguityTTL),
+		// preventing duplicate RPCs and sweeper races without locking the sandbox for 60s.
+		if !errors.As(resumeErr, &apiErr) {
+			r.markAmbiguous(sandboxID)
+			return errors.New("cubemaster resume result unknown: " + resumeErr.Error())
+		}
+		// A structured non-success response is definitive; release ownership
+		// with an independent context so request cancellation cannot strand it.
+		r.clearState(sandboxID)
 		return errors.New("cubemaster resume: " + resumeErr.Error())
+	}
+}
+
+func (r *Resumer) markAmbiguous(sandboxID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), stateBookkeepingTimeout)
+	defer cancel()
+	if err := r.o.Redis.WriteState(ctx, sandboxID, "resuming", r.o.AmbiguityTTL); err != nil {
+		r.o.Log.Warn("preserve ambiguous resume ownership failed",
+			zap.String("sandbox_id", sandboxID), zap.Error(err))
+	}
+}
+
+func (r *Resumer) clearState(sandboxID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), stateBookkeepingTimeout)
+	defer cancel()
+	if err := r.o.Redis.ClearStateNotify(ctx, sandboxID); err != nil {
+		r.o.Log.Warn("clear resume ownership failed",
+			zap.String("sandbox_id", sandboxID), zap.Error(err))
 	}
 }
 
@@ -254,9 +295,9 @@ func (r *Resumer) callCubeMasterResume(ctx context.Context, sandboxID, instanceT
 // (peer in flight resolved, sandbox already running, or real failure).
 //
 // The state-key conflict (terminal markers vs. transition locks share
-// the key) is resolved by GET-ing the current value:
+// the key) is resolved by an atomic single-key WATCH transaction:
 //
-//   - "paused" or expired:        we own the resume — write "resuming"
+//   - "paused" or expired:        atomically write "resuming"; the winner owns
 //   - "running":                   nothing to do, return nil-and-success
 //     via a sentinel (the caller's success
 //     bookkeeping then runs and re-asserts
@@ -264,34 +305,29 @@ func (r *Resumer) callCubeMasterResume(ctx context.Context, sandboxID, instanceT
 //     for race-recovery).
 //   - "pausing" or "resuming":    a peer is in flight → waitForRunning
 //
-// This is intentionally racy: between GET and SET another sidecar could
-// claim the key. That's fine because the worst case is two resumers both
-// calling CubeMaster.Resume — which CubeMaster handles idempotently
-// (returns "already running" the second time, which we already map to
-// success in the caller).
+// WATCH/MULTI keeps the paused→resuming transition atomic across CLM replicas.
+// CubeMaster's own lifecycle lock remains the final guard for ambiguous
+// transport failures where a timed-out operation may still complete remotely.
 func (r *Resumer) acquireResumeOwnership(ctx context.Context, sandboxID string) error {
-	cur, ok, err := r.o.Redis.GetState(ctx, sandboxID)
+	cur, acquired, err := r.o.Redis.AcquireResume(ctx, sandboxID, r.o.StateLockTTL)
 	if err != nil {
 		return err
 	}
-
-	switch {
-	case !ok, cur == "paused":
-		// Either no lock at all (most common after sweeper's TTL expired)
-		// or terminal "paused" left by a successful sweep. Either way we
-		// claim ownership by SET-ing "resuming".
-		if err := r.o.Redis.SetState(ctx, sandboxID, "resuming", r.o.StateLockTTL); err != nil {
-			return err
-		}
+	if acquired {
 		return nil
-	case cur == "running":
+	}
+
+	switch cur {
+	case "running":
 		// Sandbox is already running on Redis's view. No-op resume; the
 		// caller's success path will re-push running to the proxy in case
 		// the local dict drifted.
 		r.o.Log.Info("resume requested but sandbox already running; reconciling",
 			zap.String("sandbox_id", sandboxID))
 		return errAlreadyRunning
-	case cur == "pausing" || cur == "resuming":
+	case "killing", lifecycle.StateKilled:
+		return errSandboxKilled
+	case "pausing", "resuming":
 		// Active transition by a peer → wait it out. waitForRunning
 		// returning nil means the peer transitioned to "running"; treat
 		// that as a no-op resume from our perspective so we DON'T issue
@@ -301,6 +337,11 @@ func (r *Resumer) acquireResumeOwnership(ctx context.Context, sandboxID string) 
 			return err
 		}
 		return errAlreadyRunning
+	case "", "paused":
+		// AcquireResume only returns these values when its WATCH transaction
+		// repeatedly conflicted, which is surfaced as an error. Keep this
+		// defensive branch for alternate stateStore implementations.
+		return errors.New("resume ownership was not acquired")
 	default:
 		// Unknown state — fall back to wait, same translation rule.
 		r.o.Log.Warn("unknown state during resume ownership probe",
@@ -318,45 +359,108 @@ func (r *Resumer) acquireResumeOwnership(ctx context.Context, sandboxID string) 
 // as a successful no-op (state will be re-asserted into the proxy dict).
 var errAlreadyRunning = errors.New("sandbox already running")
 
-// waitForRunning is invoked when AcquireState lost the SETNX race — i.e.
-// some other key/holder occupies cube:v1:shared:sandbox:lifecycle:state:<id>.
-// We poll that key for one of three terminal outcomes:
+// errSandboxKilled is returned when a racing timeout-kill owns the sandbox.
+// CubeProxy maps killing/killed to 410; CLM must fail the resume RPC the
+// same way instead of waiting out the caller's deadline.
+var errSandboxKilled = errors.New("peer killed sandbox during resume")
+
+// waitForRunning is invoked when acquireResumeOwnership observed a peer's
+// transition lock ("pausing" or "resuming") and we must not fire our own
+// duplicate RPC. It resolves the peer's outcome when:
 //
 //   - state == "running"    → peer succeeded, request can proceed.
 //   - state == "paused"     → peer gave up; bail with an error so
 //     CubeProxy returns 503 and the next request
 //     gets a fresh resume attempt.
-//   - key expired (!ok)     → peer crashed mid-flight; do NOT treat this
-//     as success — return a clear error so the
-//     caller can retry. Without this guard we
-//     would silently let through a request to a
-//     still-paused sandbox.
+//   - state == "killed" / "killing" → peer (sweeper) destroyed the sandbox.
+//   - key expired (!ok)     → peer crashed mid-flight; return an error so
+//     the caller re-enters Resume() cleanly.
+//
+// Implementation modes:
+//
+//   - When Options.EventBus is nil (feature flag off), we degrade to the
+//     100ms Redis GET ticker.
+//   - When Options.EventBus is non-nil, we register a listener before the
+//     first GET. Pub/Sub only wakes the waiter; Redis is read after every
+//     hint. The 100ms poll remains as a lost-message fallback.
 func (r *Resumer) waitForRunning(ctx context.Context, sandboxID string) error {
-	const pollEvery = 200 * time.Millisecond
-	t := time.NewTicker(pollEvery)
+	if r.o.EventBus == nil {
+		return r.waitForRunningLegacy(ctx, sandboxID)
+	}
+	return r.waitForRunningEventBus(ctx, sandboxID)
+}
+
+// waitForRunningLegacy is the feature-flag OFF polling loop.
+func (r *Resumer) waitForRunningLegacy(ctx context.Context, sandboxID string) error {
+	t := time.NewTicker(waitPollInterval)
 	defer t.Stop()
 	for {
 		state, ok, err := r.o.Redis.GetState(ctx, sandboxID)
 		if err != nil {
 			return err
 		}
-		switch {
-		case !ok:
-			// Peer's lock expired without writing a terminal state. Don't
-			// pretend everything is fine — the sandbox is in an unknown
-			// state. The caller will surface a 503 and the next request
-			// re-enters Resume() and re-acquires the lock cleanly.
-			return errors.New("peer resume lock expired without resolution")
-		case state == "running":
-			return nil
-		case state == "paused":
-			return errors.New("peer resume left sandbox paused")
-			// pausing / resuming → keep polling
+		if err, done := classifyState(state, ok); done {
+			return err
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
+		}
+	}
+}
+
+// classifyState maps a GetState (state, ok) pair onto a wait decision.
+// done=true means the waiter should return (err is nil on success).
+// done=false means the state is still in-flight ("pausing" / "resuming" /
+// unknown) and the caller should keep waiting.
+func classifyState(state string, ok bool) (err error, done bool) {
+	if !ok {
+		return errors.New("peer resume lock expired without resolution"), true
+	}
+	switch state {
+	case "running":
+		return nil, true
+	case "paused":
+		return errors.New("peer resume left sandbox paused"), true
+	case "killing", lifecycle.StateKilled:
+		return errSandboxKilled, true
+	default:
+		// "pausing" / "resuming" / anything else — keep waiting.
+		return nil, false
+	}
+}
+
+func (r *Resumer) waitForRunningEventBus(ctx context.Context, sandboxID string) error {
+	listener, cancel := r.o.EventBus.Wait(sandboxID)
+	defer cancel()
+
+	readState := func() (error, bool) {
+		state, ok, err := r.o.Redis.GetState(ctx, sandboxID)
+		if err != nil {
+			return err, true
+		}
+		return classifyState(state, ok)
+	}
+
+	if err, done := readState(); done {
+		return err
+	}
+
+	fallback := time.NewTicker(waitPollInterval)
+	defer fallback.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-listener:
+			if err, done := readState(); done {
+				return err
+			}
+		case <-fallback.C:
+			if err, done := readState(); done {
+				return err
+			}
 		}
 	}
 }

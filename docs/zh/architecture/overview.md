@@ -88,7 +88,7 @@ flowchart TB
 - **LPM-trie 网络策略**，线速执行。
 - **ARP 代理**，用于点对点 TAP 链路。
 
-详见 [网络架构](./network.md)。
+详见 [CubeVS 网络模型](./network.md)。
 
 ### CubeCoW（存储引擎）
 
@@ -190,9 +190,10 @@ sequenceDiagram
 
 ## 下一步
 
-- [网络架构](./network.md) —— 深入了解 CubeVS、流量路径、会话追踪与策略引擎。
+- [CubeVS 网络模型](./network.md) —— 深入了解 CubeVS、流量路径、会话追踪与策略引擎。
 - [沙箱生命周期](../guide/lifecycle.md) —— 状态模型、自动暂停与自动恢复。
 - [快照、回滚与克隆](../guide/snapshot-rollback-clone.md) —— 基于 CubeCoW 的高级 API。
+- [跨机快照](../guide/cross-node-snapshot.md) —— S3 后端下 Pause / Resume / FromSnap 落到其他节点。
 - [安全代理](../guide/security-proxy.md) —— CubeEgress 域名过滤与凭据注入。
 - [性能基准](../guide/performance-benchmark.md) —— 冷启动、快照与密度数据。
 - [模板概览](../guide/templates.md) —— 三步式模板生命周期。

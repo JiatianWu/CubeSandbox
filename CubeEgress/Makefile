@@ -1,4 +1,4 @@
-IMAGE_TAG              ?= v0.6.0
+IMAGE_TAG              ?= v0.7.2
 IMAGE_LOCAL            := cube-egress
 CUBE_VERSION           ?= $(IMAGE_TAG)
 CUBE_COMMIT            ?= $(shell git rev-parse HEAD | cut -c1-8)
@@ -26,6 +26,13 @@ else
 	QUIET = -q
 	MAKEFLAGS += --no-print-directory
 endif
+
+.PHONY: test-lua
+test-lua:
+	$(Q)LUA_BIN=$$(command -v luajit || command -v lua); \
+		test -n "$$LUA_BIN" || { echo "error: lua or luajit not installed"; exit 1; }; \
+		$$LUA_BIN tests/port_scheme_test.lua && \
+		$$LUA_BIN tests/port_scheme_extra_test.lua
 
 .PHONY: build
 build:

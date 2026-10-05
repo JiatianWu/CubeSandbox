@@ -610,12 +610,27 @@ EOF
 # ---------------------------------------------------------------
 prepare_cubeproxy_nginx_conf() {
 	local dst="${SCRIPT_DIR}/cubeproxy-nginx.conf"
-	[ -f "${dst}" ] && return 0
+	if [ -f "${dst}" ]; then
+		# Stale pre-gRPC templates would leave Service:9090 open with no nginx
+		# listener. Force regeneration when the gRPC placeholder is missing.
+		if grep -q -F '__CUBE_PROXY_GRPC_PORT__' "${dst}" \
+			&& grep -q -F '__CUBE_PROXY_ADMIN_PORT__' "${dst}"; then
+			return 0
+		fi
+		echo -e "  ${YELLOW}⚠ existing cubeproxy-nginx.conf lacks __CUBE_PROXY_GRPC_PORT__ or __CUBE_PROXY_ADMIN_PORT__; regenerating${NC}"
+		rm -f "${dst}"
+	fi
 
 	local src
 	src="${SCRIPT_DIR}/../../cubeproxy/nginx.conf.template"
 	if [ -f "${src}" ]; then
 		cp -f "${src}" "${dst}"
+		if ! grep -q -F '__CUBE_PROXY_GRPC_PORT__' "${dst}" \
+			|| ! grep -q -F '__CUBE_PROXY_ADMIN_PORT__' "${dst}"; then
+			rm -f "${dst}"
+			echo -e "  ${RED}✗ cubeproxy nginx template is missing __CUBE_PROXY_GRPC_PORT__ or __CUBE_PROXY_ADMIN_PORT__; refusing stale ${src}${NC}" >&2
+			return 1
+		fi
 		echo -e "  ${GREEN}✓ Generated cubeproxy-nginx.conf from ${src}${NC}"
 		return 0
 	fi
@@ -632,15 +647,16 @@ EOF
 				-e 's|^worker_processes [0-9]\+;|worker_processes auto;|' \
 				-e 's|^\(\s*listen \)8081\( reuseport;\)|\1__CUBE_PROXY_HTTP_PORT__\2|' \
 				-e 's|^\(\s*listen \)8080\( ssl reuseport;\)|\1__CUBE_PROXY_HTTPS_PORT__\2|' \
+				-e 's|^\(\s*listen \)9090\( http2 reuseport;\)|\1__CUBE_PROXY_GRPC_PORT__\2|' \
 				-e 's|^\(\s*set \$host_proxy_port \)8081;|\1__CUBE_PROXY_HTTP_PORT__;|' \
 				-e 's|^\(\s*set \$host_proxy_port \)8080;|\1__CUBE_PROXY_HTTPS_PORT__;|' \
-				-e 's|^\(\s*listen \)127\.0\.0\.1:8082;|\1__CUBE_PROXY_ADMIN_LISTEN__:8082;|' \
+				-e 's|^\(\s*listen \)127\.0\.0\.1:8082;|\1__CUBE_PROXY_ADMIN_LISTEN__:__CUBE_PROXY_ADMIN_PORT__;|' \
 				-e 's|/usr/local/openresty/nginx/certs/cube\.app+3\.pem|/usr/local/openresty/nginx/certs/__CUBE_PROXY_SSL_CERT__|' \
 				-e 's|/usr/local/openresty/nginx/certs/cube\.app+3-key\.pem|/usr/local/openresty/nginx/certs/__CUBE_PROXY_SSL_KEY__|' \
 				"${src}"
 		} >"${dst}"
 		local token
-		for token in __CUBE_PROXY_HTTP_PORT__ __CUBE_PROXY_HTTPS_PORT__ __CUBE_PROXY_ADMIN_LISTEN__ __CUBE_PROXY_SSL_CERT__ __CUBE_PROXY_SSL_KEY__; do
+		for token in __CUBE_PROXY_HTTP_PORT__ __CUBE_PROXY_HTTPS_PORT__ __CUBE_PROXY_GRPC_PORT__ __CUBE_PROXY_ADMIN_LISTEN__ __CUBE_PROXY_ADMIN_PORT__ __CUBE_PROXY_SSL_CERT__ __CUBE_PROXY_SSL_KEY__; do
 			if ! grep -q -F "${token}" "${dst}"; then
 				rm -f "${dst}"
 				echo -e "  ${RED}✗ cube-proxy nginx template is missing ${token}; upstream CubeProxy/nginx.conf may have changed${NC}" >&2
@@ -673,7 +689,7 @@ http {
     location / { return 404; }
   }
   server {
-    listen __CUBE_PROXY_ADMIN_LISTEN__:8082;
+    listen __CUBE_PROXY_ADMIN_LISTEN__:__CUBE_PROXY_ADMIN_PORT__;
     server_name _;
     location / { return 404; }
   }
@@ -873,11 +889,12 @@ setup_env() {
 	TENCENTCLOUD_USE_CFS="${TENCENTCLOUD_USE_CFS:-false}"
 	export TF_VAR_use_tcr="$TENCENTCLOUD_USE_TCR"
 	export TF_VAR_use_cfs="$TENCENTCLOUD_USE_CFS"
-	CUBE_IMAGE_TAG="${TENCENTCLOUD_CUBE_IMAGE_TAG:-v0.6.0}"
+	CUBE_IMAGE_TAG="${TENCENTCLOUD_CUBE_IMAGE_TAG:-v0.7.2}"
 	export TF_VAR_image_tag="$CUBE_IMAGE_TAG"
 	export TF_VAR_image_registry="${TENCENTCLOUD_IMAGE_REGISTRY:-cube-sandbox-cn.tencentcloudcr.com}"
 	export TF_VAR_image_namespace="${TENCENTCLOUD_IMAGE_NAMESPACE:-cube-sandbox}"
 	export TF_VAR_cubemaster_image="${TENCENTCLOUD_CUBEMASTER_IMAGE:-cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/cube-master:${CUBE_IMAGE_TAG}}"
+	export TF_VAR_templatecenter_image="${TENCENTCLOUD_CUBETEMPLATECENTER_IMAGE:-cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/cube-templatecenter:${CUBE_IMAGE_TAG}}"
 	export TF_VAR_cubeapi_image="${TENCENTCLOUD_CUBEAPI_IMAGE:-cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/cube-api:${CUBE_IMAGE_TAG}}"
 	export TF_VAR_cubeops_image="${TENCENTCLOUD_CUBEOPS_IMAGE:-cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/cube-ops:${CUBE_IMAGE_TAG}}"
 	export TF_VAR_cubeproxy_image="${TENCENTCLOUD_CUBEPROXY_IMAGE:-cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/cube-proxy:${CUBE_IMAGE_TAG}}"
@@ -889,16 +906,31 @@ setup_env() {
 	export TF_VAR_tke_cluster_version="${TENCENTCLOUD_TKE_CLUSTER_VERSION:-1.34.1}"
 	export TF_VAR_tke_node_count="$TKE_NODE_COUNT"
 	export TF_VAR_cubemaster_replicas="${TENCENTCLOUD_CUBEMASTER_REPLICAS:-1}"
+	# TC 默认单副本（hostPath 模式强制）；use_cfs=true 时可调大，见
+	# variables.tf 的 templatecenter_replicas 说明。旧名
+	# TENCENTCLOUD_TEMPLATECENTER_REPLICAS 仍作 fallback（env.example 已改用
+	# 与 TENCENTCLOUD_CUBETEMPLATECENTER_IMAGE 一致的 CUBE 前缀命名）。
+	export TF_VAR_templatecenter_replicas="${TENCENTCLOUD_CUBETEMPLATECENTER_REPLICAS:-${TENCENTCLOUD_TEMPLATECENTER_REPLICAS:-1}}"
 	export TF_VAR_cube_api_replicas="${TENCENTCLOUD_CUBE_API_REPLICAS:-1}"
-	export TF_VAR_cube_ops_replicas="${TENCENTCLOUD_CUBE_OPS_REPLICAS:-1}"
+	export TF_VAR_cube_ops_replicas="${TENCENTCLOUD_CUBE_OPS_REPLICAS:-2}"
 	export TF_VAR_cube_proxy_replicas="${TENCENTCLOUD_CUBE_PROXY_REPLICAS:-1}"
-	export TF_VAR_cube_lifecycle_manager_replicas="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS:-1}"
+	export TF_VAR_cube_lifecycle_manager_replicas="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS:-2}"
 	export TF_VAR_cube_webui_replicas="${TENCENTCLOUD_CUBE_WEBUI_REPLICAS:-1}"
 	export TF_VAR_cube_lifecycle_manager_default_idle_timeout="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DEFAULT_IDLE_TIMEOUT:-5m}"
 	export TF_VAR_cube_lifecycle_manager_heartbeat_ttl="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_HEARTBEAT_TTL:-15s}"
 	export TF_VAR_cube_lifecycle_manager_discovery_refresh="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DISCOVERY_REFRESH:-3s}"
+	# CLM active-standby. Election must stay in step with the replica count:
+	# 2 replicas without it means two uncoordinated actors, not HA. tke-addons.tf
+	# has preconditions on both directions.
+	export TF_VAR_cube_lifecycle_manager_leader_election_enabled="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_ELECTION_ENABLED:-true}"
+	export TF_VAR_cube_lifecycle_manager_leader_lease_ttl="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_LEASE_TTL:-10s}"
+	export TF_VAR_cube_lifecycle_manager_leader_renew_interval="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RENEW_INTERVAL:-3s}"
+	export TF_VAR_cube_lifecycle_manager_leader_retry_interval="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RETRY_INTERVAL:-1s}"
 	export TF_VAR_cube_admin_token="${TENCENTCLOUD_CUBE_ADMIN_TOKEN:-}"
 	export TF_VAR_cube_proxy_heartbeat_interval_ms="${TENCENTCLOUD_CUBE_PROXY_HEARTBEAT_INTERVAL_MS:-5000}"
+	# cube-proxy admin port (host-network admin listener, auto-pause coordination).
+	# Mirrors the systemd path's CUBE_PROXY_ADMIN_PORT; the TF default stays 8082.
+	export TF_VAR_cube_proxy_admin_port="${TENCENTCLOUD_CUBE_PROXY_ADMIN_PORT:-8082}"
 	# Network exposure mode. Default (false) fronts cube-api/cube-proxy/cube-webui
 	# with VPC-internal CLBs; set to 'true' for public CLBs reachable from the
 	# internet (see the "Hardening the Public-Facing Services" doc section).
@@ -1144,6 +1176,146 @@ _install_cubemastercli() {
 	verify=$("${js_ssh[@]}" root@"${js_pub_ip}" "cubemastercli --help 2>&1 | head -1" 2>&1) || true
 	if [ -n "$verify" ]; then
 		echo -e "  ${GREEN}✓ cubemastercli installed (jumpserver:/usr/local/bin/cubemastercli)${NC}"
+	fi
+}
+
+# Install cubeopscli on the jumpserver (extracted from the bundle).
+# Mirrors _install_cubemastercli; the sandbox-package already contains
+# cubeopscli after the one-click bundle builder was updated.
+_install_cubeopscli() {
+	local js_pub_ip key_file
+	js_pub_ip=$(terraform output -raw jumpserver_public_ip 2>/dev/null || echo "")
+	key_file="${TENCENTCLOUD_SSH_PRIVATE_KEY_PATH:-$SSH_PRI_KEY}"
+	[ -z "$js_pub_ip" ] && return 1
+
+	local js_ssh=(
+		ssh -i "${key_file}" -p 443
+		-o StrictHostKeyChecking=no
+		-o UserKnownHostsFile=/dev/null
+		-o ConnectTimeout=10
+		-o BatchMode=yes
+		-o LogLevel=ERROR
+	)
+
+	# Check whether it is already installed
+	local already
+	already=$("${js_ssh[@]}" root@"${js_pub_ip}" "command -v cubeopscli 2>&1" 2>&1) || true
+	if echo "$already" | grep -q "cubeopscli"; then
+		echo -e "  ${GREEN}✓ cubeopscli already exists (${already})${NC}"
+		return 0
+	fi
+
+	echo -e "  ${CYAN}Installing cubeopscli on the jumpserver...${NC}"
+
+	if [ -n "${LOCAL_BUNDLE:-}" ]; then
+		# Local bundle: verify → upload → extract cubeopscli
+		local bundle_name
+		bundle_name="$(basename "${LOCAL_BUNDLE}")"
+
+		# Compute the local md5
+		local local_md5
+		local_md5=$(md5sum "${LOCAL_BUNDLE}" 2>/dev/null | awk '{print $1}' || echo "")
+		if [ -z "$local_md5" ] && command -v md5 &>/dev/null; then
+			local_md5=$(md5 -q "${LOCAL_BUNDLE}" 2>/dev/null || echo "")
+		fi
+
+		# Check the bundle md5 on the jumpserver
+		local remote_md5 need_upload=0
+		remote_md5=$("${js_ssh[@]}" root@"${js_pub_ip}" "
+      if [ -f /tmp/${bundle_name} ]; then
+        md5sum /tmp/${bundle_name} 2>/dev/null | awk '{print \$1}' || md5 -q /tmp/${bundle_name} 2>/dev/null || echo 'NO_MD5'
+      else
+        echo 'NOT_FOUND'
+      fi
+    " 2>&1) || true
+		remote_md5=$(echo "$remote_md5" | tr -d '\r\n ')
+
+		if [ "$remote_md5" = "NOT_FOUND" ]; then
+			echo -e "  ${YELLOW}No bundle on the jumpserver, upload required${NC}"
+			need_upload=1
+		elif [ -n "$local_md5" ] && [ -n "$remote_md5" ] && [ "$local_md5" != "$remote_md5" ] && [ "$remote_md5" != "NO_MD5" ]; then
+			echo -e "  ${YELLOW}md5 mismatch (local: ${local_md5}, remote: ${remote_md5}), re-uploading${NC}"
+			need_upload=1
+		else
+			echo -e "  ${GREEN}✓ bundle md5 matches (${local_md5}), skipping upload${NC}"
+		fi
+
+		if [ "$need_upload" -eq 1 ]; then
+			echo -e "  ${CYAN}Uploading the bundle to the jumpserver...${NC}"
+			scp -i "${key_file}" -P 443 \
+				-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+				-o ConnectTimeout=10 \
+				"${LOCAL_BUNDLE}" "root@${js_pub_ip}:/tmp/${bundle_name}" 2>&1 || {
+				echo -e "  ${YELLOW}⚠ bundle upload failed, skipping cubeopscli installation${NC}"
+				return 1
+			}
+			BUNDLE_UPDATED=1
+		fi
+
+		"${js_ssh[@]}" root@"${js_pub_ip}" "
+      set -e
+      mkdir -p /tmp/cube-bundle /tmp/cube-package
+      # 1) Extract the outer bundle
+      tar -xzf /tmp/${bundle_name} -C /tmp/cube-bundle/
+      BUNDLE_DIR=\$(ls -d /tmp/cube-bundle/*/ 2>/dev/null | head -1)
+      # 2) Extract assets/package/sandbox-package.tar.gz
+      PKG_TAR=\"\${BUNDLE_DIR}/assets/package/sandbox-package.tar.gz\"
+      if [ -f \"\${PKG_TAR}\" ]; then
+        tar -xzf \"\${PKG_TAR}\" -C /tmp/cube-package/
+        # 3) Find cubeopscli and install it
+        CLI_BIN=\$(find /tmp/cube-package -name cubeopscli -type f 2>/dev/null | head -1)
+        if [ -n \"\${CLI_BIN}\" ]; then
+          cp \${CLI_BIN} /usr/local/bin/cubeopscli
+          chmod +x /usr/local/bin/cubeopscli
+          echo 'INSTALLED'
+        else
+          echo 'NOT_FOUND: cubeopscli not in sandbox-package'
+        fi
+      else
+        echo \"NOT_FOUND: \${PKG_TAR} not found\"
+      fi
+    " 2>&1 || echo -e "  ${YELLOW}⚠ cubeopscli extraction failed${NC}"
+	else
+		# Online mode: download and extract on the jumpserver
+		local cn_url="https://cnb.cool/CubeSandbox/CubeSandbox/-/git/raw/master/deploy/one-click/online-install.sh"
+		local gh_url="https://github.com/tencentcloud/CubeSandbox/raw/master/deploy/one-click/online-install.sh"
+
+		"${js_ssh[@]}" root@"${js_pub_ip}" "
+      ONLINE_SCRIPT=\$(curl -fsSL --connect-timeout 10 --max-time 30 '${cn_url}' 2>/dev/null || \\
+                       curl -fsSL --connect-timeout 10 --max-time 30 '${gh_url}' 2>/dev/null)
+      BUNDLE_URL=\$(echo \"\$ONLINE_SCRIPT\" | grep -oE 'https://[^ ]*cube-sandbox-one-click[^ ]*\.tar\.gz' | head -1)
+      if [ -z \"\$BUNDLE_URL\" ]; then
+        echo 'SKIP: cannot determine bundle URL'
+        exit 0
+      fi
+      echo \"Downloading: \$BUNDLE_URL\"
+      mkdir -p /tmp/cube-bundle /tmp/cube-package
+      cd /tmp/cube-bundle
+      curl -fsSL --connect-timeout 10 --max-time 120 \"\$BUNDLE_URL\" -o bundle.tar.gz
+      tar -xzf bundle.tar.gz
+      BUNDLE_DIR=\$(ls -d */ 2>/dev/null | head -1)
+      PKG_TAR=\"\${BUNDLE_DIR}/assets/package/sandbox-package.tar.gz\"
+      if [ -f \"\${PKG_TAR}\" ]; then
+        tar -xzf \"\${PKG_TAR}\" -C /tmp/cube-package/
+        CLI_BIN=\$(find /tmp/cube-package -name cubeopscli -type f 2>/dev/null | head -1)
+        if [ -n \"\${CLI_BIN}\" ]; then
+          cp \${CLI_BIN} /usr/local/bin/cubeopscli
+          chmod +x /usr/local/bin/cubeopscli
+          echo 'INSTALLED'
+        else
+          echo 'NOT_FOUND'
+        fi
+      else
+        echo 'NOT_FOUND'
+      fi
+    " 2>&1 || echo -e "  ${YELLOW}⚠ cubeopscli online installation failed${NC}"
+	fi
+
+	# Verify
+	local verify
+	verify=$("${js_ssh[@]}" root@"${js_pub_ip}" "cubeopscli --help 2>&1 | head -1" 2>&1) || true
+	if [ -n "$verify" ]; then
+		echo -e "  ${GREEN}✓ cubeopscli installed (jumpserver:/usr/local/bin/cubeopscli)${NC}"
 	fi
 }
 
@@ -1416,7 +1588,7 @@ build_and_push_images() {
 	reg=$(terraform output -raw tcr_registry_name 2>/dev/null || echo "")
 	ns=$(terraform output -raw tcr_namespace 2>/dev/null || echo "")
 	user=$(terraform output -raw tcr_token_user 2>/dev/null || echo "")
-	tag="${CUBE_IMAGE_TAG:-v0.6.0}"
+	tag="${CUBE_IMAGE_TAG:-v0.7.2}"
 
 	if [ -z "$js_pub_ip" ] || [ -z "$reg" ] || [ -z "$ns" ]; then
 		echo -e "  ${RED}✗ Missing jumpserver / TCR info; cannot build images${NC}"
@@ -1527,7 +1699,7 @@ tcr_build_and_push() {
 	# The image tag was already resolved earlier (env / saved selection /
 	# prompt_deployment_env / default), so don't ask again — just remind which tag
 	# will be built & pushed.
-	echo -e "  ${GREEN}✓ Image tag to build & push: ${CUBE_IMAGE_TAG:-v0.6.0}${NC}"
+	echo -e "  ${GREEN}✓ Image tag to build & push: ${CUBE_IMAGE_TAG:-v0.7.2}${NC}"
 	echo ""
 
 	# Pre-pull the base images the build needs from the in-VPC TCR mirror first
@@ -1780,7 +1952,7 @@ prompt_deployment_env() {
 	select_env TENCENTCLOUD_CUBE_DB "Cube database name" "cube_mvp"
 	select_env TENCENTCLOUD_CUBE_USER "Cube database user" "cube"
 	select_env_secret TENCENTCLOUD_CUBE_PASSWORD "Cube database password" "cube_pass"
-	select_env TENCENTCLOUD_CUBE_IMAGE_TAG "Cube component image tag" "v0.6.0" "dev"
+	select_env TENCENTCLOUD_CUBE_IMAGE_TAG "Cube component image tag" "v0.7.2" "dev"
 
 	# Ask whether to print verbose terraform logs (defaults to off). Runs before
 	# setup_env so the resolved value feeds VERBOSE. An explicit
@@ -3318,7 +3490,7 @@ step6_replace_kernel() {
 	local key_file js_public_ip
 	key_file="${TENCENTCLOUD_SSH_PRIVATE_KEY_PATH:-$SSH_PRI_KEY}"
 	js_public_ip=$(terraform output -raw jumpserver_public_ip 2>/dev/null || echo "")
-	local pvm_kernel_url="${TENCENTCLOUD_PVM_KERNEL_RPM_URL:-https://mirrors.opencloudos.tech/opencloudos/9.6/extras/x86_64/os/Packages/kernel-core-6.6.69-1.2.cubesandbox.oc9.x86_64.rpm}"
+	local pvm_kernel_url="${TENCENTCLOUD_PVM_KERNEL_RPM_URL:-https://mirrors.opencloudos.tech/opencloudos/9.6/extras/x86_64/os/Packages/kernel-core-6.6.117-45.16.cubesandbox.oc9.x86_64.rpm}"
 	local rpm_name
 	rpm_name=$(basename "$pvm_kernel_url")
 	local rpm_file="/tmp/${rpm_name}"
@@ -3678,6 +3850,11 @@ step8_init_compute_nodes() {
 	local cm_clb_ip
 	cm_clb_ip=$(terraform output -raw tke_cubemaster_clb_ip 2>/dev/null || echo "")
 
+	# cube-ops VPC-internal CLB IP. Compute nodes reach cube-ops:3010 for
+	# node registration / heartbeat via this CLB.
+	local ops_clb_ip
+	ops_clb_ip=$(terraform output -raw tke_cube_ops_clb_ip 2>/dev/null || echo "")
+
 	# cube-egress image mirror for the compute nodes. This terraform deployer
 	# always runs inside Tencent Cloud, so the China-region pull-through
 	# (cube-sandbox-cn.tencentcloudcr.com, selected by MIRROR=cn in
@@ -3800,6 +3977,7 @@ step8_init_compute_nodes() {
 				ssh "${ssh_opts[@]}" root@"${compute_private_ip}" "sh /usr/local/services/cubetoolbox/scripts/one-click/down-compute.sh 2>&1" 2>&1 || true
 				sleep 3
 				ssh "${ssh_opts[@]}" root@"${compute_private_ip}" "sed -i 's/^ONE_CLICK_CONTROL_PLANE_IP=.*/ONE_CLICK_CONTROL_PLANE_IP=\"${cm_clb_ip}\"/' /usr/local/services/cubetoolbox/.one-click.env 2>&1" 2>&1 || true
+				ssh "${ssh_opts[@]}" root@"${compute_private_ip}" "sed -i 's/^ONE_CLICK_CONTROL_PLANE_CUBEOPS_ADDR=.*/ONE_CLICK_CONTROL_PLANE_CUBEOPS_ADDR=\"${ops_clb_ip}:3010\"/' /usr/local/services/cubetoolbox/.one-click.env 2>&1" 2>&1 || true
 				ssh "${ssh_opts[@]}" root@"${compute_private_ip}" "sh /usr/local/services/cubetoolbox/scripts/one-click/up-compute.sh 2>&1" 2>&1 || true
 				echo -e "  ${GREEN}✓ Compute node re-registered${NC}"
 				continue
@@ -3894,6 +4072,7 @@ CUBE_EXTERNAL_MYSQL_HOST=${mysql_ip}
 CUBE_EXTERNAL_REDIS_HOST=${redis_ip}
 CUBE_PVM_ENABLE=1
 ONE_CLICK_CONTROL_PLANE_IP=\"${control_plane_ip}\"
+ONE_CLICK_CONTROL_PLANE_CUBEOPS_ADDR=\"${ops_clb_ip}:3010\"
 MIRROR=${egress_mirror}
 EOF
 echo '[local-bundle] .env created:'
@@ -3925,6 +4104,7 @@ echo '[local-bundle] Done'"
          ONE_CLICK_DEPLOY_ROLE=compute \
          CUBE_SANDBOX_NODE_IP='${compute_private_ip}' \
          ONE_CLICK_CONTROL_PLANE_IP='${cm_clb_ip}' \
+         ONE_CLICK_CONTROL_PLANE_CUBEOPS_ADDR='${ops_clb_ip}:3010' \
          CUBE_PVM_ENABLE=1 \
          MIRROR='${egress_mirror}' bash 2>&1" 2>&1 | tee "$install_log"
 			install_rc=${PIPESTATUS[0]}
@@ -4023,16 +4203,18 @@ REMOTE_CUBELET_FREQ
 
 	if [ -z "${cm_clb_ip}" ]; then
 		echo -e "  ${YELLOW}⚠ cube-master CLB unavailable, skipping verification${NC}"
+	elif [ -z "${ops_clb_ip}" ]; then
+		echo -e "  ${YELLOW}⚠ cube-ops CLB unavailable, skipping node registration verification and template creation${NC}"
 	else
 		local nodes_json
-		# Query cube-master through the jumpserver
-		nodes_json=$(_jump_exec "curl -s --connect-timeout 10 'http://${cm_clb_ip}:8089/internal/meta/nodes' 2>&1" 2>&1) || true
+		# Query CubeOps via its VPC-internal CLB (same address compute nodes use).
+		nodes_json=$(_jump_exec "curl -s --connect-timeout 10 --max-time 10 'http://${ops_clb_ip}:3010/internal/v1/nodes' 2>&1" 2>&1) || true
 
 		# Output the registered nodes (with health status)
 		local node_ips node_count node_status
-		node_ips=$(echo "$nodes_json" | jq -r '.data[]?.node_id' 2>/dev/null || echo "")
-		node_count=$(echo "$nodes_json" | jq -r '.data | length' 2>/dev/null || echo "0")
-		node_status=$(echo "$nodes_json" | jq -r '.data[] | "  \(.node_id)  healthy=\(.healthy)"' 2>/dev/null || echo "")
+		node_ips=$(echo "$nodes_json" | jq -r '.[]?.InstanceID' 2>/dev/null || echo "")
+		node_count=$(echo "$nodes_json" | jq 'if type=="array" then length else 0 end' 2>/dev/null || echo "0")
+		node_status=$(echo "$nodes_json" | jq -r '.[] | "  \(.InstanceID)  healthy=\(.Healthy)"' 2>/dev/null || echo "")
 		echo ""
 		echo -e "  ${CYAN}Registered nodes (${node_count}):${NC}"
 		echo "$node_status"
@@ -4050,9 +4232,9 @@ REMOTE_CUBELET_FREQ
 			mysql_db="${CUBE_DB:-cube_mvp}"
 
 			if [ -n "$mysql_host" ]; then
-				# Only query nodes with healthy=true
+				# Only query healthy nodes; `.InstanceID` is the DB `node_id`.
 				local healthy_node_ips node_list
-				healthy_node_ips=$(echo "$nodes_json" | jq -r '.data[] | select(.healthy == true) | .node_id' 2>/dev/null || echo "")
+				healthy_node_ips=$(echo "$nodes_json" | jq -r '.[] | select(.Healthy == true) | .InstanceID' 2>/dev/null || echo "")
 				if [ -z "$healthy_node_ips" ]; then
 					echo -e "  ${YELLOW}⚠ No healthy nodes${NC}"
 				else
@@ -4066,9 +4248,9 @@ REMOTE_CUBELET_FREQ
 
 		# Check the number of existing templates; create one if it is 0 (requires at least 1 registered node)
 		if [ -n "${cm_clb_ip}" ]; then
-			# Get the number of registered healthy nodes
+			# Get the number of registered healthy nodes.
 			local healthy_count
-			healthy_count=$(echo "$nodes_json" | jq -r '[.data[]? | select(.healthy == true)] | length' 2>/dev/null || echo "0")
+			healthy_count=$(echo "$nodes_json" | jq -r '[.[]? | select(.Healthy == true)] | length' 2>/dev/null || echo "0")
 			healthy_count=$(echo "$healthy_count" | tr -d ' \n\r')
 			echo -e "  ${CYAN}Registered healthy nodes: ${healthy_count:-0}${NC}"
 
@@ -4101,7 +4283,8 @@ REMOTE_CUBELET_FREQ
 	# failures and continue instead of aborting an otherwise-working deployment.
 	if [ "${#failed_nodes[@]}" -gt 0 ] && [ -n "${nodes_json:-}" ]; then
 		local _expected_ip _healthy_ips _all_registered=1 _expected_n=0
-		_healthy_ips=$(echo "$nodes_json" | jq -r '.data[]? | select(.healthy == true) | .node_id' 2>/dev/null || echo "")
+		# Healthy node's registered host IP (`.IP`), matched against private IPs.
+		_healthy_ips=$(echo "$nodes_json" | jq -r '.[]? | select(.Healthy == true) | .IP' 2>/dev/null || echo "")
 		while IFS= read -r _expected_ip; do
 			[ -n "$_expected_ip" ] || continue
 			_expected_n=$((_expected_n + 1))
@@ -4202,10 +4385,11 @@ TENCENTCLOUD_CUBE_DB='${TENCENTCLOUD_CUBE_DB:-cube_mvp}'
 TENCENTCLOUD_CUBE_USER='${TENCENTCLOUD_CUBE_USER:-cube}'
 TENCENTCLOUD_CUBE_PASSWORD='${TENCENTCLOUD_CUBE_PASSWORD:-}'
 TENCENTCLOUD_CUBELET_NODE_STATUS_UPDATE_FREQUENCY='${CUBELET_NODE_STATUS_UPDATE_FREQUENCY:-${TENCENTCLOUD_CUBELET_NODE_STATUS_UPDATE_FREQUENCY:-1s}}'
-TENCENTCLOUD_CUBE_IMAGE_TAG='${TENCENTCLOUD_CUBE_IMAGE_TAG:-v0.6.0}'
+TENCENTCLOUD_CUBE_IMAGE_TAG='${TENCENTCLOUD_CUBE_IMAGE_TAG:-v0.7.2}'
 TENCENTCLOUD_IMAGE_REGISTRY='${TF_VAR_image_registry:-${TENCENTCLOUD_IMAGE_REGISTRY:-cube-sandbox-cn.tencentcloudcr.com}}'
 TENCENTCLOUD_IMAGE_NAMESPACE='${TF_VAR_image_namespace:-${TENCENTCLOUD_IMAGE_NAMESPACE:-cube-sandbox}}'
 TENCENTCLOUD_CUBEMASTER_IMAGE='${TF_VAR_cubemaster_image:-${TENCENTCLOUD_CUBEMASTER_IMAGE:-}}'
+TENCENTCLOUD_CUBETEMPLATECENTER_IMAGE='${TF_VAR_templatecenter_image:-${TENCENTCLOUD_CUBETEMPLATECENTER_IMAGE:-}}'
 TENCENTCLOUD_CUBEAPI_IMAGE='${TF_VAR_cubeapi_image:-${TENCENTCLOUD_CUBEAPI_IMAGE:-}}'
 TENCENTCLOUD_CUBEOPS_IMAGE='${TF_VAR_cubeops_image:-${TENCENTCLOUD_CUBEOPS_IMAGE:-}}'
 TENCENTCLOUD_CUBEPROXY_IMAGE='${TF_VAR_cubeproxy_image:-${TENCENTCLOUD_CUBEPROXY_IMAGE:-}}'
@@ -4214,16 +4398,22 @@ TENCENTCLOUD_WEBUI_IMAGE='${TF_VAR_webui_image:-${TENCENTCLOUD_WEBUI_IMAGE:-}}'
 TENCENTCLOUD_TKE_CLUSTER_VERSION='${TKE_CLUSTER_VERSION:-1.34.1}'
 TENCENTCLOUD_TKE_NODE_COUNT='${TKE_NODE_COUNT:-2}'
 TENCENTCLOUD_CUBEMASTER_REPLICAS='${TENCENTCLOUD_CUBEMASTER_REPLICAS:-1}'
+TENCENTCLOUD_CUBETEMPLATECENTER_REPLICAS='${TF_VAR_templatecenter_replicas:-${TENCENTCLOUD_CUBETEMPLATECENTER_REPLICAS:-${TENCENTCLOUD_TEMPLATECENTER_REPLICAS:-1}}}'
 TENCENTCLOUD_CUBE_API_REPLICAS='${TF_VAR_cube_api_replicas:-${TENCENTCLOUD_CUBE_API_REPLICAS:-1}}'
-TENCENTCLOUD_CUBE_OPS_REPLICAS='${TF_VAR_cube_ops_replicas:-${TENCENTCLOUD_CUBE_OPS_REPLICAS:-1}}'
+TENCENTCLOUD_CUBE_OPS_REPLICAS='${TF_VAR_cube_ops_replicas:-${TENCENTCLOUD_CUBE_OPS_REPLICAS:-2}}'
 TENCENTCLOUD_CUBE_PROXY_REPLICAS='${TF_VAR_cube_proxy_replicas:-${TENCENTCLOUD_CUBE_PROXY_REPLICAS:-1}}'
-TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS='${TF_VAR_cube_lifecycle_manager_replicas:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS:-1}}'
+TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS='${TF_VAR_cube_lifecycle_manager_replicas:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS:-2}}'
 TENCENTCLOUD_CUBE_WEBUI_REPLICAS='${TF_VAR_cube_webui_replicas:-${TENCENTCLOUD_CUBE_WEBUI_REPLICAS:-1}}'
 TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DEFAULT_IDLE_TIMEOUT='${TF_VAR_cube_lifecycle_manager_default_idle_timeout:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DEFAULT_IDLE_TIMEOUT:-5m}}'
 TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_HEARTBEAT_TTL='${TF_VAR_cube_lifecycle_manager_heartbeat_ttl:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_HEARTBEAT_TTL:-15s}}'
 TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DISCOVERY_REFRESH='${TF_VAR_cube_lifecycle_manager_discovery_refresh:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DISCOVERY_REFRESH:-3s}}'
+TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_ELECTION_ENABLED='${TF_VAR_cube_lifecycle_manager_leader_election_enabled:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_ELECTION_ENABLED:-true}}'
+TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_LEASE_TTL='${TF_VAR_cube_lifecycle_manager_leader_lease_ttl:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_LEASE_TTL:-10s}}'
+TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RENEW_INTERVAL='${TF_VAR_cube_lifecycle_manager_leader_renew_interval:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RENEW_INTERVAL:-3s}}'
+TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RETRY_INTERVAL='${TF_VAR_cube_lifecycle_manager_leader_retry_interval:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RETRY_INTERVAL:-1s}}'
 TENCENTCLOUD_CUBE_ADMIN_TOKEN='${TF_VAR_cube_admin_token:-${TENCENTCLOUD_CUBE_ADMIN_TOKEN:-}}'
 TENCENTCLOUD_CUBE_PROXY_HEARTBEAT_INTERVAL_MS='${TF_VAR_cube_proxy_heartbeat_interval_ms:-${TENCENTCLOUD_CUBE_PROXY_HEARTBEAT_INTERVAL_MS:-5000}}'
+TENCENTCLOUD_CUBE_PROXY_ADMIN_PORT='${TF_VAR_cube_proxy_admin_port:-${TENCENTCLOUD_CUBE_PROXY_ADMIN_PORT:-8082}}'
 TENCENTCLOUD_ENABLE_PUBLIC_NETWORK='${TF_VAR_enable_public_network:-${TENCENTCLOUD_ENABLE_PUBLIC_NETWORK:-false}}'
 TENCENTCLOUD_LOCAL_BUNDLE='${LOCAL_BUNDLE:-${TENCENTCLOUD_LOCAL_BUNDLE:-}}'
 TENCENTCLOUD_PVM_KERNEL_VMLINUX='${PVM_KERNEL_VMLINUX:-${TENCENTCLOUD_PVM_KERNEL_VMLINUX:-}}'
@@ -4418,26 +4608,33 @@ write_resolved_tfvars_file() {
 		--argjson enable_public_network "$(_bool_json "${TF_VAR_enable_public_network:-${TENCENTCLOUD_ENABLE_PUBLIC_NETWORK:-false}}")" \
 		--argjson use_tcr "$(_bool_json "${TF_VAR_use_tcr:-${TENCENTCLOUD_USE_TCR:-false}}")" \
 		--argjson use_cfs "$(_bool_json "${TF_VAR_use_cfs:-${TENCENTCLOUD_USE_CFS:-false}}")" \
-		--arg image_tag "${TF_VAR_image_tag:-${CUBE_IMAGE_TAG:-${TENCENTCLOUD_CUBE_IMAGE_TAG:-v0.6.0}}}" \
+		--arg image_tag "${TF_VAR_image_tag:-${CUBE_IMAGE_TAG:-${TENCENTCLOUD_CUBE_IMAGE_TAG:-v0.7.2}}}" \
 		--arg image_registry "${TF_VAR_image_registry:-${TENCENTCLOUD_IMAGE_REGISTRY:-cube-sandbox-cn.tencentcloudcr.com}}" \
 		--arg image_namespace "${TF_VAR_image_namespace:-${TENCENTCLOUD_IMAGE_NAMESPACE:-cube-sandbox}}" \
 		--arg cubemaster_image "${TF_VAR_cubemaster_image:-${TENCENTCLOUD_CUBEMASTER_IMAGE:-}}" \
+		--arg templatecenter_image "${TF_VAR_templatecenter_image:-${TENCENTCLOUD_CUBETEMPLATECENTER_IMAGE:-}}" \
 		--arg cubeapi_image "${TF_VAR_cubeapi_image:-${TENCENTCLOUD_CUBEAPI_IMAGE:-}}" \
 		--arg cubeops_image "${TF_VAR_cubeops_image:-${TENCENTCLOUD_CUBEOPS_IMAGE:-}}" \
 		--arg cubeproxy_image "${TF_VAR_cubeproxy_image:-${TENCENTCLOUD_CUBEPROXY_IMAGE:-}}" \
 		--arg cube_lifecycle_manager_image "${TF_VAR_cube_lifecycle_manager_image:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_IMAGE:-}}" \
 		--arg webui_image "${TF_VAR_webui_image:-${TENCENTCLOUD_WEBUI_IMAGE:-}}" \
 		--argjson cubemaster_replicas "$(_number_or_default "${TF_VAR_cubemaster_replicas:-${TENCENTCLOUD_CUBEMASTER_REPLICAS:-1}}" 1)" \
+		--argjson templatecenter_replicas "$(_number_or_default "${TF_VAR_templatecenter_replicas:-${TENCENTCLOUD_CUBETEMPLATECENTER_REPLICAS:-${TENCENTCLOUD_TEMPLATECENTER_REPLICAS:-1}}}" 1)" \
 		--argjson cube_api_replicas "$(_number_or_default "${TF_VAR_cube_api_replicas:-${TENCENTCLOUD_CUBE_API_REPLICAS:-1}}" 1)" \
-		--argjson cube_ops_replicas "$(_number_or_default "${TF_VAR_cube_ops_replicas:-${TENCENTCLOUD_CUBE_OPS_REPLICAS:-1}}" 1)" \
+		--argjson cube_ops_replicas "$(_number_or_default "${TF_VAR_cube_ops_replicas:-${TENCENTCLOUD_CUBE_OPS_REPLICAS:-2}}" 2)" \
 		--argjson cube_proxy_replicas "$(_number_or_default "${TF_VAR_cube_proxy_replicas:-${TENCENTCLOUD_CUBE_PROXY_REPLICAS:-1}}" 1)" \
-		--argjson cube_lifecycle_manager_replicas "$(_number_or_default "${TF_VAR_cube_lifecycle_manager_replicas:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS:-1}}" 1)" \
+		--argjson cube_lifecycle_manager_replicas "$(_number_or_default "${TF_VAR_cube_lifecycle_manager_replicas:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS:-2}}" 2)" \
 		--argjson cube_webui_replicas "$(_number_or_default "${TF_VAR_cube_webui_replicas:-${TENCENTCLOUD_CUBE_WEBUI_REPLICAS:-1}}" 1)" \
 		--arg cube_lifecycle_manager_default_idle_timeout "${TF_VAR_cube_lifecycle_manager_default_idle_timeout:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DEFAULT_IDLE_TIMEOUT:-5m}}" \
 		--arg cube_lifecycle_manager_heartbeat_ttl "${TF_VAR_cube_lifecycle_manager_heartbeat_ttl:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_HEARTBEAT_TTL:-15s}}" \
 		--arg cube_lifecycle_manager_discovery_refresh "${TF_VAR_cube_lifecycle_manager_discovery_refresh:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DISCOVERY_REFRESH:-3s}}" \
+		--argjson cube_lifecycle_manager_leader_election_enabled "$(_bool_json "${TF_VAR_cube_lifecycle_manager_leader_election_enabled:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_ELECTION_ENABLED:-true}}")" \
+		--arg cube_lifecycle_manager_leader_lease_ttl "${TF_VAR_cube_lifecycle_manager_leader_lease_ttl:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_LEASE_TTL:-10s}}" \
+		--arg cube_lifecycle_manager_leader_renew_interval "${TF_VAR_cube_lifecycle_manager_leader_renew_interval:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RENEW_INTERVAL:-3s}}" \
+		--arg cube_lifecycle_manager_leader_retry_interval "${TF_VAR_cube_lifecycle_manager_leader_retry_interval:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RETRY_INTERVAL:-1s}}" \
 		--arg cube_admin_token "${TF_VAR_cube_admin_token:-${TENCENTCLOUD_CUBE_ADMIN_TOKEN:-}}" \
 		--argjson cube_proxy_heartbeat_interval_ms "$(_number_or_default "${TF_VAR_cube_proxy_heartbeat_interval_ms:-${TENCENTCLOUD_CUBE_PROXY_HEARTBEAT_INTERVAL_MS:-5000}}" 5000)" \
+		--argjson cube_proxy_admin_port "$(_number_or_default "${TF_VAR_cube_proxy_admin_port:-${TENCENTCLOUD_CUBE_PROXY_ADMIN_PORT:-8082}}" 8082)" \
 		'{
 			vpc_name: $vpc_name,
 			region: $region,
@@ -4473,12 +4670,14 @@ write_resolved_tfvars_file() {
 			image_registry: $image_registry,
 			image_namespace: $image_namespace,
 			cubemaster_image: $cubemaster_image,
+			templatecenter_image: $templatecenter_image,
 			cubeapi_image: $cubeapi_image,
 			cubeops_image: $cubeops_image,
 			cubeproxy_image: $cubeproxy_image,
 			cube_lifecycle_manager_image: $cube_lifecycle_manager_image,
 			webui_image: $webui_image,
 			cubemaster_replicas: $cubemaster_replicas,
+			templatecenter_replicas: $templatecenter_replicas,
 			cube_api_replicas: $cube_api_replicas,
 			cube_ops_replicas: $cube_ops_replicas,
 			cube_proxy_replicas: $cube_proxy_replicas,
@@ -4487,8 +4686,13 @@ write_resolved_tfvars_file() {
 			cube_lifecycle_manager_default_idle_timeout: $cube_lifecycle_manager_default_idle_timeout,
 			cube_lifecycle_manager_heartbeat_ttl: $cube_lifecycle_manager_heartbeat_ttl,
 			cube_lifecycle_manager_discovery_refresh: $cube_lifecycle_manager_discovery_refresh,
+			cube_lifecycle_manager_leader_election_enabled: $cube_lifecycle_manager_leader_election_enabled,
+			cube_lifecycle_manager_leader_lease_ttl: $cube_lifecycle_manager_leader_lease_ttl,
+			cube_lifecycle_manager_leader_renew_interval: $cube_lifecycle_manager_leader_renew_interval,
+			cube_lifecycle_manager_leader_retry_interval: $cube_lifecycle_manager_leader_retry_interval,
 			cube_admin_token: $cube_admin_token,
 			cube_proxy_heartbeat_interval_ms: $cube_proxy_heartbeat_interval_ms,
+			cube_proxy_admin_port: $cube_proxy_admin_port,
 		}
 		| with_entries(select(.value != "" and .value != null))' >"$tmp"
 
@@ -4718,6 +4922,7 @@ print_cluster_operator_help() {
 		echo -e "    ${YELLOW}The jumpserver sits in the VPC and already holds:${NC}"
 		echo -e "      • kubectl + kubeconfig at /root/.kube/config (kubectl get pods -n cubesandbox)"
 		echo -e "      • the cubemastercli tool (cubemastercli --help)"
+		echo -e "      • the cubeopscli tool (cubeopscli --help)"
 		echo -e "      • the SSH key to reach the internal compute nodes"
 	else
 		echo -e "    ${YELLOW}Jumpserver public IP unavailable (check: terraform output jumpserver_public_ip)${NC}"
@@ -4727,7 +4932,7 @@ print_cluster_operator_help() {
 	echo ""
 	echo -e "${CYAN}▶ 2. CLB (load balancer) IPs and ports${NC}"
 	echo -e "    ${GREEN}cube-webui${NC}  (public, HTTP)   : ${webui_ip:-N/A}  → port 80"
-	echo -e "    ${GREEN}cube-proxy${NC}  (public, TCP)    : ${proxy_ip:-N/A}  → ports 80, 443"
+	echo -e "    ${GREEN}cube-proxy${NC}  (public, TCP)    : ${proxy_ip:-N/A}  → ports 80, 443, 9090"
 	echo -e "    ${GREEN}cube-api${NC}    (public, TCP)    : ${api_ip:-N/A}  → port 3000"
 	echo -e "    ${GREEN}cube-master${NC} (VPC-internal)   : ${master_ip:-N/A}  → port 8089 (reachable from the jumpserver/VPC only)"
 
@@ -4836,6 +5041,8 @@ wait_jumpserver_ready() {
 	ensure_js_bundle || echo -e "  ${YELLOW}⚠ Bundle verification/upload had issues; later steps will retry.${NC}"
 	# Install the cubemastercli management tool on the jumpserver
 	_install_cubemastercli
+	# Install the cubeopscli node-management tool on the jumpserver
+	_install_cubeopscli
 	return 0
 }
 
@@ -4861,18 +5068,21 @@ _reconcile_addons() {
 	local entries='
 kubernetes_secret.cube_egress_ca|-n cubesandbox delete secret cube-egress-ca
 kubernetes_secret.cubemaster_conf|-n cubesandbox delete secret cubemaster-conf
+kubernetes_secret.templatecenter_conf|-n cubesandbox delete secret cube-templatecenter-conf
 kubernetes_secret.cube_lifecycle_manager_conf|-n cubesandbox delete secret cube-lifecycle-manager-conf
 kubernetes_secret.cubeproxy_global|-n cubesandbox delete secret cubeproxy-global
 kubernetes_secret.cubeproxy_certs|-n cubesandbox delete secret cubeproxy-certs
 kubernetes_config_map.cubeproxy_nginx_conf|-n cubesandbox delete configmap cubeproxy-nginx-conf
 kubernetes_config_map.cube_webui_nginx_conf|-n cubesandbox delete configmap cube-webui-nginx-conf
 kubernetes_service.cubemaster|-n cubesandbox delete svc cubemaster
+kubernetes_service.templatecenter|-n cubesandbox delete svc cube-templatecenter
 kubernetes_service.cube_api|-n cubesandbox delete svc cube-api
 kubernetes_service.cube_ops|-n cubesandbox delete svc cube-ops
 kubernetes_service.cube_lifecycle_manager|-n cubesandbox delete svc cube-lifecycle-manager
 kubernetes_service.cube_proxy|-n cubesandbox delete svc cube-proxy
 kubernetes_service.cube_webui|-n cubesandbox delete svc cube-webui
 kubernetes_deployment.cubemaster|-n cubesandbox delete deploy cubemaster
+kubernetes_deployment.templatecenter|-n cubesandbox delete deploy cube-templatecenter
 kubernetes_deployment.cube_api|-n cubesandbox delete deploy cube-api
 kubernetes_deployment.cube_ops|-n cubesandbox delete deploy cube-ops
 kubernetes_deployment.cube_lifecycle_manager|-n cubesandbox delete deploy cube-lifecycle-manager
@@ -4914,7 +5124,7 @@ EOF
 #   orchestrator can fail-fast.
 # ---------------------------------------------------------------
 phase7_health_check() {
-	banner "Step: Health check — cube-master / cube-api / cube-ops / cube-lifecycle-manager / cube-proxy / cube-webui"
+	banner "Step: Health check — cube-master / cube-templatecenter / cube-api / cube-ops / cube-lifecycle-manager / cube-proxy / cube-webui"
 
 	local ns="cubesandbox"
 	# The namespace must be present (created by the addons apply in Step 6).
@@ -4935,7 +5145,7 @@ phase7_health_check() {
 	# ---- 1) Wait for each Deployment to roll out (synchronous, fail-fast) ---
 	#     On failure, dump pod state + events + container logs to explain why.
 	local dep out ready ok=1
-	for dep in cubemaster cube-api cube-ops cube-lifecycle-manager cube-proxy cube-webui; do
+	for dep in cubemaster cube-templatecenter cube-api cube-ops cube-lifecycle-manager cube-proxy cube-webui; do
 		echo -e "  ${CYAN}▶ deployment/${dep}: waiting for rollout (timeout 300s)...${NC}"
 		out=$(_js_kubectl -n "${ns}" rollout status deploy/"${dep}" --timeout=300s 2>&1)
 		if echo "$out" | grep -qi "successfully rolled out"; then
@@ -4959,9 +5169,10 @@ phase7_health_check() {
 	echo ""
 
 	# ---- 2) Probe the component endpoints through the CLBs (from jumpserver) -
-	local cm_ip api_ip proxy_ip webui_ip
+	local cm_ip api_ip ops_ip proxy_ip webui_ip
 	cm_ip=$(terraform output -raw tke_cubemaster_clb_ip 2>/dev/null || echo "")
 	api_ip=$(terraform output -raw tke_cube_api_clb_ip 2>/dev/null || echo "")
+	ops_ip=$(terraform output -raw tke_cube_ops_clb_ip 2>/dev/null || echo "")
 	proxy_ip=$(terraform output -raw tke_cube_proxy_clb_ip 2>/dev/null || echo "")
 	webui_ip=$(terraform output -raw tke_cube_webui_clb_ip 2>/dev/null || echo "")
 
@@ -4978,9 +5189,13 @@ phase7_health_check() {
 		fi
 		# Informational: how many compute nodes have registered so far. The
 		# standalone compute nodes only register in Step 8, so 0 here is normal.
-		local nodes_json ncount
-		nodes_json=$(_jump_exec "curl -s --connect-timeout 5 --max-time 10 'http://${cm_ip}:8089/internal/meta/nodes' 2>/dev/null" 2>/dev/null)
-		ncount=$(echo "$nodes_json" | jq -r '.data | length' 2>/dev/null || echo "0")
+		# Query CubeOps via its VPC-internal CLB (same as other endpoint probes).
+		# Keep nodes_json bound (→ count 0) if the cube-ops CLB is not ready yet.
+		local nodes_json="[]" ncount
+		if [ -n "$ops_ip" ]; then
+			nodes_json=$(_jump_exec "curl -s --connect-timeout 5 --max-time 10 'http://${ops_ip}:3010/internal/v1/nodes' 2>/dev/null" 2>/dev/null)
+		fi
+		ncount=$(echo "$nodes_json" | jq 'if type=="array" then length else 0 end' 2>/dev/null || echo "0")
 		echo -e "    ${CYAN}registered compute nodes so far: ${ncount:-0} (they register in Step 8)${NC}"
 	else
 		echo -e "  ${RED}✗ cube-master CLB IP not available${NC}"
@@ -5043,7 +5258,7 @@ phase7_health_check() {
 	echo -e "  ${CYAN}Summary:${NC}"
 	echo -e "    cube-master : ${cm_ip:-N/A}:8089   (VPC-internal)"
 	echo -e "    cube-api    : ${api_ip:-N/A}:3000  (public)"
-	echo -e "    cube-proxy  : ${proxy_ip:-N/A}:80/443 (public)"
+	echo -e "    cube-proxy  : ${proxy_ip:-N/A}:80/443/9090 (public)"
 	echo -e "    cube-webui  : ${webui_ip:-N/A}:80   (public)"
 	return 0
 }
@@ -5426,8 +5641,11 @@ main() {
 		tls_self_signed_cert.cube_egress_ca[0]
 		kubernetes_secret.cube_egress_ca[0]
 		kubernetes_secret.cubemaster_conf[0]
+		kubernetes_secret.templatecenter_conf[0]
 		kubernetes_deployment.cubemaster[0]
 		kubernetes_service.cubemaster[0]
+		kubernetes_deployment.templatecenter[0]
+		kubernetes_service.templatecenter[0]
 		kubernetes_deployment.cube_api[0]
 		kubernetes_service.cube_api[0]
 		kubernetes_deployment.cube_ops[0]
@@ -5458,7 +5676,7 @@ main() {
 	# Restart the Deployments so any ConfigMap changes take effect.
 	if _js_kubectl get ns cubesandbox 2>/dev/null | grep -q Active; then
 		echo -e "  ${CYAN}Restarting Deployments...${NC}"
-		for _dep in cubemaster cube-api cube-ops cube-lifecycle-manager cube-proxy cube-webui; do
+		for _dep in cubemaster cube-templatecenter cube-api cube-ops cube-lifecycle-manager cube-proxy cube-webui; do
 			_js_kubectl -n cubesandbox rollout restart deploy ${_dep} 2>/dev/null || true
 		done
 	fi

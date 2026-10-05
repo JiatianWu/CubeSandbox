@@ -1750,7 +1750,11 @@ impl MemoryManager {
 
         let start_addr = MemoryManager::start_addr(self.guest_memory.memory().last_addr(), true)?;
 
-        if start_addr.checked_add(size.try_into().unwrap()).unwrap() >= self.end_of_ram_area {
+        if start_addr
+            .checked_add((size - 1).try_into().unwrap())
+            .unwrap()
+            > self.end_of_ram_area
+        {
             return Err(Error::InsufficientHotplugRam);
         }
 
@@ -2392,7 +2396,8 @@ impl MemoryManager {
 
         let guest_memory = self.guest_memory.memory();
 
-        // Use pagemap + kpageflags to filter memory ranges, keeping only anonymous pages (CoW)
+        // Classify CoW anonymous pages from pagemap bit 61 (`PM_FILE`): a page
+        // is saved when it is swapped, or present without `PM_FILE`.
         let (filtered_ranges, stats) =
             filter_memory_ranges_by_pagemap_anon(&guest_memory, &self.snapshot_memory_ranges)
                 .map_err(|e| {

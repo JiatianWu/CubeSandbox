@@ -14,8 +14,13 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/pathutil"
 	"github.com/urfave/cli/v2"
+
+	"github.com/tencentcloud/CubeSandbox/Cubelet/cmd/cubecli/commands"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/pathutil"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/sandboxid"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/sandboxlog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 const (
@@ -37,17 +42,22 @@ const (
 //
 // Sandbox log files live at:
 //
-//	<cubeletStateDir>/<sandboxID>/stdout|stderr  (inside cubelet mount namespace)
+//	/data/cubelet/log/<sandboxID>/stdout|stderr  (host filesystem, no ns)
+//
+// If that file is missing, cubecli falls back to the pre-v0.7.1 bundle path
+// inside the cubelet mount namespace:
+//
+//	<cubeletStateDir>/<sandboxID>/stdout|stderr
 //
 // Template log files live at:
 //
 //	<templateLogDir>/<templateID>_0/stdout|stderr  (host filesystem, no ns needed)
 //
 // The "_0" suffix is the container index within the sandbox (currently always 0).
-// For sandbox logs the process re-execs itself with CUBEMNT=1 so the C
-// constructor in pkg/cubemnt/nsenter.c enters the mount namespace while still
-// single-threaded.  Template logs are on the host filesystem and need no
-// namespace entry.
+// Host `/data/cubelet/log` is tried first without entering a namespace. Only
+// the bundle fallback re-execs with CUBEMNT=1 so the C constructor in
+// pkg/cubemnt/nsenter.c enters the cubelet mount namespace while still
+// single-threaded.
 var LogsCommand = &cli.Command{
 	Name:  "logs",
 	Usage: "show container stdout/stderr log for a sandbox or template",
@@ -122,21 +132,42 @@ var LogsCommand = &cli.Command{
 			return readTemplateLog(id, stream, all, tailN, headN)
 		}
 
-		// Already inside the namespace: do the real work.
+		// Bundle fallback after CUBEMNT re-exec: only the legacy path is
+		// visible inside the cubelet mount namespace.
 		if os.Getenv(envLogsMode) == "1" {
-			return readLog(id, stream, all, tailN, headN)
+			return readBundleLog(id, stream, all, tailN, headN)
+		}
+
+		// Resolve short sandbox ID prefix to full 32-char ID before opening
+		// files or re-exec so both paths use the canonical ID.
+		originalID := id
+		if !sandboxid.IsFullID(id) {
+			resolved, err := resolveLogsSandboxID(cliCtx, id)
+			if err != nil {
+				return err
+			}
+			id = resolved
+		}
+
+		// Host path first: shim writes here, no mount namespace required.
+		if f, logPath, err := openHostSandboxLog(id, stream); err == nil {
+			defer f.Close()
+			return printLog(f, logPath, id, all, tailN, headN)
+		} else if !os.IsNotExist(err) {
+			return err
 		}
 
 		// Re-exec with CUBEMNT=1 so the C constructor enters the cubelet mount
 		// namespace before Go runtime starts (single-threaded at that point).
-		// Pass os.Args[1:] directly so flag parsing is handled by the CLI
-		// framework in the child, avoiding fragile manual flag reconstruction.
+		// Substitute the resolved full ID for the user-supplied value so the
+		// child process uses the canonical ID directly.
 		self, err := os.Executable()
 		if err != nil {
 			return fmt.Errorf("cannot determine executable path: %w", err)
 		}
 
-		cmd := exec.Command(self, os.Args[1:]...)
+		childArgs := replacePositionalArg(os.Args[1:], originalID, id)
+		cmd := exec.Command(self, childArgs...)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -187,23 +218,24 @@ func openNoFollow(path, base string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), resolvedPath), nil
 }
 
-// readLog opens the log file for sandboxID/stream and prints lines according
-// to the requested mode. Must be called after entering the cubelet mount namespace.
-func readLog(sandboxID, stream string, all bool, tailN, headN int) error {
+// readBundleLog opens the legacy bundle log inside the cubelet mount namespace.
+func readBundleLog(sandboxID, stream string, all bool, tailN, headN int) error {
 	logPath := filepath.Join(cubeletStateDir, sandboxID, stream)
-
 	f, err := openNoFollow(logPath, cubeletStateDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("log file not found: %s\n(sandbox may not exist or log forwarding may not be enabled)", logPath)
+			return fmt.Errorf("log file not found at %s (host) or %s (legacy bundle)\n(sandbox may not exist or log forwarding may not be enabled)", filepath.Join(sandboxlog.Dir, sandboxID, stream), logPath)
 		}
 		return fmt.Errorf("open %s: %w", logPath, err)
 	}
 	defer f.Close()
+	return printLog(f, logPath, sandboxID, all, tailN, headN)
+}
 
+func printLog(f *os.File, logPath, sandboxID string, all bool, tailN, headN int) error {
 	switch {
 	case all:
-		if _, err = io.Copy(os.Stdout, f); err != nil {
+		if _, err := io.Copy(os.Stdout, f); err != nil {
 			return fmt.Errorf("reading log for %s: %w", sandboxID, err)
 		}
 		return nil
@@ -261,6 +293,78 @@ func printTail(r io.Reader, logPath string, n int) error {
 		fmt.Println(buf[(start+i)%n])
 	}
 	return nil
+}
+
+func openHostSandboxLog(sandboxID, stream string) (*os.File, string, error) {
+	path := filepath.Join(sandboxlog.Dir, sandboxID, stream)
+	f, err := openNoFollow(path, sandboxlog.Dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, path, err
+		}
+		return nil, path, fmt.Errorf("open %s: %w", path, err)
+	}
+	return f, path, nil
+}
+
+// openSandboxLogFrom tries the host log directory first, then the legacy
+// containerd bundle path. Used by unit tests; live cubecli splits the two
+// paths across host vs mount-namespace processes.
+func openSandboxLogFrom(sandboxID, stream, newBase, oldBase string) (*os.File, string, error) {
+	newPath := filepath.Join(newBase, sandboxID, stream)
+	f, err := openNoFollow(newPath, newBase)
+	if err == nil {
+		return f, newPath, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, newPath, fmt.Errorf("open %s: %w", newPath, err)
+	}
+
+	oldPath := filepath.Join(oldBase, sandboxID, stream)
+	f, err = openNoFollow(oldPath, oldBase)
+	if err == nil {
+		return f, oldPath, nil
+	}
+	if os.IsNotExist(err) {
+		return nil, newPath, fmt.Errorf("log file not found at %s (host) or %s (legacy bundle)\n(sandbox may not exist or log forwarding may not be enabled)", newPath, oldPath)
+	}
+	return nil, oldPath, fmt.Errorf("open %s: %w", oldPath, err)
+}
+
+// resolveLogsSandboxID resolves a short sandbox ID prefix to the full 32-char
+// ID by listing all sandboxes via the Cubelet gRPC API.
+func resolveLogsSandboxID(cliCtx *cli.Context, id string) (string, error) {
+	conn, ctx, cancel, err := commands.NewGrpcConn(cliCtx)
+	if err != nil {
+		return "", fmt.Errorf("resolve sandbox id: %w", err)
+	}
+	defer conn.Close()
+	defer cancel()
+
+	client := cubebox.NewCubeboxMgrClient(conn)
+	resp, err := client.List(ctx, &cubebox.ListCubeSandboxRequest{})
+	if err != nil {
+		return "", fmt.Errorf("resolve sandbox id: list sandboxes: %w", err)
+	}
+	return resolveSandboxIDFromList(resp.Items, id)
+}
+
+// replacePositionalArg returns a copy of args with the last occurrence of old
+// replaced by new.  Searching from the end is preferred because positional
+// arguments typically follow flags.
+func replacePositionalArg(args []string, old, new string) []string {
+	if old == new {
+		return args
+	}
+	out := make([]string, len(args))
+	copy(out, args)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] == old {
+			out[i] = new
+			break
+		}
+	}
+	return out
 }
 
 // readTemplateLog reads log files from /data/log/template/<templateID>_0/.

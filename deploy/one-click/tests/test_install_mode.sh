@@ -82,13 +82,15 @@ test_default_fresh_is_install() {
   [[ "${got}" == "install" ]] || fail "default+fresh should be install (got ${got})"
 }
 
-test_default_existing_non_interactive_is_install() {
+test_default_existing_non_interactive_is_upgrade() {
   local d="${TMP_DIR}/f"
   make_install_dir "${d}"
   local got
-  got="$(resolve_install_mode "" "${d}" 0 < /dev/null 2>/dev/null)"
-  [[ "${got}" == "install" ]] \
-    || fail "default+existing+non-interactive should default to install (got ${got})"
+  local err="${TMP_DIR}/f.err"
+  got="$(resolve_install_mode "" "${d}" 0 < /dev/null 2>"${err}")"
+  [[ "${got}" == "upgrade" ]] \
+    || fail "default+existing+non-interactive should default to upgrade (got ${got})"
+  assert_contains "${err}" "defaulting to config-preserving upgrade"
 }
 
 test_assume_yes_existing_is_upgrade() {
@@ -201,6 +203,30 @@ test_assert_safe_install_prefix() {
   ln -s "${TMP_DIR}/backup-link-target" "${backup_link_prefix}/.backup"
   if ( assert_safe_install_prefix "${backup_link_prefix}" ) >/dev/null 2>&1; then
     fail "assert_safe_install_prefix should reject a .backup symlink"
+  fi
+
+  # A link that lands inside the root is the versioned-component pattern, spelled
+  # the way install_cubes3lvol_versioned spells it (a bare name pointing at the
+  # versioned directory beside it). Refusing it aborted every upgrade of a tree
+  # this installer built, and did so after the services had been stopped.
+  local inside_prefix="${TMP_DIR}/inside-link-prefix"
+  mkdir -p "${inside_prefix}/CubeS3lvol-v1"
+  : > "${inside_prefix}/.one-click.env"
+  ln -s "CubeS3lvol-v1" "${inside_prefix}/CubeS3lvol"
+  ( assert_safe_install_prefix "${inside_prefix}" ) >/dev/null 2>&1 \
+    || fail "assert_safe_install_prefix should accept a top-level symlink that resolves inside the root"
+
+  # The same, spelled with an absolute target.
+  ln -sfn "${inside_prefix}/CubeS3lvol-v1" "${inside_prefix}/CubeS3lvol"
+  ( assert_safe_install_prefix "${inside_prefix}" ) >/dev/null 2>&1 \
+    || fail "assert_safe_install_prefix should accept an absolute symlink that resolves inside the root"
+
+  # A neighbour whose name merely starts with the root's is still outside it.
+  local neighbour="${TMP_DIR}/inside-link-prefix-neighbour"
+  mkdir -p "${neighbour}"
+  ln -sfn "${neighbour}" "${inside_prefix}/neighbour"
+  if ( assert_safe_install_prefix "${inside_prefix}" ) >/dev/null 2>&1; then
+    fail "assert_safe_install_prefix should reject a link to a sibling whose path only shares a name prefix"
   fi
 }
 
@@ -324,13 +350,16 @@ eth_name = "eth0"
 cidr = "192.168.0.0/18"
 cube_router_enable = false
 cube_router_cidr = ""
+cube_egress_admin_url = "http://127.0.0.1:9091"
 EOF
 
-  patch_cubelet_config_template "${cfg}" "ens3" "10.123.0.0/16" "1" "172.20.0.0/16" >/dev/null 2>&1
+  patch_cubelet_config_template "${cfg}" "ens3" "10.123.0.0/16" "1" "172.20.0.0/16" "9092" >/dev/null 2>&1
   grep -Fq 'eth_name = "ens3"' "${cfg}" || fail "patch should update eth_name"
   grep -Fq 'cidr = "10.123.0.0/16"' "${cfg}" || fail "patch should update cidr"
   grep -Fq 'cube_router_enable = true' "${cfg}" || fail "patch should update cube_router_enable"
   grep -Fq 'cube_router_cidr = "172.20.0.0/16"' "${cfg}" || fail "patch should update cube_router_cidr"
+  grep -Fq 'cube_egress_admin_url = "http://127.0.0.1:9092"' "${cfg}" \
+    || fail "patch should update cube_egress_admin_url from CUBE_EGRESS_ADMIN_PORT"
 
   local default_router_cidr_cfg="${TMP_DIR}/cubelet-default-router-cidr.toml"
   cat > "${default_router_cidr_cfg}" <<'EOF'
@@ -543,6 +572,8 @@ test_install_sh_wires_upgrade_flow() {
   assert_contains "${f}" "backup_before_upgrade"
   assert_contains "${f}" "merge_env_three_way"
   assert_contains "${f}" "patch_cubelet_config_template"
+  assert_contains "${f}" "check_minio_not_combined_with_user_s3"
+  assert_contains "${f}" "local_minio_s3_endpoint"
   # CLI parsing is delegated to one_click_parse_args (supports --mode/--node-ip
   # in both = and space forms) and CLI values are re-applied after .env load.
   assert_contains "${f}" 'one_click_parse_args "$@"'
@@ -567,6 +598,27 @@ test_install_sh_wires_upgrade_flow() {
   # on upgrade, CIDR host-conflict detection is skipped (M2)
   assert_contains "${f}" 'check_cidr_preflight "${CUBE_SANDBOX_NETWORK_CIDR}" "${cidr_skip_conflict}" "CUBE_SANDBOX_NETWORK_CIDR" 24 16'
   assert_contains "${f}" 'check_cidr_preflight "192.168.0.0/18" "${cidr_skip_conflict}" "default CubeSandbox network CIDR" 24 16'
+  # This-run toggle intent (ONE_CLICK_TOGGLE_KEYS) must be captured before any
+  # env sourcing and re-applied after the upgrade merge.
+  assert_contains "${f}" "snapshot_one_click_toggles"
+  assert_contains "${f}" "apply_one_click_toggles"
+  assert_contains "${f}" "ONE_CLICK_TOGGLE_KEYS"
+  # The s3lvol swap has to happen before anything else is stopped, so its online
+  # flush still has the running target and the S3 endpoint to write through.
+  # install.sh no longer stops the unit itself -- the upgrade orchestrator does,
+  # through the stop script, and the unit is deliberately not PartOf the role
+  # targets -- so what is checked is the ordering of the two, not a stop call.
+  # The invocation shape itself (the prefix travelling with it) is covered in
+  # test_s3lvol_hot_upgrade.sh.
+  local s3lvol_line stop_line
+  s3lvol_line="$(grep -nE '^[[:space:]]*(bash )?"[$][{]PKG_ROOT[}]/scripts/systemd/cube-s3lvol-hot-upgrade[.]sh"' \
+    "${f}" | head -1 | cut -d: -f1 || true)"
+  stop_line="$(grep -nE '^stop_existing_systemd_deployment$' "${f}" | head -1 | cut -d: -f1 || true)"
+  if [[ -z "${s3lvol_line}" || -z "${stop_line}" || "${s3lvol_line}" -ge "${stop_line}" ]]; then
+    fail "install.sh must upgrade s3lvol before stopping the deployment (s3lvol=${s3lvol_line:-missing}, stop=${stop_line:-missing})"
+  fi
+  # Disable must clear leftover failed state.
+  assert_contains "${f}" "systemctl reset-failed cube-sandbox-s3lvol.service"
 }
 
 test_explicit_install_mode
@@ -574,7 +626,7 @@ test_explicit_upgrade_requires_existing
 test_explicit_upgrade_with_existing
 test_auto_mode
 test_default_fresh_is_install
-test_default_existing_non_interactive_is_install
+test_default_existing_non_interactive_is_upgrade
 test_assume_yes_existing_is_upgrade
 test_parse_args_space_and_equals_forms
 test_parse_args_missing_value_fails

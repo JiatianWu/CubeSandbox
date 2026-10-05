@@ -5,7 +5,7 @@
 -- they are truly distributed and don't lead to synchronized stampedes.
 math.randomseed(ngx.now() * 1000 + ngx.worker.id())
 
--- Register this CubeProxy replica in Redis so cube-lifecycle-manager can
+-- Register this CubeProxy replica in Redis so Cube Lifecycle Manager can
 -- discover us. Config comes from environment variables so the operator can
 -- flip the feature on without editing nginx.conf (ngx.var.* is unavailable
 -- in init_worker_by_lua). All settings are optional; if CUBE_PROXY_REGISTRY_ENABLE
@@ -19,8 +19,11 @@ proxy_registry.setup({
     node_ip     = os.getenv("CUBE_PROXY_NODE_IP"),
     version     = os.getenv("CUBE_PROXY_VERSION"),
     interval_ms = tonumber(os.getenv("CUBE_PROXY_HEARTBEAT_INTERVAL_MS") or "") or 5000,
-    redis_ip    = os.getenv("CUBE_PROXY_REGISTRY_REDIS_HOST"),
+    redis_ip = os.getenv("CUBE_PROXY_REGISTRY_REDIS_HOST"),
     redis_port  = tonumber(os.getenv("CUBE_PROXY_REGISTRY_REDIS_PORT") or "") or 6379,
     redis_pd    = os.getenv("CUBE_PROXY_REGISTRY_REDIS_PASSWORD") or "",
     redis_index = tonumber(os.getenv("CUBE_PROXY_REGISTRY_REDIS_DB") or "") or 0,
+    redis_master_name = os.getenv("CUBE_PROXY_REGISTRY_REDIS_MASTER_NAME"),
+    redis_sentinel_nodes = os.getenv("CUBE_PROXY_REGISTRY_REDIS_SENTINEL_NODES"),
+    redis_sentinel_pd = os.getenv("CUBE_PROXY_REGISTRY_REDIS_SENTINEL_PASSWORD"),
 })

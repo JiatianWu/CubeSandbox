@@ -6,14 +6,13 @@
 #     -f runtime-values.yaml   # passwords / advertiseIP / TLS
 #
 # What this file does compared to values.yaml defaults:
-#   1. Rewrites Cube-owned image hosts from cube-sandbox-int → cube-sandbox-cn
-#      via global.imageRegistry (cube.cubeImage only replaces the registry host
-#      segment before the first "/"; do NOT include /cube-sandbox here).
-#   2. Points mysql / redis / kubectl (cube.image, no registry rewrite) at the
+#   1. Sets global.imageRegistry to the cn host so cube.cubeImage
+#      repositories move int → cn.
+#   2. Points mysql / redis / minio / kubectl (cube.image, no registry rewrite) at the
 #      mirrored CN repositories under cube-sandbox/.
 #
 # Prerequisites: CN images already published, including
-#   cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/{mysql,redis,alpine-k8s,...}
+#   cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/{mysql,redis,minio,alpine-k8s,...}
 
 global:
   # Host only — path /cube-sandbox/<image> is preserved from values.yaml.
@@ -33,3 +32,8 @@ redis:
   image:
     repository: cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/redis
     tag: "7-alpine"
+
+minio:
+  image:
+    repository: cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/minio
+    tag: "RELEASE.2025-09-07T16-13-09Z"

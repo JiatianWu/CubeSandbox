@@ -106,11 +106,21 @@ export interface ClusterNodeView {
   memorySaturationPct: number;
   heartbeatTime?: string | null;
   healthy: boolean;
+  schedulingDisabled: boolean;
   localTemplates: string[];
   versions: ComponentVersionDto[];
 }
 
 export interface ClusterOverview extends ClusterOverviewDto {}
+
+export interface NodeOperationDto {
+  id: number;
+  node_id: string;
+  type: string;
+  operator?: string;
+  detail?: string;
+  created_at: string;
+}
 
 function mapSandbox(dto: ListedSandboxDto): RunningSandbox {
   return dto;
@@ -187,6 +197,8 @@ function mapNode(dto: ApiNodeView): ClusterNodeView {
     memorySaturationPct: Math.round(dto.memorySaturation),
     heartbeatTime: dto.heartbeatTime,
     healthy: dto.healthy,
+    schedulingDisabled:
+      (dto as unknown as { schedulingDisabled?: boolean }).schedulingDisabled ?? false,
     localTemplates: dto.localTemplates ?? [],
     versions: dto.versions ?? [],
   };
@@ -275,18 +287,120 @@ export const versionApi = {
   matrix: () => ops<VersionMatrixDto>('/cluster/versions'),
 };
 
+export interface WarehouseComponentSummary {
+  name: string;
+  versionCount: number;
+  arches: string[];
+  sizeBytes: number;
+  nodesMissing?: number;
+}
+
+export interface WarehouseArtifact {
+  arch: string;
+  sizeBytes: number;
+  source: string;
+  sourceRef: string;
+  checksum: string;
+  createdAt: string;
+  nodesInstalled?: string[];
+  nodesMissing?: string[];
+}
+
+export interface WarehouseVersionGroup {
+  version: string;
+  artifacts: WarehouseArtifact[];
+}
+
+export interface WarehouseComponentDetail {
+  name: string;
+  versions: WarehouseVersionGroup[];
+}
+
+export interface WarehouseImportJob {
+  id: string;
+  source: string;
+  sourceRef: string;
+  tag: string;
+  arch: string;
+  status: string;
+  error?: string;
+  bytesTotal: number;
+}
+
+export interface WarehousePreinstallJob {
+  id: string;
+  nodeId: string;
+  arch: string;
+  component: string;
+  version: string;
+  status: string;
+  error?: string;
+}
+
+export const warehouseApi = {
+  listComponents: () => ops<{ components: WarehouseComponentSummary[] }>('/warehouse/components'),
+  getComponent: (name: string) =>
+    ops<WarehouseComponentDetail>(`/warehouse/components/${encodeURIComponent(name)}`),
+  preinstallJobs: (params?: {
+    node_id?: string;
+    status?: string;
+    limit?: number;
+    offset?: number;
+  }) => ops<{ jobs: WarehousePreinstallJob[]; total: number }>('/warehouse/preinstall', { params }),
+  importStatus: (id: string) => ops<WarehouseImportJob>(`/warehouse/imports/${id}`),
+  listImports: (params?: { limit?: number; offset?: number }) =>
+    ops<{ jobs: WarehouseImportJob[]; total: number }>('/warehouse/imports', { params }),
+  createImport: (body: {
+    source: 'github' | 'cnb' | 'upload';
+    repo?: string;
+    tag?: string;
+    uploadId?: string;
+    arch: string[];
+  }) =>
+    ops<{ jobs: WarehouseImportJob[] }>('/warehouse/imports', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  preinstall: (body: { nodeIds: string[]; arch: string; component: string; version: string }) =>
+    ops<{ jobs: WarehousePreinstallJob[] }>('/warehouse/preinstall', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  deleteVersion: (component: string, version: string, arch: string) =>
+    ops<void>(
+      `/warehouse/components/${encodeURIComponent(component)}/versions/${encodeURIComponent(version)}`,
+      { method: 'DELETE', params: { arch } },
+    ),
+  upload: (file: File) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    return ops<{ uploadId: string; filename: string }>('/warehouse/uploads', {
+      method: 'POST',
+      body: fd,
+    });
+  },
+};
+
 export const clusterApi = {
   overview: () => ops<ClusterOverviewDto>('/cluster/overview'),
   nodes: () => ops<ApiNodeView[]>('/nodes').then((items) => items.map(mapNode)),
   node: (id: string) => ops<ApiNodeView>(`/nodes/${id}`).then(mapNode),
+  isolate: (id: string, detail?: string) =>
+    ops<void>(`/nodes/${id}/isolation`, {
+      method: 'PUT',
+      body: detail ? JSON.stringify({ detail }) : undefined,
+    }),
+  unisolate: (id: string, detail?: string) =>
+    ops<void>(`/nodes/${id}/isolation`, {
+      method: 'DELETE',
+      body: detail ? JSON.stringify({ detail }) : undefined,
+    }),
+  nodeOperations: (id: string) => ops<NodeOperationDto[]>(`/nodes/${id}/operations`),
   config: () =>
     ops<{
       apiEndpoint: string;
       opsApiEndpoint: string;
-      rateLimitPerSec: number;
-      authEnabled: boolean;
       sandboxDomain: string;
-      instanceType: string;
     }>('/config'),
 };
 

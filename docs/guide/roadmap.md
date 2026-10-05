@@ -4,25 +4,13 @@
 
 ## Coming Soon
 
-### Kubernetes-Native Deployment
+### Cross-Node Pause/Resume Performance
 
-Deploy and operate CubeSandbox entirely within a Kubernetes cluster using standard primitives — CRDs, operators, and native scheduling. Removes the need for out-of-band orchestration and makes CubeSandbox a first-class citizen in cloud-native environments.
-
-### Volume Support
-
-Persistent and shared volume support for sandboxes, compatible with the E2B volume protocol. Enables stateful workloads and shared data across sandbox instances.
-
-### Cross-Node Pause and Resume
-
-Suspend a running sandbox on one node and resume it on a different node, with full memory and filesystem state preserved. Unlocks flexible bin-packing, host drain workflows, and cross-node sandbox migration.
+Cross-node pause/resume landed in v0.7.0 as a preview. The next step is performance: cut pause/resume latency and speed up snapshot transfer so that resuming on another node approaches same-node speed.
 
 ### E2B API Compatibility
 
 Close the remaining gaps between CubeSandbox's API surface and the E2B specification. The goal is full drop-in compatibility so that workloads and SDK clients targeting E2B can run against a self-hosted CubeSandbox cluster without modification.
-
-### Control Plane / Data Plane Separation
-
-Separate the control plane (cluster management, scheduling, health checks) from the data plane (sandbox create/run/snapshot) so that a failure or rolling upgrade of the control plane does not affect sandboxes already in flight. Achieving full end-to-end high availability requires that the two planes are independently deployable and fault-isolated.
 
 ### Sandbox Fault Recovery
 
@@ -31,6 +19,18 @@ Automatic detection and recovery of sandboxes in abnormal states — crashed VMs
 ### Scheduling and Operations Enhancements
 
 Richer scheduling capabilities including resource-aware placement, affinity/anti-affinity rules, and priority classes. Also covers operational tooling: live resource rebalancing and node drain with sandbox migration.
+
+### S3 Performance and Cost Optimization
+
+Cross-node pause/resume and volumes already persist through S3-compatible object storage. Next is to cut both latency and bill: incremental uploads, better local cache, and cheaper storage classes so snapshot transfer and volume I/O stay fast without paying full-object prices every time.
+
+### Filesystem-Only Snapshots
+
+Today a snapshot captures memory and the writable filesystem together. A filesystem-only snapshot skips the memory dump so clone and restore are cheaper and faster when the workload can cold-start from disk — installed packages, workspace files, and envd state — without a live RAM image.
+
+### GPU Sandboxes
+
+Attach host GPUs to sandboxes so Agent and inference workloads can run CUDA (and similar accelerators) inside the same isolated VM model, with the scheduler accounting for GPU inventory and placement.
 
 ---
 

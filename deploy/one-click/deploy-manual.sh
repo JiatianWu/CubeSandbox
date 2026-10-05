@@ -56,14 +56,12 @@ restart_core_services() {
 
   if [[ "${role}" == "compute" ]]; then
     units=(
-      cube-sandbox-network-agent.service
       cube-sandbox-cubelet.service
     )
   else
     units=(
       cube-sandbox-cubemaster.service
       cube-sandbox-cube-api.service
-      cube-sandbox-network-agent.service
       cube-sandbox-cubelet.service
     )
   fi
@@ -111,12 +109,13 @@ main() {
   if [[ "${role}" != "compute" ]]; then
     cp -a "${install_prefix}/CubeMaster/bin/cubemaster" "${backup_dir}/"
     cp -a "${install_prefix}/CubeMaster/bin/cubemastercli" "${backup_dir}/"
+    cp -a "${install_prefix}/CubeOps/bin/cubeops" "${backup_dir}/"
+    cp -a "${install_prefix}/CubeOps/bin/cubeopscli" "${backup_dir}/"
   fi
   cp -a "${install_prefix}/Cubelet/bin/cubelet" "${backup_dir}/"
   cp -a "${install_prefix}/Cubelet/bin/cubecli" "${backup_dir}/"
-  cp -a "${install_prefix}/network-agent/bin/network-agent" "${backup_dir}/"
-  if [[ -f "${install_prefix}/network-agent/bin/cubevsmapdump" ]]; then
-    cp -a "${install_prefix}/network-agent/bin/cubevsmapdump" "${backup_dir}/"
+  if [[ -f "${install_prefix}/cube-vs/network/bin/cubevsmapdump" ]]; then
+    cp -a "${install_prefix}/cube-vs/network/bin/cubevsmapdump" "${backup_dir}/"
   fi
 
   log "extract package ${package_tar}"
@@ -125,22 +124,25 @@ main() {
   if [[ "${role}" != "compute" ]]; then
     ensure_file "${work_dir}/cubemaster"
     ensure_file "${work_dir}/cubemastercli"
+    ensure_file "${work_dir}/cubeops"
+    ensure_file "${work_dir}/cubeopscli"
   fi
   ensure_file "${work_dir}/cubelet"
   ensure_file "${work_dir}/cubecli"
-  ensure_file "${work_dir}/network-agent"
   ensure_file "${work_dir}/cubevsmapdump"
 
   log "replace binaries under ${install_prefix}"
   if [[ "${role}" != "compute" ]]; then
     install -m 0755 "${work_dir}/cubemaster" "${install_prefix}/CubeMaster/bin/cubemaster"
     install -m 0755 "${work_dir}/cubemastercli" "${install_prefix}/CubeMaster/bin/cubemastercli"
+    install -m 0755 "${work_dir}/cubeops" "${install_prefix}/CubeOps/bin/cubeops"
+    install -m 0755 "${work_dir}/cubeopscli" "${install_prefix}/CubeOps/bin/cubeopscli"
   fi
   install -m 0755 "${work_dir}/cubelet" "${install_prefix}/Cubelet/bin/cubelet"
   install -m 0755 "${work_dir}/cubecli" "${install_prefix}/Cubelet/bin/cubecli"
-  install -m 0755 "${work_dir}/network-agent" "${install_prefix}/network-agent/bin/network-agent"
-  install -m 0755 "${work_dir}/cubevsmapdump" "${install_prefix}/network-agent/bin/cubevsmapdump"
-  ln -sf "${install_prefix}/network-agent/bin/cubevsmapdump" /usr/local/bin/cubevsmapdump
+  install -d -m 0755 "${install_prefix}/cube-vs/network/bin"
+  install -m 0755 "${work_dir}/cubevsmapdump" "${install_prefix}/cube-vs/network/bin/cubevsmapdump"
+  ln -sf "${install_prefix}/cube-vs/network/bin/cubevsmapdump" /usr/local/bin/cubevsmapdump
 
   log "restart local systemd services"
   restart_core_services "${role}"
@@ -153,7 +155,7 @@ main() {
 
   if [[ "${role}" != "compute" ]]; then
     log "node metadata after restart"
-    curl -fsS http://127.0.0.1:8089/internal/meta/nodes || true
+    curl -fsS http://127.0.0.1:3010/internal/v1/nodes || true
     printf '\n'
   fi
 

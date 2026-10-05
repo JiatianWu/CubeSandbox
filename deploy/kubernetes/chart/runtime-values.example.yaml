@@ -28,7 +28,22 @@ cubeProxy:
   #   annotations:
   #     service.cloud.tencent.com/security-groups: "sg-xxxxxxxx"
   # No Ingress controller? Set cubeProxy.ingress.enabled: false and expose
-  # the ClusterIP Service yourself.
+  # the Service yourself, e.g. NodePort with fixed host ports:
+  # service:
+  #   type: NodePort
+  #   nodePorts:
+  #     http: 30080
+  #     https: 30443
+  #     grpc: 30090
+  # ingress:
+  #   enabled: false
+
+# Optional: expose CubeAPI on a fixed NodePort (with service.type=NodePort):
+# controlPlane:
+#   api:
+#     service:
+#       type: NodePort
+#       nodePort: 30030
 
 # REQUIRED: validate.yaml refuses CHANGE_ME_* sentinels from values.yaml.
 mysql:
@@ -36,16 +51,32 @@ mysql:
   password: "replace-me-mysql-password"
   rootPassword: "replace-me-mysql-root-password"
   # host: "mysql.example.com"   # optional: skip built-in StatefulSet
+#
+# External PostgreSQL instead of MySQL (skips built-in MySQL; CubeMaster gets
+# driver: postgres). Switch the driver and fill in the postgres section:
+# database:
+#   driver: postgres
+# postgres:
+#   host: "10.0.0.10"
+#   port: 5432
+#   user: postgres
+#   password: "replace-me-pg-password"
+#   database: cube_mvp
 redis:
   host: ""
   password: "replace-me-redis-password"
+  # External Redis Sentinel (skips chart-managed redis). Example:
+  # masterName: mymaster
+  # sentinelNodes: "10.0.0.11:26379,10.0.0.12:26379,10.0.0.13:26379"
+  # sentinelPassword: ""   # leave empty when Sentinel has no requirepass
+  # password: "replace-me-redis-master-password"
 
 # --- Persistence (optional) ---
-# Default: leave unset → CubeMaster / MySQL / Redis PVCs use the cluster's
+# Default: leave unset → CubeMaster / MySQL / Redis / MinIO PVCs use the cluster's
 # default StorageClass. Chart does NOT create a StorageClass unless you merge
 # values-tke.yaml (or set storageClass.create=true yourself).
 #
-# Pin all three PVCs to one existing SC (e.g. local-path / gp3 / premium-rwo):
+# Pin all four PVCs to one existing SC (e.g. local-path / gp3 / premium-rwo):
 # persistence:
 #   storageClassName: local-path
 #
@@ -60,6 +91,9 @@ redis:
 # redis:
 #   persistence:
 #     storageClassName: gp3
+# minio:
+#   persistence:
+#     storageClassName: gp3
 #
 # Single-node / no CSI: use hostPath instead of PVC
 # controlPlane:
@@ -72,6 +106,9 @@ redis:
 # redis:
 #   persistence:
 #     hostPath: /data/redis
+# minio:
+#   persistence:
+#     hostPath: /data/minio
 
 # Optional: cubevs/sandbox CIDR (Chart default is 172.16.0.0/18).
 # Override when it collides with your VPC; keep tproxyOnIP as the CIDR gateway.
@@ -94,14 +131,14 @@ redis:
 # Production with a pre-mounted XFS volume at /data/cubelet:
 #         enabled: false
 
-# Optional: mirror Cube-owned images into a private registry
+# Optional: mirror the official Cube images into a private registry
+# (only official Cube TCR hosts are rewritten):
 # global:
-#   imageRegistry: my-mirror.example.com/cubesandbox
+#   imageRegistry: my-mirror.example.com
 #
-# Or override per-image repositories (required when the path differs from the
-# chart default cube-sandbox/... — e.g. private TCR with a different namespace):
+# Or override selected images individually:
 # images:
 #   ops:
 #     repository: my-mirror.example.com/cube-sandbox/cube-ops
-#     tag: v0.5.1
+#     tag: v0.7.2
 #     pullPolicy: Always

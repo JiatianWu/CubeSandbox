@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import inspect
 import os
+import time
+from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from typing import Any
@@ -69,7 +71,10 @@ def _normalize_info_value(value: Any) -> Any:
     if hasattr(value, "isoformat"):
         return value.isoformat()
     if is_dataclass(value):
-        return _sandbox_info_to_raw(value)
+        return {
+            key: _normalize_info_value(item)
+            for key, item in asdict(value).items()
+        }
     if isinstance(value, dict):
         return {key: _normalize_info_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -99,6 +104,7 @@ def _sandbox_info_to_raw(info: Any) -> dict[str, Any]:
             "startedAt",
             "end_at",
             "endAt",
+            "timeout",
             "state",
             "status",
             "cpu_count",
@@ -139,7 +145,16 @@ def _sandbox_entry_to_dict(entry: Any) -> dict[str, Any]:
     else:
         data = {
             name: getattr(entry, name)
-            for name in ("sandbox_id", "sandboxID", "id", "state", "metadata", "template_id")
+            for name in (
+                "sandbox_id",
+                "sandboxID",
+                "id",
+                "state",
+                "metadata",
+                "template_id",
+                "end_at",
+                "endAt",
+            )
             if hasattr(entry, name)
         }
 
@@ -150,6 +165,11 @@ def _sandbox_entry_to_dict(entry: Any) -> dict[str, Any]:
     state = data.get("state")
     if state is not None:
         data["state"] = str(getattr(state, "value", state))
+    end_at = first_present(data, "end_at", "endAt")
+    if end_at is not None:
+        end_at = _normalize_info_value(end_at)
+        data.setdefault("end_at", end_at)
+        data.setdefault("endAt", end_at)
     return data
 
 
@@ -215,7 +235,7 @@ class E2BAdapter(SandboxAdapter):
         connect_method = getattr(Sandbox, "connect", None)
         if callable(connect_method):
             kwargs = dict(_e2b_api_params(config))
-            if _accepts_keyword(connect_method, "timeout"):
+            if timeout is not None and _accepts_keyword(connect_method, "timeout"):
                 kwargs["timeout"] = timeout
             sandbox = connect_method(sandbox_id, **kwargs)
         else:
@@ -286,8 +306,115 @@ class E2BAdapter(SandboxAdapter):
             raise RuntimeError("E2B files object does not expose read/read_file")
         return str(reader(path))
 
-    def run_code(self, code: str, *, timeout: int = 60) -> CodeResult:
-        result = self._sandbox.run_code(code, timeout=timeout)
+    def _files_call(self, names: tuple[str, ...], *args):
+        files = getattr(self._sandbox, "files", None)
+        if files is None:
+            raise RuntimeError("E2B sandbox object does not expose files")
+        method = next(
+            (
+                getattr(files, name, None)
+                for name in names
+                if callable(getattr(files, name, None))
+            ),
+            None,
+        )
+        if method is None:
+            raise RuntimeError(f"E2B files object does not expose any of {names!r}")
+        return method(*args)
+
+    def list_files(self, path: str) -> list[dict[str, Any]]:
+        return [_normalize_info_value(item) for item in self._files_call(("list",), path)]
+
+    def stat_file(self, path: str) -> dict[str, Any]:
+        return dict(_normalize_info_value(self._files_call(("stat", "get_info"), path)))
+
+    def file_exists(self, path: str) -> bool:
+        return bool(self._files_call(("exists",), path))
+
+    def remove_file(self, path: str) -> None:
+        self._files_call(("remove", "delete"), path)
+
+    def rename_file(self, old_path: str, new_path: str) -> dict[str, Any]:
+        value = self._files_call(("rename", "move"), old_path, new_path)
+        return dict(_normalize_info_value(value) or {})
+
+    def make_dir(self, path: str) -> None:
+        self._files_call(("make_dir", "mkdir"), path)
+
+    def write_files(self, files: list[tuple[str, str | bytes]]) -> int:
+        entries = [{"path": path, "data": data} for path, data in files]
+        return len(self._files_call(("write_files",), entries))
+
+    def watch_dir_events(
+        self,
+        path: str,
+        operation: Callable[[], None],
+        *,
+        timeout: float = 5,
+        until: Callable[[list[dict[str, str]]], bool] | None = None,
+    ) -> list[dict[str, str]]:
+        events: list[dict[str, str]] = []
+
+        def append_events(batch: Any) -> None:
+            events.extend(
+                {
+                    "name": str(getattr(event, "name", "")),
+                    "type": str(getattr(getattr(event, "type", None), "value", "")),
+                }
+                for event in batch
+            )
+
+        files = getattr(self._sandbox, "files", None)
+        watch_dir = getattr(files, "watch_dir", None)
+        if not callable(watch_dir):
+            raise RuntimeError("E2B files object does not expose watch_dir()")
+        watcher = watch_dir(path)
+        get_new_events = getattr(watcher, "get_new_events", None)
+        if not callable(get_new_events):
+            raise RuntimeError(
+                "E2B watch_dir() returned a watcher without get_new_events()"
+            )
+
+        deadline = time.monotonic() + timeout
+        previous_count = -1
+        unchanged_since = time.monotonic()
+        try:
+            # Give both callback- and polling-based SDK implementations time to
+            # establish the remote watch before the first filesystem mutation.
+            time.sleep(0.1)
+            operation()
+            while time.monotonic() < deadline:
+                append_events(get_new_events())
+                count = len(events)
+                if until is not None and until(events):
+                    return events
+                if count != previous_count:
+                    previous_count = count
+                    unchanged_since = time.monotonic()
+                elif (
+                    until is None
+                    and count
+                    and time.monotonic() - unchanged_since >= 0.5
+                ):
+                    return events
+                time.sleep(0.1)
+        finally:
+            stop = getattr(watcher, "stop", None)
+            if callable(stop):
+                stop()
+        return events
+
+    def run_code(
+        self,
+        code: str,
+        *,
+        env_vars: dict[str, str] | None = None,
+        timeout: int = 60,
+    ) -> CodeResult:
+        kwargs = {"timeout": timeout}
+        if env_vars is not None:
+            kwargs["envs"] = env_vars
+        result = self._sandbox.run_code(code, **kwargs)
         logs = getattr(result, "logs", None)
         stdout = list(getattr(logs, "stdout", []) or [])
         stderr = list(getattr(logs, "stderr", []) or [])
@@ -331,6 +458,19 @@ class E2BAdapter(SandboxAdapter):
             self._e2e_config or SdkE2EConfig.from_env(),
             timeout=timeout,
         )
+
+    def resume_idle_timeout(self, timeout: int | None) -> "E2BAdapter":
+        return type(self).connect(
+            self.sandbox_id,
+            self._e2e_config or SdkE2EConfig.from_env(),
+            timeout=timeout,
+        )
+
+    def set_timeout(self, timeout: int) -> None:
+        method = getattr(self._sandbox, "set_timeout", None)
+        if not callable(method):
+            raise RuntimeError("E2B sandbox object does not expose set_timeout()")
+        method(timeout)
 
     def kill(self) -> None:
         for name in ("kill", "delete", "close"):

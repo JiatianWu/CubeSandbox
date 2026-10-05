@@ -10,8 +10,8 @@ This is the **native K8s path**: components run in the cluster and are managed b
 The current K8s deployment is a **preview** release. Known issues:
 
 1. When compute nodes are under resource pressure, Pods may be incorrectly evicted by the K8s control plane, interrupting sandboxes. This is being fixed.
-2. Compute-plane upgrades **recreate the `cube-node` Big Pod** (native DaemonSet) and **will interrupt existing sandboxes on that node**. Before upgrading, call CubeMaster’s isolate API, isolate the node for at least 60 seconds, and destroy the sandboxes on that node.
-3. Because sandbox networking on compute nodes is bound to the Pod’s network interface, recreating `cube-node` interrupts existing sandbox networks. To address this, you may use a Kubernetes plugin you are familiar with to achieve “in-place upgrade” — update container images without recreating the Pod. After deploying the current version, carefully evaluate changes and test before upgrading further.
+2. Compute-node upgrades currently have known issues: an upgrade recreates `cube-node`; on the Pod network that interrupts existing sandbox networking on the node, while on the default host network the netns survives the recreate. Read the [Upgrade guide](./upgrade.md) **before you deploy**.
+3. The default host network is new and may interact with your CNI / Pod Security Admission (e.g. Cilium eBPF, `restricted` PSA). Test it in a non-production cluster first; see [Install · cube-node networking](./install.md#_8-3-cube-node-networking-and-pod-recreation).
 
 **These issues will be addressed in later versions. You are welcome to try the K8s deployment path and report issues and suggestions via Issues.**
 :::
@@ -22,7 +22,7 @@ The current K8s deployment is a **preview** release. Known issues:
 | --- | --- |
 | [Helm Install](./install.md) | Full steps from cluster readiness to verification (recommended main path) |
 | [Architecture](./architecture.md) | Chart component layers, four DaemonSets, startup order, and data flows |
-| [Upgrade](./upgrade.md) | Control plane can roll; compute upgrades recreate the Big Pod and interrupt sandboxes |
+| [Upgrade](./upgrade.md) | Control plane can roll; compute upgrades recreate the Big Pod (the netns survives on the default host network) |
 | [FAQ](./faq.md) | Troubleshooting for install, scheduling, PVM, Proxy, Egress, and upgrades |
 
 ## Install order (required reading)

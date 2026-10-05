@@ -153,6 +153,14 @@ Cube 会在宿主机 `/data/cubelet`下写入数据，且该路径必须是 **XF
 
 若您希望在生产环境部署，或调整相关配置，请转到 [8.2 计算节点数据盘配置](#_8-2-计算节点数据盘配置)。
 
+**计算节点网络（cube-node 重建）**
+
+::: warning 请在部署前决定
+默认的**宿主机网络**下，沙箱设备留在宿主机 netns，不随 `cube-node` Pod 重建销毁；在 cubelet 重启后沙箱存活的实机验证落地前，drain 仍是支持路径。若改用 Pod 网络（`cubeNode.hostNetwork: false`），则沙箱运行期间该 Pod **不可重建**——该节点上所有沙箱的网络**全部中断（入站、出站均中断）**，且无法自愈。详细说明与取舍（含 NetworkPolicy）：[8.3 cube-node 网络与 Pod 重建](#_8-3-cube-node-网络与-pod-重建)。
+
+宿主机网络默认值是新增行为，尚未在所有 CNI / admission 配置下验证。`hostNetwork` Pod 绕过 CNI IPAM、不被 NetworkPolicy 选中；eBPF 型 CNI（如 Cilium）自身的 eBPF 程序可能与宿主机网卡上的 cubevs 钩子冲突；集群若强制 `restricted` Pod Security Admission，会拒绝 `hostNetwork` Pod。**请先在测试集群验证此默认值**，再用于生产；集群不允许 `hostNetwork` 时设 `cubeNode.hostNetwork: false`（见 [8.3](#_8-3-cube-node-网络与-pod-重建)）。
+:::
+
 
 ## 5. Helm 安装
 
@@ -208,9 +216,9 @@ helm upgrade --install cube ./deploy/kubernetes/chart \
 # 1) Pod 是否 Ready
 kubectl get pods -n cube-system -o wide
 
-# 2) 计算节点是否已注册到 CubeMaster
+# 2) 计算节点是否已注册到 CubeOps
 kubectl exec -n cube-system deploy/cube-cubemastercli -- \
-  sh -lc 'cubemastercli --address "$CUBEMASTERCLI_ADDRESS" --port "$CUBEMASTERCLI_PORT" node list'
+  sh -lc 'cubeopscli --address "$CUBEOPSCLI_ADDRESS" --port "$CUBEOPSCLI_PORT" node list'
 
 # 3) 内置端到端测试（约数分钟）
 helm test cube -n cube-system --timeout 20m --logs
@@ -249,7 +257,7 @@ kubectl delete namespace cube-system
 
 ### 8.1 控制面 PVC 配置
 
-- 默认：CubeMaster / MySQL / Redis 走集群 **default StorageClass**
+- 默认：CubeMaster / MySQL / Redis / MinIO 走集群 **default StorageClass**
 - 指定 SC：在 `runtime-values.yaml` 修改 `persistence.storageClassName: <name>`
 - 单节点 / 无 CSI：可改用 hostPath（见 `runtime-values.example.yaml` 注释）
 
@@ -291,6 +299,52 @@ bootstrap:
 ```
 
 
+### 8.3 cube-node 网络与 Pod 重建
+
+::: tip 一句话结论
+`cube-node` 默认使用**宿主机网络**，Pod 重建不再改变沙箱网络设备所在的 network namespace。在 cubelet 重启后沙箱存活的实机验证落地前，计算面仍以 drain 为支持路径——见[升级](./upgrade.md)。若改用 Pod 网络（`cubeNode.hostNetwork: false`），则该 Pod **不可重建**——重建会导致该节点上所有沙箱的网络**全部中断（入站、出站均中断）且无法自愈**。
+:::
+
+#### 为什么网络模式决定这件事
+
+沙箱的网络设备（TAP 设备）与 cubevs 钩子位于 `cube-node` Pod 的 network namespace 中，因此 Pod 的网络模式决定了重建时它们会怎样：
+
+| 项目 | 说明 |
+| --- | --- |
+| 触发条件 | 任何导致 Pod 重建的操作：DaemonSet template 变更、镜像升级、手工 `kubectl delete pod` 等 |
+| hostNetwork（默认） | netns 即宿主机 netns，不随 Pod 重建变化，设备得以保留。cubelet 重启后沙箱存活尚未实机验证——在此之前仍应 drain（见[升级](./upgrade.md)） |
+| Pod 网络（`hostNetwork: false`） | Pod netns 被销毁：该节点上**所有沙箱**的网络全部中断（**入站、出站均中断**）且**不能自愈**。只能销毁并重建受影响的沙箱 |
+
+计算面升级同样受此影响，详见[升级](./upgrade.md)。
+
+#### 默认：宿主机网络
+
+`cubeNode.hostNetwork` 默认为 `true`，全新安装无需任何操作。保持默认时需要确认：
+
+| 事项 | 说明 |
+| --- | --- |
+| DNS | `dnsPolicy` 自动切为 `ClusterFirstWithHostNet`，集群内域名解析正常 |
+| 端口冲突 | cubelet（9998 / 9999 / 9966）与启用时的 CubeS3lvol 占用宿主机端口；已被占用时 `cube-node-init` 会 fail-fast（`bootstrap.nodeInit.checkHostPorts`）。CubeEgress 端口不在此检查中——启用时请自行确认。cubelet 端口无认证，防火墙按 kubelet 10250 同级对待 |
+| NetworkPolicy | 无法管控沙箱流量，见下文 |
+| 监控 / 防火墙 | 基于 Pod IP / Pod CIDR 的规则需改为基于节点 IP |
+| CNI / admission | `hostNetwork` Pod 绕过 CNI IPAM、不被 NetworkPolicy 选中；eBPF 型 CNI（如 Cilium）可能与宿主机网卡上的 cubevs 钩子冲突；`restricted` Pod Security Admission 会拒绝 `hostNetwork` Pod。此默认是新增的——先在测试集群验证，或设 `cubeNode.hostNetwork: false` |
+
+#### 改用 Pod 网络
+
+当 Kubernetes NetworkPolicy 需要管控沙箱流量（例如「沙箱能否访问某个 Service」）时，设 `cubeNode.hostNetwork: false`。Pod 网络其余方面都是代价：
+
+- `cube-node` Pod 重建会中断该节点上所有沙箱的网络；
+- guest MTU 需要容纳 CNI 封装——`cubeNode.network.mtu: auto` 会按探测到的网卡下调。
+
+在已有 release 上改这个值会重建所有 Big Pod，因此由一个 pre-upgrade Hook 拦截：见[升级 · 切换网络模式](./upgrade.md#切换网络模式)。
+
+::: info 后续工作：PR #1189（尚未合入，仅供参考）
+若要在保持宿主机网络的同时用 NetworkPolicy 管控沙箱访问集群内 Service / Pod 的流量，以及实现完整的 `cube-node` 原地替换，可参考 [PR #1189](https://github.com/TencentCloud/CubeSandbox/pull/1189)：
+
+- 仅将发往集群 CIDR 的流量经节点本地 **EgressProxy Pod** 转发，并 SNAT 为 Proxy Pod IP，使其受您自定义的 NetworkPolicy 管控；其余流量仍走正常路由。
+:::
+
+
 ---
 
 ## 常见问题速查
@@ -316,6 +370,6 @@ bootstrap:
 - [架构说明](./architecture.md)
 - [升级](./upgrade.md)
 - [常见问题](./faq.md)
-- [连接到已有 Cube 集群](../connect-existing-cluster.md)
+- [从客户端连接集群](../multi-node-deploy.md#从客户端连接集群)
 - [WebUI 控制台](../webui.md)
 - [鉴权](../authentication.md)

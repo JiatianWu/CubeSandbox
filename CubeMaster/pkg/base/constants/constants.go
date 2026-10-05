@@ -70,15 +70,54 @@ const (
 	CubeAnnotationAppSnapshotVersion         = "cube.master.appsnapshot.version"
 	CubeAnnotationAppSnapshotTemplateVersion = "cube.master.appsnapshot.template.version"
 	CubeAnnotationRuntimeSnapshotID          = "cube.master.runtime.snapshot.id"
-	CubeAnnotationRuntimeSnapshotAttachedAt  = "cube.master.runtime.snapshot.attached_at"
-	CubeAnnotationRootfsArtifactID           = "cube.master.rootfs.artifact.id"
-	CubeAnnotationRootfsArtifactJobID        = "cube.master.rootfs.artifact.job_id"
-	CubeAnnotationRootfsArtifactURL          = "cube.master.rootfs.artifact.url"
-	CubeAnnotationRootfsArtifactToken        = "cube.master.rootfs.artifact.token"
-	CubeAnnotationRootfsArtifactSHA256       = "cube.master.rootfs.artifact.sha256"
-	CubeAnnotationRootfsArtifactSizeBytes    = "cube.master.rootfs.artifact.size_bytes"
-	CubeAnnotationWritableLayerSize          = "cube.master.rootfs.writable_layer_size"
-	CubeAnnotationTemplateSpecFingerprint    = "cube.master.template.spec_fingerprint"
+	// CubeAnnotationDesiredSandboxID asks Cubelet createid to reuse this
+	// sandbox ID (Resume-from-pause same-ID recreate).
+	CubeAnnotationDesiredSandboxID = "cube.master.desired.sandbox.id"
+	// CubeAnnotationPauseSnapshotID is the pause snapshot id allocated by
+	// Master (same snap-* format as normal snapshots). DB Kind=pause_snapshot;
+	// Cubelet only keeps the local catalog under that id.
+	CubeAnnotationPauseSnapshotID = "cube.master.pause.snapshot.id"
+	// CubeAnnotationLaunchMemorySnapshotID is the start-image id Cubelet
+	// stamps once. User Create must not set it (see checkAndGetAnnotation).
+	CubeAnnotationLaunchMemorySnapshotID = "cube.master.launch.memory.snapshot.id"
+	// CubeAnnotationRuntimeRestoreSnapshotID is the memory image the VM was
+	// last restored from. User Create must not set it.
+	CubeAnnotationRuntimeRestoreSnapshotID         = "cube.master.runtime.restore.snapshot.id"
+	CubeAnnotationRuntimeRestoreSnapshotAttachedAt = "cube.master.runtime.restore.snapshot.attached_at"
+	// CubeAnnotationStorageBackend is the CoW backend Master passes to Cubelet
+	// on Pause / Commit (xfs｜s3). Empty means xfs.
+	CubeAnnotationStorageBackend = "cube.master.storage.backend"
+	// CubeAnnotationSnapshotRemoteUUIDs is the JSON blob of remote
+	// volume uuids (rootfs/memory/metadata) for cubecow_import_lvol.
+	CubeAnnotationSnapshotRemoteUUIDs = "cube.master.snapshot.remote_uuids"
+	// CubeAnnotationSnapshotAllowNonLocal lets the scheduler pick a node that
+	// does not already hold a local replica. Set on S3 remote_ready cross-node
+	// from-snapshot Create. Value is the literal "true". This is an input to
+	// placement; the outcome is CubeAnnotationSnapshotCrossNode.
+	CubeAnnotationSnapshotAllowNonLocal = "cube.master.snapshot.allow_nonlocal"
+	// CubeAnnotationSnapshotCrossNode tells Cubelet that placement did land
+	// this restore off the package's node, so the package has to be imported
+	// from S3 before it can be used. Value is the literal "true". Only Master
+	// knows this, and it is a fact about the chosen node, not a permission.
+	CubeAnnotationSnapshotCrossNode = "cube.master.snapshot.cross_node"
+	// CubeAnnotationPauseKeepTombstone is used by Cubelet's in-process Destroy
+	// after PauseToSnapshot (Master no longer issues a separate Destroy RPC).
+	CubeAnnotationPauseKeepTombstone = "cube.pause.keep_tombstone"
+	// CubeAnnotationPauseDeleteTombstone removes the PAUSED CubeBox store row
+	// when the user deletes a paused sandbox.
+	CubeAnnotationPauseDeleteTombstone = "cube.pause.delete_tombstone"
+	// CubeAnnotationPauseError surfaces a terminal Pause failure on Info/List
+	// (sandbox record kept; Resume rejected). Pause snaps stay internal.
+	CubeAnnotationPauseError                = "cube.pause.error"
+	CubeAnnotationRuntimeSnapshotAttachedAt = "cube.master.runtime.snapshot.attached_at"
+	CubeAnnotationRootfsArtifactID          = "cube.master.rootfs.artifact.id"
+	CubeAnnotationRootfsArtifactJobID       = "cube.master.rootfs.artifact.job_id"
+	CubeAnnotationRootfsArtifactURL         = "cube.master.rootfs.artifact.url"
+	CubeAnnotationRootfsArtifactToken       = "cube.master.rootfs.artifact.token"
+	CubeAnnotationRootfsArtifactSHA256      = "cube.master.rootfs.artifact.sha256"
+	CubeAnnotationRootfsArtifactSizeBytes   = "cube.master.rootfs.artifact.size_bytes"
+	CubeAnnotationWritableLayerSize         = "cube.master.rootfs.writable_layer_size"
+	CubeAnnotationTemplateSpecFingerprint   = "cube.master.template.spec_fingerprint"
 	// CubeAnnotationCreateTimeEnvVars stores the serialized create-time env map
 	// that CubeMaster passes to cubelet for envd initialization.
 	CubeAnnotationCreateTimeEnvVars = "cube.master.internal.create_time_env_vars"
@@ -86,12 +125,22 @@ const (
 
 	CubeAnnotationsVirtiofsCache = "cube.master.virtiofs.cache"
 
+	CubeAnnotationsInjectEnvd      = "cube.master.inject_envd"
+	CubeAnnotationsInjectEnvdOptIn = "true"
+	CubeEnvdInImagePath            = "/usr/local/bin/envd"
+	MaxEnvdPayloadBytes            = 16 * 1024 * 1024
+
 	// CubeAnnotationComponentsPrefix is the namespace for pre-installed
 	// runtime-component metadata carried on templates/sandboxes.
 	CubeAnnotationComponentsPrefix = "cube.master.components."
 	// CubeAnnotationComponentEnvdVersion carries the real envd semantic version
 	// collected at template-creation time and propagated to sandbox instances.
 	CubeAnnotationComponentEnvdVersion = "cube.master.components.envd.version"
+	// Component version annotations (dir name → version string).
+	CubeAnnotationComponentCubeShimVersion   = "cube.master.components.cube-shim.version"
+	CubeAnnotationComponentCubeKernelVersion = "cube.master.components.cube-kernel-scf.version"
+	CubeAnnotationComponentCubeImageVersion  = "cube.master.components.cube-image.version"
+	CubeAnnotationComponentCubeAgentVersion  = "cube.master.components.cube-agent.version"
 )
 const (
 	CubeAnnotationsUseNetFileCache = "cube.instance.use_netfile_cache"
@@ -184,6 +233,10 @@ const (
 	SnapshotRuntimeRefTableName    = "t_cube_snapshot_runtime_ref"
 	SnapshotRuntimeActiveTableName = "t_cube_snapshot_runtime_active"
 	SandboxSpecTableName           = "t_cube_sandbox_spec"
+	// SnapshotTableName holds user Commit snapshots (independent of template
+	// definitions). Pause bindings live in PauseSnapshotTableName.
+	SnapshotTableName      = "t_cube_snapshot"
+	PauseSnapshotTableName = "t_cube_pause_snapshot"
 	// ArtifactNodePlacementTableName records on which nodes an ext4 rootfs
 	// artifact is physically present, independent of replica lifecycle, so the
 	// last-owner-cleanup / GC paths can enumerate every node that ever held an

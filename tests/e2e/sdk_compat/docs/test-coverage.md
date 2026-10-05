@@ -30,9 +30,12 @@ pytest --run-e2e -m "lifecycle and slow"
 | File | Main Behavior | Capability / Prerequisite | Risk And Execution Guidance |
 | --- | --- | --- | --- |
 | `cases/lifecycle/test_create.py` | `info` after creation and Linux command smoke | `lifecycle` | P0 / PR gate candidate |
-| `cases/lifecycle/test_connect.py` | connect to an existing sandbox, ID and file/command usability | `lifecycle` | P1 |
+| `cases/lifecycle/test_connect.py` | connect to an existing sandbox, ID and file/command usability, and explicit timeout application for running/paused sandboxes | `lifecycle`; paused case also requires `pause_resume` | P1 |
 | `cases/lifecycle/test_create_options.py` | metadata, env vars, timeout, command after create options | `lifecycle` | P1 |
 | `cases/lifecycle/test_pause_resume.py` | SDK pause, connect resume, file/env/kernel preservation | `pause_resume`, partially Code Interpreter | P1 |
+| `cases/lifecycle/test_pause_resume_network.py` | pause/resume keeps egress deny/allowlist and restricted public-access token | `pause_resume` + network capabilities; CubeProxy for ingress token case | P1 + `requires_internet` |
+| `cases/lifecycle/test_rollback_clone.py` | Rollback errors/filesystem/kernel state; default/concurrent clone state and temporary-snapshot cleanup | `rollback_clone` (CubeSandbox only), partially Code Interpreter | P1 |
+| `cases/lifecycle/test_negative_and_timeout.py` | Missing create/connect targets, pause-after-delete and online timeout update | `lifecycle`, `pause_resume`, `set_timeout` | P1 |
 | `cases/lifecycle/test_kill.py` | unusable after kill, list removal, idempotent terminal semantics | `lifecycle` | P1 |
 | `cases/lifecycle/test_auto_lifecycle.py` | auto-pause, manual/auto resume, reentrant resume, auto-kill, manual pause before timeout | `platform_lifecycle`, CubeProxy, lifecycle-manager, partially Code Interpreter | P1 + `slow`, daily run |
 
@@ -49,6 +52,9 @@ with file, kernel and command data-plane behavior. A sandbox reported as
 `running` is expected to have a working data plane; data-plane failures after
 `running` should be reported as backend regressions, not hidden behind extra
 readiness sleeps.
+
+The manual-pause/auto-kill case verifies that the lifecycle timeout destroys a
+manually paused sandbox and removes it from sandbox listings.
 
 ### 2.2 Commands
 
@@ -73,8 +79,16 @@ data-plane regressions.
 - interoperability between file API and shell;
 - missing file error semantics.
 
-The current coverage is text-file focused. Directories, permissions, binary
-round-trips, atomic replace and concurrent file access are not covered yet.
+`cases/filesystem/test_extended.py` covers directory and file metadata, nested
+and empty directory listing, exists, remove, rename and mkdir through the SDK
+filesystem API.
+
+`cases/filesystem/test_batch_and_watch.py` covers multi-file writes and live
+directory create/write/remove events through both SDK backends.
+
+The current content coverage is text-file focused. Non-root permission
+behavior, binary round-trips, atomic replace and concurrent file access are not
+covered yet.
 
 ### 2.4 Run Code
 
@@ -83,10 +97,10 @@ round-trips, atomic replace and concurrent file access are not covered yet.
 - expression result text;
 - stdout and stderr capture;
 - Python errors and syntax errors;
+- create-time env inheritance and temporary per-call env overrides, enabled with `SDK_E2E_RUN_CODE_ENV_INHERITANCE=true` for compatible templates;
 - stateful kernel variable preservation.
 
-These scenarios require Code Interpreter support and validate normalized
-`CodeResult` values rather than SDK-private response objects.
+These scenarios require Code Interpreter support and validate normalized `CodeResult` values rather than SDK-private response objects. The environment-inheritance case is skipped unless explicitly enabled because the default template may not provide that behavior.
 
 ### 2.5 Network
 
@@ -102,11 +116,59 @@ These scenarios require Code Interpreter support and validate normalized
   `e2b-traffic-access-token` and `cube-traffic-access-token` both work with the
   correct token.
 
+`cases/network/test_policy_update.py` covers in-place policy replacement on a
+running sandbox (`network_dynamic_update`, CubeSandbox only):
+
+- granting a destination that was blocked at create time;
+- revoking every destination, since the update replaces rather than patches;
+- swapping the allow list so access moves instead of accumulating;
+- **tearing down an established connection whose policy was revoked** — the case
+  that distinguishes this feature from create-time policy, because without
+  datapath re-evaluation an open channel would keep its create-time verdict;
+- **leaving an established connection alone when the update still permits it** —
+  the necessary counterpart, since a datapath that killed every session on any
+  update would otherwise pass the case above;
+- keeping DNS working after a domain-policy update, guarding the control-plane
+  resolver allowance that the caller never authors and could silently lose;
+- **a clone inheriting the updated policy rather than the create-time one**, which
+  also covers read-your-writes: clone snapshots immediately after the update
+  returns, so it fails if the spec write lagged the response;
+- **a clone of a narrowed policy not being more permissive** — the direction where
+  a stale spec would silently widen access for every descendant;
+- **the updated policy surviving pause/resume**, since pause packages the sandbox
+  from Cubelet's own store rather than from the network runtime state file;
+- converging under repeated updates, guarding the incremental map diff against
+  leaked or double-freed entries.
+
+The established-connection cases use the guest-side holder in
+`framework/network_probe.py`, which keeps poking the peer on purpose: a revoked
+flow is re-evaluated when the guest next sends, so nothing would be observed on
+an idle socket.
+
+`cases/lifecycle/test_pause_resume_network.py` covers the same create-time
+policies after an SDK pause + connect resume:
+
+- `allow_internet_access=False` and `deny_out=0.0.0.0/0` still block egress;
+- allowlist (`allow_out` with public internet disabled) still permits only the
+  listed target;
+- restricted public access still requires a traffic access token after resume
+  (CubeProxy HostIP rewrite path).
+
+Shared TCP / public-access probe helpers live in
+`framework/network_probe.py`.
+
 The current network suite uses configurable public TCP targets for L3/L4 egress
 checks. Cases are marked `requires_internet`; runners without stable public
 egress should set `SDK_E2E_SKIP_INTERNET_TESTS=true`.
 
-### 2.6 Concurrency
+### 2.6 Templates
+
+`cases/templates/test_alias.py` covers list/get/build/delete and alias lifecycle.
+It also builds a template with writable-layer size, exposed ports, HTTP probe
+and environment variables, then verifies those advanced parameters in the
+template detail returned by CubeAPI. Template operations are CubeSandbox-only.
+
+### 2.7 Concurrency
 
 `cases/concurrency/test_isolation.py` currently validates file isolation between
 two sandboxes writing different content to the same path. The peer sandbox is
@@ -114,6 +176,31 @@ created and cleaned up through `managed_control_sandbox`.
 
 This proves basic instance isolation, but it is not a concurrency stress test,
 resource contention test or multi-worker safety validation.
+
+### 2.8 Volume
+
+`cases/volume/` covers Volume Plugin CRUD, sandbox bind/unbind and delete-while-bound behavior. It also verifies that one Volume can remain writable in one sandbox while a concurrent attachment is read-only in another sandbox, including read access and rejected create, write, rename and delete operations. These cases are CubeSandbox-only, default to the S3 driver, and run with `--run-e2e` unless `SDK_E2E_VOLUME_PLUGIN=false`.
+
+### 2.9 Host Mount
+
+`cases/host-mount/` covers raw host-directory mount validation, runtime bind
+failures, read-only enforcement, nested mounts, public mount metadata, and
+cross-sandbox sharing. `test_snapshot_clone_rollback.py` additionally verifies:
+
+- creating a new sandbox from an exact snapshot restores guest rootfs state
+  while retaining current external data, remapping both RW and RO mounts, and
+  preserving their access modes;
+- snapshots created from a restored sandbox can be restored again after the
+  intermediate sandbox is destroyed, remapping both mounts on every generation;
+- rollback restores guest rootfs state while retaining external file content,
+  creations, deletions, mount access modes, and the writable channel;
+- fork-style concurrent clones inherit and isolate guest state while sharing
+  the writable raw host mount and preserving the read-only mount.
+
+These cases require both the CubeSandbox-only `host_mount` and
+`rollback_clone` capabilities. They mount the configured allowed-prefix root
+read-write and a provisioned child read-only, then isolate payloads in
+UUID-named directories so parallel runs do not collide.
 
 ## 3. Coverage Boundaries
 

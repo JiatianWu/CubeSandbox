@@ -140,30 +140,19 @@ func (c *Client) createPayload(opts CreateOptions) (map[string]any, error) {
 		payload["allowInternetAccess"] = false
 	}
 
-	// Mirror the server-side contract: domain allowOut requires either
-	// allowInternetAccess=false or an explicit deny-all CIDR in denyOut.
-	if err := validateAllowOutDomainsRequireDenyAll(opts.Network.AllowOut, opts.Network.DenyOut, internetAccessDisabled); err != nil {
+	network, err := buildNetworkPayload(opts.Network, internetAccessDisabled)
+	if err != nil {
 		return nil, err
-	}
-
-	network := map[string]any{}
-	if opts.Network.AllowPublicTraffic != nil {
-		network["allowPublicTraffic"] = *opts.Network.AllowPublicTraffic
-	}
-	if opts.Network.MaskRequestHost != nil {
-		network["maskRequestHost"] = *opts.Network.MaskRequestHost
-	}
-	if len(opts.Network.AllowOut) > 0 {
-		network["allowOut"] = opts.Network.AllowOut
-	}
-	if len(opts.Network.DenyOut) > 0 {
-		network["denyOut"] = opts.Network.DenyOut
-	}
-	if len(opts.Network.Rules) > 0 {
-		network["rules"] = opts.Network.Rules
 	}
 	if len(network) > 0 {
 		payload["network"] = network
+	}
+
+	if len(opts.VolumeMounts) > 0 {
+		if err := validateVolumeMounts(opts.VolumeMounts); err != nil {
+			return nil, err
+		}
+		payload["volumeMounts"] = opts.VolumeMounts
 	}
 
 	for key, value := range opts.Extra {

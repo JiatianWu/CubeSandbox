@@ -23,8 +23,9 @@
     "addMeta": "Add entry"
   },
   "compat": {
-    "stale": "Needs rebuild",
-    "staleHelp": "This template is stale in the current node environment. Rebuild it or adopt the current baseline before creating a sandbox."
+    "unpinned": "Needs rebuild",
+    "unpinnedHelp": "After the node upgrade, creating a sandbox from this template may fail. Open the template and click Rebuild Template first.",
+    "openTemplate": "Open template"
   },
   "actions": {
     "cancel": "Cancel",

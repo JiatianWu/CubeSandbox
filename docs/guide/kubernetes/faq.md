@@ -144,6 +144,10 @@ kubectl uncordon <node>
 
 ## Control plane / database
 
+### After CLM failover a sandbox pauses or resumes once more
+
+This is expected, and it happens once — not in a loop. When a new leader takes over (a replica failure, or the leader switch during a rolling upgrade), it re-checks each sandbox's state; where the records disagree it records the safe answer, `paused`. This is bookkeeping only — no pause is sent to the VM — and the next request auto-resumes the sandbox as usual. The cost is one extra auto-resume; the alternative, recording `running` for a sandbox that is actually stopped, would route traffic to a stopped VM.
+
 ### cube-master cannot connect to MySQL
 
 Check in order (commands below assume Release `cube`, namespace `cube-system`; for other Release names, replace the resource name prefix with `<release>`):
@@ -191,7 +195,7 @@ FLUSH PRIVILEGES;
 ```bash
 # Interactive shell (bashrc in the image auto-fills --address / --port)
 kubectl -n cube-system exec -it -l app.kubernetes.io/component=cubemastercli -- bash
-cubemastercli node list
+cubeopscli node list
 cubemastercli sandbox list
 ```
 
@@ -199,7 +203,7 @@ Or one-liner (same as Chart `NOTES.txt`):
 
 ```bash
 kubectl -n cube-system exec deploy/cube-cubemastercli -- \
-  sh -lc 'cubemastercli --address "$CUBEMASTERCLI_ADDRESS" --port "$CUBEMASTERCLI_PORT" node list'
+  sh -lc 'cubeopscli --address "$CUBEOPSCLI_ADDRESS" --port "$CUBEOPSCLI_PORT" node list'
 ```
 
 ---
@@ -239,7 +243,7 @@ Cloud VMs need PVM installed; physical machines need VT-x / AMD-V enabled.
 
 ```bash
 kubectl -n cube-system exec -l app.kubernetes.io/component=cubemastercli -- \
-  sh -lc 'cubemastercli --address "$CUBEMASTERCLI_ADDRESS" --port "$CUBEMASTERCLI_PORT" node list'
+  sh -lc 'cubeopscli --address "$CUBEOPSCLI_ADDRESS" --port "$CUBEOPSCLI_PORT" node list'
 ```
 
 - `healthy: true` → you can create sandboxes
@@ -250,6 +254,34 @@ kubectl -n cube-system logs -l app.kubernetes.io/component=cube-node -c cubelet 
 ```
 
 A common cause is inability to reach CubeMaster (network / DNS).
+
+### All sandboxes on one node lost network at the same time
+
+Most likely the `cube-node` Pod on that node was recreated (manual deletion, DaemonSet template change, node drain) while running on the Pod network: sandbox TAP devices live in the Pod's netns there, so recreation destroys it and **all sandbox networking on the node breaks — inbound and outbound — and does not self-heal**. On the default host network the netns is the host's and survives recreation, so this symptom there points somewhere else. Confirm by comparing Pod age / UID with the incident time:
+
+```bash
+kubectl get pods -n cube-system -l app.kubernetes.io/component=cube-node -o wide
+```
+
+- **Recovery**: destroy and recreate the affected sandboxes.
+- **Prevention**: keep `cube-node` on the default host network (`cubeNode.hostNetwork: true`), where Pod recreation does not change the netns; see [Install · cube-node networking and Pod recreation](./install.md#_8-3-cube-node-networking-and-pod-recreation). If you run on the Pod network because NetworkPolicy must govern sandbox traffic, the same section covers that trade-off.
+
+### How do I run `cubecli` in a Kubernetes deployment?
+
+`cubecli` accesses the local Cubelet and containerd sockets of a single compute node. First find the `cube-node` Pod corresponding to the target node, then use `kubectl exec` to run commands inside that Pod:
+
+```bash
+# List the node assigned to each cube-node Pod and find the Pod for the target node
+kubectl get pods -n cube-system \
+  -l app.kubernetes.io/component=cube-node -o wide
+
+# Run cubecli in the cube-node Pod for the target node
+kubectl exec -n cube-system <cube-node-pod> -- cubecli ls
+```
+
+By default, `kubectl exec` enters the `cubelet` container in that `cube-node` Pod, which is the supported place to run `cubecli` in a Kubernetes deployment.
+
+For network-device diagnostics such as `cubecli container taps`, note which netns the TAP devices live in: with the default `hostNetwork: true` they are created in the host network namespace, so a host login shell and the `cube-node` Pod see the same devices. On the Pod network (`cubeNode.hostNetwork: false`) they live in the `cube-node` Pod's network namespace, and a host login shell cannot provide the same view — run the command inside the Pod there.
 
 ### Sandbox start is slow (>10s) while the node is mostly idle
 
@@ -370,7 +402,7 @@ It depends on `cube-dev` created by the main containers:
 kubectl -n cube-system logs <cube-node-pod> -c cube-egress-net --tail=100
 ```
 
-- Log shows `interface cube-dev not present` → **network-agent / cubelet** have not created `cube-dev` yet; usually self-heals; if longer than ~5 minutes, check those two containers’ logs
+- Log shows `interface cube-dev not present` → **cubelet** has not created `cube-dev` yet; usually self-heals; if longer than ~5 minutes, check cubelet logs
 - Repeated `rule reapply failed` → iptables too old (needs nft) or conflict with CNI rules
 
 ---
@@ -379,9 +411,11 @@ kubectl -n cube-system logs <cube-node-pod> -c cube-egress-net --tail=100
 
 ### Will `helm upgrade` interrupt existing sandboxes? Will Pod IP change?
 
-**Bumping Big Pod runtime images / changing the Pod template: yes.** `cube-node` is a native DaemonSet; changes recreate the Pod (UID / IP / netns change) and interrupt existing sandboxes on that node. Bumping only Installer / Bootstrap / PVM while leaving the Big Pod template untouched can leave the Big Pod unchanged. Steps and red lines: [Upgrade](./upgrade.md).
+**Bumping Big Pod runtime images / changing the Pod template recreates the Pod (the UID changes).** What that costs the sandboxes depends on the network mode: on the Pod network the netns is destroyed and existing sandboxes on the node lose networking; on the default host network the netns survives — see [Install · cube-node networking and Pod recreation](./install.md#_8-3-cube-node-networking-and-pod-recreation). Plan a maintenance window either way until in-place replacement lands. Bumping only Installer / Bootstrap / PVM while leaving the Big Pod template untouched can leave the Big Pod unchanged. Steps and red lines: [Upgrade](./upgrade.md).
 
 Typical Big Pod recreate triggers: bump `images.cubelet` and other runtime images, add/remove containers, change volumeMount / securityContext / container name / env.
+
+This release changes the default no-`-c` `kubectl exec` and `kubectl logs` target for `cube-node` Pods from `network-agent` to `cubelet`; use `cubeNode.podAnnotations` to set an explicit default if your operational workflow needs another container.
 
 ### Does `helm rollback` roll back the host kernel?
 
@@ -410,7 +444,7 @@ Whether PVC/PV are deleted depends on the StorageClass `reclaimPolicy` (TKE’s 
 
 ```bash
 ONE_CLICK_ARCH=arm64 \
-PUSH=1 REGISTRY=<your-registry> IMAGE_TAG=v0.6.0 \
+PUSH=1 REGISTRY=<your-registry> IMAGE_TAG=v0.7.2 \
 ./deploy/kubernetes/images/build-cube-images.sh
 ```
 

@@ -4,6 +4,7 @@
 package cubesandbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -16,6 +17,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -447,6 +450,8 @@ func TestParseLineAcceptsStringTraceback(t *testing.T) {
 
 func TestRunCodeUsesProxyNodeIPAndPreservesHost(t *testing.T) {
 	var gotHost string
+	var gotE2BToken string
+	var gotCubeToken string
 	var gotPayload map[string]any
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -454,6 +459,8 @@ func TestRunCodeUsesProxyNodeIPAndPreservesHost(t *testing.T) {
 			t.Fatalf("request=%s %s", r.Method, r.URL.Path)
 		}
 		gotHost = r.Host
+		gotE2BToken = r.Header.Get("e2b-traffic-access-token")
+		gotCubeToken = r.Header.Get("cube-traffic-access-token")
 		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
 			t.Fatalf("decode payload: %v", err)
 		}
@@ -474,7 +481,7 @@ func TestRunCodeUsesProxyNodeIPAndPreservesHost(t *testing.T) {
 		RequestTimeout: time.Second,
 		Timeout:        300 * time.Second,
 	})
-	sb := &Sandbox{client: client, SandboxID: "sb-proxy", TemplateID: "tpl-test"}
+	sb := &Sandbox{client: client, SandboxID: "sb-proxy", TemplateID: "tpl-test", TrafficAccessToken: "traffic-token"}
 
 	var stdout []string
 	execution, err := sb.RunCode(context.Background(), "1 + 1", RunCodeOptions{
@@ -490,6 +497,9 @@ func TestRunCodeUsesProxyNodeIPAndPreservesHost(t *testing.T) {
 
 	if gotHost != "49999-sb-proxy.cube.test" {
 		t.Fatalf("Host=%q", gotHost)
+	}
+	if gotE2BToken != "traffic-token" || gotCubeToken != "traffic-token" {
+		t.Fatalf("traffic tokens=%q/%q, want traffic-token", gotE2BToken, gotCubeToken)
 	}
 	assertString(t, gotPayload, "code", "1 + 1")
 	assertString(t, gotPayload, "language", "python")
@@ -651,10 +661,11 @@ func TestCommandsRunUsesEnvdProcessStart(t *testing.T) {
 		RequestTimeout: time.Second,
 	})
 	sb := &Sandbox{
-		client:          client,
-		SandboxID:       "sb-proc",
-		TemplateID:      "tpl-test",
-		EnvdAccessToken: "envd-token",
+		client:             client,
+		SandboxID:          "sb-proc",
+		TemplateID:         "tpl-test",
+		EnvdAccessToken:    "envd-token",
+		TrafficAccessToken: "traffic-token",
 	}
 
 	result, err := sb.Commands().Run(context.Background(), "echo hello", CommandOptions{
@@ -677,6 +688,9 @@ func TestCommandsRunUsesEnvdProcessStart(t *testing.T) {
 	}
 	if gotHeaders.Get("Connect-Timeout-Ms") != "1500" || gotHeaders.Get("X-Access-Token") != "envd-token" {
 		t.Fatalf("headers=%#v", gotHeaders)
+	}
+	if gotHeaders.Get("e2b-traffic-access-token") != "traffic-token" || gotHeaders.Get("cube-traffic-access-token") != "traffic-token" {
+		t.Fatalf("traffic headers=%#v", gotHeaders)
 	}
 
 	processPayload, ok := gotPayload["process"].(map[string]any)
@@ -763,6 +777,8 @@ func TestFilesReadUsesEnvdHTTPFileAPI(t *testing.T) {
 	var gotHost string
 	var gotPath string
 	var gotToken string
+	var gotE2BToken string
+	var gotCubeToken string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/files" {
@@ -771,6 +787,8 @@ func TestFilesReadUsesEnvdHTTPFileAPI(t *testing.T) {
 		gotHost = r.Host
 		gotPath = r.URL.Query().Get("path")
 		gotToken = r.Header.Get("X-Access-Token")
+		gotE2BToken = r.Header.Get("e2b-traffic-access-token")
+		gotCubeToken = r.Header.Get("cube-traffic-access-token")
 		fmt.Fprint(w, "file content")
 	}))
 	defer server.Close()
@@ -783,10 +801,11 @@ func TestFilesReadUsesEnvdHTTPFileAPI(t *testing.T) {
 		RequestTimeout: time.Second,
 	})
 	sb := &Sandbox{
-		client:          client,
-		SandboxID:       "sb-files",
-		TemplateID:      "tpl-test",
-		EnvdAccessToken: "envd-token",
+		client:             client,
+		SandboxID:          "sb-files",
+		TemplateID:         "tpl-test",
+		EnvdAccessToken:    "envd-token",
+		TrafficAccessToken: "traffic-token",
 	}
 
 	content, err := sb.Files().Read(context.Background(), "/tmp/foo bar.txt")
@@ -798,6 +817,9 @@ func TestFilesReadUsesEnvdHTTPFileAPI(t *testing.T) {
 	}
 	if gotHost != "49983-sb-files.cube.test" || gotPath != "/tmp/foo bar.txt" || gotToken != "envd-token" {
 		t.Fatalf("host/path/token=%q/%q/%q", gotHost, gotPath, gotToken)
+	}
+	if gotE2BToken != "traffic-token" || gotCubeToken != "traffic-token" {
+		t.Fatalf("traffic tokens=%q/%q, want traffic-token", gotE2BToken, gotCubeToken)
 	}
 }
 
@@ -865,12 +887,15 @@ func (s *fakeProcessStarter) startProcess(_ context.Context, payload processStar
 
 type fakeFileReader struct {
 	path    string
+	user    string
 	content string
 	err     error
 }
 
-func (r *fakeFileReader) readFile(_ context.Context, path string) (string, error) {
+func (r *fakeFileReader) readFile(_ context.Context, path string, options ...fileRequestOption) (string, error) {
 	r.path = path
+	opts := resolveFileRequestOptions(options...)
+	r.user = opts.user
 	return r.content, r.err
 }
 
@@ -934,6 +959,80 @@ func TestSandboxInfoEndAtPresent(t *testing.T) {
 	want := time.Date(2026, 5, 14, 1, 0, 0, 0, time.UTC)
 	if !info.EndAt.Equal(want) {
 		t.Fatalf("EndAt=%v want %v", info.EndAt, want)
+	}
+}
+
+func TestGetInfoDecodesVolumeMounts(t *testing.T) {
+	const sandboxID = "sb-mount-1"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/sandboxes/"+sandboxID {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		fmt.Fprint(w, `{"sandboxID":"sb-mount-1","templateID":"tpl-test","clientID":"client-1","startedAt":"2026-05-14T00:00:00Z","endAt":"2026-05-14T01:00:00Z","envdVersion":"0.0.1","domain":"cube.app","cpuCount":2,"memoryMB":512,"state":"running","volumeMounts":[{"name":"hostdir-0","path":"/mnt/data","readOnly":true}]}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{APIURL: server.URL, TemplateID: "tpl-test"})
+	sb := &Sandbox{client: client, SandboxID: sandboxID}
+	info, err := sb.GetInfo(context.Background())
+	if err != nil {
+		t.Fatalf("GetInfo: %v", err)
+	}
+	if len(info.VolumeMounts) != 1 {
+		t.Fatalf("VolumeMounts=%#v want len 1", info.VolumeMounts)
+	}
+	mount := info.VolumeMounts[0]
+	if mount.Name != "hostdir-0" || mount.Path != "/mnt/data" {
+		t.Fatalf("mount=%#v", mount)
+	}
+	if !mount.ReadOnly {
+		t.Fatalf("ReadOnly=%v want true", mount.ReadOnly)
+	}
+}
+
+func TestGetInfoDecodesCPUMilli(t *testing.T) {
+	const sandboxID = "sb-subcore"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"sandboxID":"sb-subcore","templateID":"tpl-test","clientID":"c-1","startedAt":"2026-05-14T00:00:00Z","envdVersion":"0.0.1","cpuCount":0,"cpuMilli":500,"memoryMB":512,"state":"running"}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{APIURL: server.URL, TemplateID: "tpl-test"})
+	sb := &Sandbox{client: client, SandboxID: sandboxID}
+	info, err := sb.GetInfo(context.Background())
+	if err != nil {
+		t.Fatalf("GetInfo: %v", err)
+	}
+	if info.CPUCount != 0 {
+		t.Errorf("CPUCount = %d, want 0 (sub-core truncates)", info.CPUCount)
+	}
+	if info.CPUMilli == nil {
+		t.Fatalf("CPUMilli is nil, want pointer to 500")
+	}
+	if *info.CPUMilli != 500 {
+		t.Errorf("CPUMilli = %d, want 500", *info.CPUMilli)
+	}
+}
+
+func TestListDecodesVolumeMounts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/sandboxes" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		fmt.Fprint(w, `[{"sandboxID":"sb-mount-1","templateID":"tpl-test","clientID":"client-1","startedAt":"2026-05-14T00:00:00Z","endAt":"2026-05-14T01:00:00Z","envdVersion":"0.0.1","domain":"cube.app","cpuCount":2,"memoryMB":512,"state":"running","volumeMounts":[{"name":"hostdir-0","path":"/mnt/data","readOnly":true}]}]`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{APIURL: server.URL, TemplateID: "tpl-test"})
+	list, err := client.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 || len(list[0].VolumeMounts) != 1 {
+		t.Fatalf("List=%#v", list)
+	}
+	if list[0].VolumeMounts[0].Path != "/mnt/data" {
+		t.Fatalf("mount=%#v", list[0].VolumeMounts[0])
 	}
 }
 
@@ -1359,6 +1458,175 @@ func TestFilesWatchDirErrorFromServer(t *testing.T) {
 	}
 }
 
+type trackingReadCloser struct {
+	io.Reader
+	closeCount int32
+}
+
+func (t *trackingReadCloser) Close() error {
+	atomic.AddInt32(&t.closeCount, 1)
+	return nil
+}
+
+func TestWatcherClosesBodyExactlyOnce(t *testing.T) {
+	body := &trackingReadCloser{
+		Reader: bytes.NewReader(connectEnvelope(connectEndStreamFlag, `{}`)),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan WatchEvent, 64)
+	errs := make(chan error, 1)
+	w := &Watcher{
+		Events: events,
+		Errors: errs,
+		events: events,
+		errs:   errs,
+		ctx:    ctx,
+		cancel: cancel,
+		body:   body,
+	}
+
+	w.readLoop()
+
+	// After readLoop exits on natural stream end, Close() should be a no-op
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if count := atomic.LoadInt32(&body.closeCount); count != 1 {
+		t.Fatalf("expected body to be closed exactly once, got %d", count)
+	}
+}
+
+func TestWatcherConcurrentClose(t *testing.T) {
+	pr, pw := io.Pipe()
+	body := &trackingReadCloser{
+		Reader: pr,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan WatchEvent, 64)
+	errs := make(chan error, 1)
+	w := &Watcher{
+		Events: events,
+		Errors: errs,
+		events: events,
+		errs:   errs,
+		ctx:    ctx,
+		cancel: cancel,
+		body:   body,
+	}
+
+	go w.readLoop()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = w.Close()
+		}()
+	}
+
+	_ = pw.Close()
+	wg.Wait()
+
+	if count := atomic.LoadInt32(&body.closeCount); count != 1 {
+		t.Fatalf("expected body to be closed exactly once under concurrent Close(), got %d", count)
+	}
+}
+
+type errCloser struct {
+	io.Reader
+	err error
+}
+
+func (e *errCloser) Close() error {
+	return e.err
+}
+
+func TestWatcherCloseErrorPreserved(t *testing.T) {
+	expectedErr := errors.New("underlying close failed")
+	body := &errCloser{
+		Reader: bytes.NewReader(connectEnvelope(connectEndStreamFlag, `{}`)),
+		err:    expectedErr,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan WatchEvent, 64)
+	errs := make(chan error, 1)
+	w := &Watcher{
+		Events: events,
+		Errors: errs,
+		events: events,
+		errs:   errs,
+		ctx:    ctx,
+		cancel: cancel,
+		body:   body,
+	}
+
+	w.readLoop()
+
+	// Both first Close() and subsequent Close() calls should reliably return the captured closeErr
+	if err := w.Close(); !errors.Is(err, expectedErr) {
+		t.Fatalf("expected %v, got %v", expectedErr, err)
+	}
+	if err := w.Close(); !errors.Is(err, expectedErr) {
+		t.Fatalf("expected subsequent Close() to preserve %v, got %v", expectedErr, err)
+	}
+}
+
+func TestFilesWatchDirConcurrentCloseLiveServer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", connectContentType)
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		w.Write(connectFrame(0, []byte(`{"start":{}}`)))
+		flusher.Flush()
+
+		// Stream events until client disconnects
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				_, _ = w.Write(connectFrame(0, []byte(`{"filesystem":{"name":"x.txt","type":"EVENT_TYPE_CREATE"}}`)))
+				flusher.Flush()
+			}
+		}
+	}))
+	defer server.Close()
+
+	host, port := serverHostPort(t, server.URL)
+	client := NewClient(Config{ProxyNodeIP: host, ProxyPortHTTP: port, SandboxDomain: "cube.test", RequestTimeout: 5 * time.Second})
+	sb := &Sandbox{client: client, SandboxID: "sb-fs-concurrent"}
+
+	watcher, err := sb.Files().WatchDir(context.Background(), "/tmp")
+	if err != nil {
+		t.Fatalf("WatchDir: %v", err)
+	}
+
+	// Consume at least 1 event to ensure stream is active
+	<-watcher.Events
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = watcher.Close()
+		}()
+	}
+
+	wg.Wait()
+
+	// Drain remaining events safely
+	for range watcher.Events {
+	}
+}
+
 func TestBuildTemplateForwardsCreateFromImageOptions(t *testing.T) {
 	var got map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1463,6 +1731,154 @@ func TestGetTemplateParsesNetworkFields(t *testing.T) {
 	}
 	if info.AllowInternetAccess == nil || *info.AllowInternetAccess {
 		t.Fatalf("AllowInternetAccess=%#v, want false", info.AllowInternetAccess)
+	}
+}
+
+func TestBuildTemplateForwardsName(t *testing.T) {
+	var got map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/templates" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprint(w, `{"jobID":"job-name","templateID":"tpl-name","status":"accepted"}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{APIURL: server.URL, Timeout: 300 * time.Second})
+	if _, err := client.BuildTemplate(context.Background(), BuildTemplateOptions{
+		Image: "python:3.11-slim",
+		Name:  "my-alias",
+	}); err != nil {
+		t.Fatalf("BuildTemplate returned error: %v", err)
+	}
+	assertString(t, got, "name", "my-alias")
+	assertString(t, got, "image", "python:3.11-slim")
+}
+
+func TestBuildTemplateOmitsNameWhenBlank(t *testing.T) {
+	var got map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprint(w, `{"jobID":"j","templateID":"t","status":"accepted"}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{APIURL: server.URL, Timeout: 300 * time.Second})
+	if _, err := client.BuildTemplate(context.Background(), BuildTemplateOptions{
+		Image: "python:3.11-slim",
+		Name:  "   ",
+	}); err != nil {
+		t.Fatalf("BuildTemplate returned error: %v", err)
+	}
+	if _, ok := got["name"]; ok {
+		t.Fatalf("name should be omitted when blank: %#v", got)
+	}
+}
+
+func TestGetTemplateDerivesNameFromAliases(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/templates/tpl-alias" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"templateID":"tpl-alias",
+			"aliases":["my-alias"],
+			"status":"READY"
+		}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{APIURL: server.URL, Timeout: 300 * time.Second})
+	info, err := client.GetTemplate(context.Background(), "tpl-alias")
+	if err != nil {
+		t.Fatalf("GetTemplate returned error: %v", err)
+	}
+	if info.Name != "my-alias" {
+		t.Fatalf("Name=%q, want my-alias", info.Name)
+	}
+}
+
+func TestGetTemplateFallsBackToFirstAliasForName(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"templateID":"tpl-fb","aliases":["fallback-alias"],"status":"READY"}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{APIURL: server.URL, Timeout: 300 * time.Second})
+	info, err := client.GetTemplate(context.Background(), "tpl-fb")
+	if err != nil {
+		t.Fatalf("GetTemplate returned error: %v", err)
+	}
+	if info.Name != "fallback-alias" {
+		t.Fatalf("Name=%q, want fallback-alias (from aliases[0])", info.Name)
+	}
+}
+
+func TestSetTemplateAliasForwardsPutAndParsesResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/templates/tpl-1/alias" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if body["alias"] != "my-alias" {
+			t.Fatalf("alias=%v, want my-alias", body["alias"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"templateID":"tpl-1","aliases":["my-alias"],"status":"READY"}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{APIURL: server.URL, Timeout: 300 * time.Second})
+	info, err := client.SetTemplateAlias(context.Background(), "tpl-1", "my-alias")
+	if err != nil {
+		t.Fatalf("SetTemplateAlias returned error: %v", err)
+	}
+	if info.TemplateID != "tpl-1" {
+		t.Fatalf("TemplateID=%q, want tpl-1", info.TemplateID)
+	}
+	if info.Name != "my-alias" {
+		t.Fatalf("Name=%q, want my-alias", info.Name)
+	}
+}
+
+func TestSetTemplateAliasClearSendsEmptyAlias(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Fatalf("method=%s, want PUT", r.Method)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if body["alias"] != "" {
+			t.Fatalf("alias=%v, want empty", body["alias"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"templateID":"tpl-1","aliases":[],"status":"READY"}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{APIURL: server.URL, Timeout: 300 * time.Second})
+	info, err := client.SetTemplateAlias(context.Background(), "tpl-1", "")
+	if err != nil {
+		t.Fatalf("SetTemplateAlias returned error: %v", err)
+	}
+	if info.Name != "" {
+		t.Fatalf("Name=%q, want empty", info.Name)
 	}
 }
 

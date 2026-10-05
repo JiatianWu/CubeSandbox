@@ -4,6 +4,7 @@
 package cubesandbox
 
 import (
+	"fmt"
 	"net"
 	"strings"
 )
@@ -16,12 +17,52 @@ import (
 // Match holds rule match conditions. All fields are optional; an empty Match
 // matches any request. Fields are AND-ed; Method values are OR-ed;
 // sni/host/scheme are compared case-insensitively server-side.
+//
+// Port + Scheme together drive which TCP port CubeEgress intercepts on the
+// sandbox side. Both must be set together or both omitted:
+//   - Both omitted → default set {80/http, 443/https} (backward compatible).
+//   - Both set → CubeEgress intercepts only that (host, port, scheme) tuple.
+//
+// Every rule sharing the same (host, port) MUST agree on Scheme — a port can
+// only route to one nginx listener. The server rejects the whole policy on
+// mismatch.
 type Match struct {
 	SNI    string   `json:"sni,omitempty"`
 	Host   string   `json:"host,omitempty"`
 	Method []string `json:"method,omitempty"`
 	Path   string   `json:"path,omitempty"`
 	Scheme string   `json:"scheme,omitempty"`
+	Port   int      `json:"port,omitempty"`
+}
+
+// validate checks the port/scheme pair, mirroring the Python and TypeScript
+// SDKs and the CubeAPI/CubeMaster server-side contract: a set Port must be in
+// [1, 65535] and must be paired with Scheme, and a set Scheme must be http or
+// https (case-insensitive). Client-side validation catches typos before the
+// network round-trip; the server rejects the same shapes.
+func (m Match) validate() error {
+	if m.Scheme != "" {
+		scheme := strings.ToLower(strings.TrimSpace(m.Scheme))
+		if scheme != "http" && scheme != "https" {
+			return fmt.Errorf("match.scheme must be 'http' or 'https', got %q", m.Scheme)
+		}
+	}
+	if m.Port != 0 {
+		if m.Port < 1 || m.Port > 65535 {
+			return fmt.Errorf("match.port must be in [1, 65535], got %d", m.Port)
+		}
+		if m.Scheme == "" {
+			return fmt.Errorf("match.port requires match.scheme to be set")
+		}
+	}
+	return nil
+}
+
+// normalized returns a copy with Scheme canonicalized (stripped, lowercased)
+// so the wire form is consistent regardless of caller casing.
+func (m Match) normalized() Match {
+	m.Scheme = strings.ToLower(strings.TrimSpace(m.Scheme))
+	return m
 }
 
 // Inject injects a credential header on an allowed HTTPS request whose
@@ -30,6 +71,13 @@ type Inject struct {
 	Header string `json:"header"`
 	Secret string `json:"secret"`
 	Format string `json:"format,omitempty"`
+}
+
+func (i Inject) validate() error {
+	if len(i.Secret) > secretMaxBytes {
+		return fmt.Errorf("inject.secret exceeds %d bytes", secretMaxBytes)
+	}
+	return nil
 }
 
 // Render returns the final injected header value (preview helper).
@@ -58,6 +106,9 @@ type Rule struct {
 }
 
 const (
+	// secretMaxBytes matches e2b maxNetworkRuleHeaderValueLen and sits under
+	// nginx's default large_client_header_buffers (8k).
+	secretMaxBytes                = 2048
 	denyAllIPv4CIDR               = "0.0.0.0/0"
 	allowOutDomainRequiresDenyAll = "When specifying allowed domains in allow_out, you must disable public " +
 		"outbound traffic or include '0.0.0.0/0' in deny_out to block all other traffic."
@@ -67,6 +118,48 @@ const (
 // allowing specific domains is meaningful only when all other egress is denied,
 // either by allowInternetAccess=false (defaultDenyAll) or by listing
 // 0.0.0.0/0 in denyOut. Returns nil when allowOut carries no domain target.
+// buildNetworkPayload translates NetworkOptions into the API's camelCase
+// network object, validating it the same way the server will. Shared by sandbox
+// creation and Sandbox.UpdateNetwork so both accept identical input.
+func buildNetworkPayload(opts NetworkOptions, internetAccessDisabled bool) (map[string]any, error) {
+	// Mirror the server-side contract: domain allowOut requires either
+	// allowInternetAccess=false or an explicit deny-all CIDR in denyOut.
+	if err := validateAllowOutDomainsRequireDenyAll(opts.AllowOut, opts.DenyOut, internetAccessDisabled); err != nil {
+		return nil, err
+	}
+
+	network := map[string]any{}
+	if opts.AllowPublicTraffic != nil {
+		network["allowPublicTraffic"] = *opts.AllowPublicTraffic
+	}
+	if opts.MaskRequestHost != nil {
+		network["maskRequestHost"] = *opts.MaskRequestHost
+	}
+	if len(opts.AllowOut) > 0 {
+		network["allowOut"] = opts.AllowOut
+	}
+	if len(opts.DenyOut) > 0 {
+		network["denyOut"] = opts.DenyOut
+	}
+	if len(opts.Rules) > 0 {
+		rules := make([]Rule, len(opts.Rules))
+		for i, rule := range opts.Rules {
+			if err := rule.Match.validate(); err != nil {
+				return nil, fmt.Errorf("network.rules[%d] %q: %w", i, rule.Name, err)
+			}
+			for j, inj := range rule.Action.Inject {
+				if err := inj.validate(); err != nil {
+					return nil, fmt.Errorf("network.rules[%d] %q: inject[%d]: %w", i, rule.Name, j, err)
+				}
+			}
+			rule.Match = rule.Match.normalized()
+			rules[i] = rule
+		}
+		network["rules"] = rules
+	}
+	return network, nil
+}
+
 func validateAllowOutDomainsRequireDenyAll(allowOut, denyOut []string, defaultDenyAll bool) error {
 	hasDomain := false
 	for _, target := range allowOut {

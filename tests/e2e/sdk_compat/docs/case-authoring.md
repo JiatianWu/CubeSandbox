@@ -105,6 +105,28 @@ For a strict domain allowlist, combine `allow_out` with
 `allow_internet_access=False` or `deny_out=["0.0.0.0/0"]`. A successful TCP
 connection alone does not prove an HTTP or L7 policy.
 
+Capabilities (Cube-only unless noted):
+
+| Capability | Coverage |
+| --- | --- |
+| `network_allow_deny` / `network_public_access` | IP allow/deny, `allow_internet_access`, restrict public traffic (also on E2B where applicable) |
+| `network_dns_allow` | Domain `allow_out` + DNS learning, `*.` wildcards |
+| `network_always_denied` | Built-in deny of link-local / private CIDRs |
+| `network_l7_egress` | CubeEgress inject / first-match / deny / TLS MITM / SNI·host |
+| `network_mask_request_host` | `mask_request_host` rewrite |
+| `network_template_merge` | Template `allow_out`/`deny_out` merged with create-time network |
+
+L7 echo / header observation uses the public service **httpbun.com**
+(`SDK_E2E_L7_ECHO_HOST` to override). Mark those cases `requires_internet`.
+Pass L7 `rules` as wire-shaped dicts in `sandbox_create_options` (no SDK
+import in shared cases). Inject secrets must be test-only placeholders —
+never commit real credentials.
+
+Domain / L7 cases need a working guest nameserver. If the template image
+default resolver is unreachable in your lab, rebuild the template with
+`dns=[...]` or set `SDK_E2E_GUEST_DNS` for module-provisioned templates
+(for example `test_template_network_merge.py`).
+
 ## Lifecycle and cleanup
 
 Platform lifecycle cases normally use `slow` and `requires_cubeproxy`:
@@ -114,16 +136,15 @@ SDK_E2E_PLATFORM_LIFECYCLE=true \
 pytest --run-e2e --sdk-e2e-trace cases/lifecycle/test_auto_lifecycle.py
 ```
 
-Volume Plugin cases use the `volume` marker and stay skipped unless
-`SDK_E2E_VOLUME_PLUGIN=true`. Create the volume first, then pass dynamic
-`volumeMounts` through `create_adapter(..., create_options=...)` — do not
-hard-code a volume ID in `sandbox_create_options`. Deploy and configure the
-plugin manually first:
-https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/cos/README.md
+Volume Plugin cases use the `volume` marker and run with `--run-e2e` (default
+driver `s3`). Set `SDK_E2E_VOLUME_PLUGIN=false` to skip. Create the volume
+first, then pass dynamic `volumeMounts` through
+`create_adapter(..., create_options=...)` — do not hard-code a volume ID in
+`sandbox_create_options`. Default install wires the S3 plugin + MinIO:
+https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/s3/README.md
 (`cubesandbox` >= 0.6.0).
 
 ```bash
-SDK_E2E_VOLUME_PLUGIN=true \
 pytest --run-e2e -m volume --sdk-e2e-backends=cubesandbox
 ```
 

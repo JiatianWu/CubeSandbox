@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
-	cubeleterrorcode "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
@@ -20,10 +18,15 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/pausesnap"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/sandboxlock"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/sandboxspec"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/task"
 	volrefcount "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/volume/refcount"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	cubeleterrorcode "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
 func DestroySandbox(ctx context.Context, req *types.DeleteCubeSandboxReq) (rsp *types.DeleteCubeSandboxRes) {
@@ -63,6 +66,7 @@ func DestroySandbox(ctx context.Context, req *types.DeleteCubeSandboxReq) (rsp *
 	}
 	destroyReq.Annotations[constants.CubeAnnotationsKillReason] = reason
 	collectMemoryOption(req, destroyReq)
+	stampDestroyStorageBackend(ctx, req.SandboxID, destroyReq)
 	if config.GetConfig().Common.CubeDestroyCheckFilter {
 
 		if req.Filter == nil || req.Filter.LabelSelector == nil {
@@ -155,6 +159,11 @@ func dealScfSandbox(ctx context.Context, req *types.DeleteCubeSandboxReq, t *tas
 	} else {
 		proxyMap, ok := localcache.GetSandboxProxyMap(ctx, req.SandboxID)
 		if !ok {
+			// Paused sandboxes keep proxy normally; fall back to pausesnap node.
+			if ip, ok := resolvePauseHostIP(ctx, req.SandboxID); ok {
+				t.CallEp = cubelet.GetCubeletAddr(ip)
+				return true
+			}
 			return false
 		}
 		hostIP = proxyMap.HostIP
@@ -178,40 +187,71 @@ func dealScfSandbox(ctx context.Context, req *types.DeleteCubeSandboxReq, t *tas
 }
 
 func callCubelet(ctx context.Context, callEp string, req *cubebox.DestroyCubeSandboxRequest) error {
-	hostIP := strings.Split(callEp, ":")[0]
-	_, ok := localcache.GetNodesByIp(hostIP)
-	if ok {
-
-		rsp, err := cubelet.Destroy(ctx, callEp, req)
-		defer func() {
-			if log.IsDebug() {
-				log.G(ctx).Debugf("Destroy_rsp:%+v", utils.InterfaceToString(rsp))
-			}
-		}()
-
+	return sandboxlock.WithLock(ctx, req.GetSandboxID(), sandboxlock.Options{
+		Value: "delete",
+		TTL:   sandboxlock.DeleteTTL,
+	}, func(ctx context.Context) error {
+		ctx = context.WithoutCancel(ctx)
+		hostIP := strings.Split(callEp, ":")[0]
+		_, nodeOK := localcache.GetNodesByIp(hostIP)
+		handled, err := pausesnap.TryDeletePaused(ctx, req.GetRequestID(), req.GetSandboxID(), hostIP)
 		if err != nil {
-			log.G(ctx).Errorf("Destroy fail:%+v", err)
+			log.G(ctx).Errorf("delete paused sandbox fail:%+v", err)
 			return err
 		}
-		if rsp.GetRet().GetRetCode() != cubeleterrorcode.ErrorCode_Success &&
-			rsp.GetRet().GetRetCode() != cubeleterrorcode.ErrorCode_OK {
-			log.G(ctx).Errorf("Destroy error:%+v", rsp)
-			return ret.Err(errorcode.MasterCode(rsp.GetRet().GetRetCode()), rsp.GetRet().GetRetMsg())
+		if !handled && nodeOK {
+			rsp, err := cubelet.Destroy(ctx, callEp, req)
+			defer func() {
+				if log.IsDebug() {
+					log.G(ctx).Debugf("Destroy_rsp:%+v", utils.InterfaceToString(rsp))
+				}
+			}()
+
+			if err != nil {
+				log.G(ctx).Errorf("Destroy fail:%+v", err)
+				return err
+			}
+			if rsp.GetRet().GetRetCode() != cubeleterrorcode.ErrorCode_Success &&
+				rsp.GetRet().GetRetCode() != cubeleterrorcode.ErrorCode_OK {
+				log.G(ctx).Errorf("Destroy error:%+v", rsp)
+				return ret.Err(errorcode.MasterCode(rsp.GetRet().GetRetCode()), rsp.GetRet().GetRetMsg())
+			}
+			// Apply any node-level volume ref-count transitions (1→0) reported by
+			// Cubelet so the volume DB releases the reference held by this node.
+			volrefcount.ApplyFromExtInfo(ctx, rsp.GetExtInfo())
 		}
-		// Apply any node-level volume ref-count transitions (1→0) reported by
-		// Cubelet so the volume DB releases the reference held by this node.
-		volrefcount.ApplyFromExtInfo(ctx, rsp.GetExtInfo())
-	}
 
-	err := localcache.DeleteSandboxProxyMap(ctx, req.GetSandboxID())
-	if err != nil {
-		log.G(ctx).Errorf("DeleteSandboxProxyMap:%+v", err)
-		return ret.Errorf(errorcode.ErrorCode_MasterInternalError, "DeleteSandboxProxyMap failed: %s", err.Error())
-	}
-	localcache.DeleteSandboxCache(req.GetSandboxID())
-	if err := runAfterDestroySandboxSuccessHook(ctx, req.GetSandboxID()); err != nil {
-		log.G(ctx).Warnf("afterDestroySandboxSuccess hook failed: %v", err)
-	}
+		err = localcache.DeleteSandboxProxyMap(ctx, req.GetSandboxID())
+		if err != nil {
+			log.G(ctx).Errorf("DeleteSandboxProxyMap:%+v", err)
+			return ret.Errorf(errorcode.ErrorCode_MasterInternalError, "DeleteSandboxProxyMap failed: %s", err.Error())
+		}
+		localcache.DeleteSandboxCache(req.GetSandboxID())
+		if err := runAfterDestroySandboxSuccessHook(ctx, req.GetSandboxID()); err != nil {
+			log.G(ctx).Warnf("afterDestroySandboxSuccess hook failed: %v", err)
+		}
 
-	return nil
+		return nil
+	})
+}
+
+// stampDestroyStorageBackend copies the sandbox's persisted CoW backend onto
+// the Cubelet Destroy request so S3 sandboxes delete on the S3 Store.
+func stampDestroyStorageBackend(ctx context.Context, sandboxID string, req *cubebox.DestroyCubeSandboxRequest) {
+	if req == nil {
+		return
+	}
+	if req.Annotations == nil {
+		req.Annotations = map[string]string{}
+	}
+	if strings.TrimSpace(req.Annotations[constants.CubeAnnotationStorageBackend]) != "" {
+		return
+	}
+	spec, err := sandboxspec.Get(ctx, sandboxID)
+	if err != nil || spec == nil {
+		return
+	}
+	if b, ok, err := constants.OptionalSnapshotBackend(spec.Backend); err == nil && ok {
+		req.Annotations[constants.CubeAnnotationStorageBackend] = b
+	}
 }

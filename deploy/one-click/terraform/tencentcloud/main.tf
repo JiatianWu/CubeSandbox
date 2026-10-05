@@ -1,4 +1,9 @@
 terraform {
+  # 1.2 is the floor for resource `precondition` blocks, which tke-addons.tf
+  # uses to reject cube-lifecycle-manager replica/leader-election combinations
+  # that would silently degrade active-standby into uncoordinated replicas.
+  required_version = ">= 1.2.0"
+
   required_providers {
     tencentcloud = {
       source = "tencentcloudstack/tencentcloud"
@@ -390,6 +395,14 @@ resource "tencentcloud_security_group_rule_set" "clb" {
     action      = "ACCEPT"
     cidr_block  = var.enable_public_network ? "0.0.0.0/0" : "10.0.0.0/16"
     protocol    = "TCP"
+    port        = "9090"
+    description = "Allow cube-proxy plaintext gRPC ingress"
+  }
+
+  ingress {
+    action      = "ACCEPT"
+    cidr_block  = var.enable_public_network ? "0.0.0.0/0" : "10.0.0.0/16"
+    protocol    = "TCP"
     port        = "3000"
     description = "Allow cube-api CLB (jumpserver public access)"
   }
@@ -402,6 +415,16 @@ resource "tencentcloud_security_group_rule_set" "clb" {
     protocol    = "TCP"
     port        = "8089"
     description = "Allow cube-master CLB (VPC-internal only)"
+  }
+
+  # cube-ops is exposed through an INTERNAL (VPC-only) CLB so compute nodes
+  # (outside the TKE cluster) can reach it for node registration / heartbeat.
+  ingress {
+    action      = "ACCEPT"
+    cidr_block  = "10.0.0.0/16"
+    protocol    = "TCP"
+    port        = "3010"
+    description = "Allow cube-ops CLB (VPC-internal only)"
   }
 
   egress {

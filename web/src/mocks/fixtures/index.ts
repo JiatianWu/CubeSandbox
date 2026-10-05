@@ -3,6 +3,7 @@
 
 import type { components } from '@/api/generated/schema';
 import type { TemplateCompatMatrix } from '@/api/client';
+import { resetWarehouseState } from './warehouse';
 
 type ClusterOverviewDto = components['schemas']['ClusterOverview'];
 type ListedSandboxDto = components['schemas']['ListedSandbox'];
@@ -27,7 +28,8 @@ function buildSandboxes(): ListedSandboxDto[] {
       clientID: 'ops-east-1',
       startedAt: ago(137),
       endAt: later(3200),
-      cpuCount: '4000m',
+      cpuCount: 4,
+      cpuMilli: 4000,
       memoryMB: 8192,
       diskSizeMB: 10_240,
       metadata: { project: 'data-pipeline', owner: 'ops@cube.dev', region: 'cn-shanghai' },
@@ -42,7 +44,8 @@ function buildSandboxes(): ListedSandboxDto[] {
       clientID: 'frontend-ci',
       startedAt: ago(32),
       endAt: later(1700),
-      cpuCount: '2000m',
+      cpuCount: 2,
+      cpuMilli: 2000,
       memoryMB: 4096,
       diskSizeMB: 8192,
       metadata: { branch: 'feat/dashboard-ui' },
@@ -56,7 +59,8 @@ function buildSandboxes(): ListedSandboxDto[] {
       clientID: 'research',
       startedAt: ago(6200),
       endAt: later(800),
-      cpuCount: '2000m',
+      cpuCount: 2,
+      cpuMilli: 2000,
       memoryMB: 2048,
       diskSizeMB: 4096,
       metadata: { paused_reason: 'manual' },
@@ -70,7 +74,8 @@ function buildSandboxes(): ListedSandboxDto[] {
       clientID: 'stage-cluster',
       startedAt: ago(48),
       endAt: later(3400),
-      cpuCount: '2000m',
+      cpuCount: 2,
+      cpuMilli: 2000,
       memoryMB: 4096,
       diskSizeMB: 8192,
       metadata: { deployment: 'canary-0.3' },
@@ -233,6 +238,7 @@ export function resetMockState() {
   sandboxes = buildSandboxes();
   templates = buildTemplates();
   nodes = buildNodes();
+  resetWarehouseState();
 }
 
 export async function mockDelay() {
@@ -386,7 +392,7 @@ export function getTemplate(templateID: string): TemplateDetailDto | undefined {
         spec: 'cpu=2000m,mem=4096Mi',
         artifact_id: 'rfs-mock-edge-01',
         last_job_id: 'job-mock-edge-01',
-        compat_status: base.templateID === 'python-3.11-ai' ? 'STALE' : 'OK',
+        compat_status: 'OK',
         guest_image_version:
           base.templateID === 'python-3.11-ai'
             ? 'guest-image@2024.11.02'
@@ -416,9 +422,9 @@ export function getTemplate(templateID: string): TemplateDetailDto | undefined {
 export function getTemplateCompat(): TemplateCompatMatrix {
   return {
     summary: {
-      staleTemplates: 1,
-      staleReplicas: 1,
-      affectedNodes: 1,
+      staleTemplates: 0,
+      staleReplicas: 0,
+      affectedNodes: 0,
       missingReplicas: 1,
       unknownReplicas: 1,
     },
@@ -426,12 +432,12 @@ export function getTemplateCompat(): TemplateCompatMatrix {
       {
         templateID: 'python-3.11-ai',
         instanceType: 'standard',
-        overall: 'STALE',
+        overall: 'OK',
         nodes: [
           {
             nodeID: 'cube-edge-01',
             nodeIP: '10.0.2.11',
-            compatStatus: 'STALE',
+            compatStatus: 'OK',
             boundGuestImageVersion: 'guest-image@2024.11.02',
             currentGuestImageVersion: 'guest-image@2024.12.01',
             boundAgentVersion: 'cube-agent@0.1.7',
@@ -595,7 +601,8 @@ export function createSandbox(body: {
     clientID: 'dashboard',
     startedAt: new Date().toISOString(),
     endAt: later(body.timeout ?? 300),
-    cpuCount: '2000m',
+    cpuCount: 2,
+    cpuMilli: 2000,
     memoryMB: 4096,
     diskSizeMB: 8192,
     metadata: body.metadata ?? {},

@@ -12,13 +12,14 @@ locals {
   image_namespace = var.use_tcr ? (
     var.image_namespace != "" ? var.image_namespace : tencentcloud_tcr_namespace.cluster[0].name
   ) : var.image_namespace
-  cube_master_image = var.cubemaster_image != "" ? var.cubemaster_image : "${local.image_registry}/${local.image_namespace}/cube-master:${var.image_tag}"
-  cube_api_image    = var.cubeapi_image != "" ? var.cubeapi_image : "${local.image_registry}/${local.image_namespace}/cube-api:${var.image_tag}"
-  cube_ops_image    = var.cubeops_image != "" ? var.cubeops_image : "${local.image_registry}/${local.image_namespace}/cube-ops:${var.image_tag}"
-  cube_proxy_image  = var.cubeproxy_image != "" ? var.cubeproxy_image : "${local.image_registry}/${local.image_namespace}/cube-proxy:${var.image_tag}"
-  cube_webui_image  = var.webui_image != "" ? var.webui_image : "${local.image_registry}/${local.image_namespace}/cube-webui:${var.image_tag}"
-  cube_lcm_image    = var.cube_lifecycle_manager_image != "" ? var.cube_lifecycle_manager_image : "${local.image_registry}/${local.image_namespace}/cube-lifecycle-manager:${var.image_tag}"
-  cube_admin_token  = var.cube_admin_token != "" ? var.cube_admin_token : random_password.cube_admin_token[0].result
+  cube_master_image    = var.cubemaster_image != "" ? var.cubemaster_image : "${local.image_registry}/${local.image_namespace}/cube-master:${var.image_tag}"
+  cube_api_image       = var.cubeapi_image != "" ? var.cubeapi_image : "${local.image_registry}/${local.image_namespace}/cube-api:${var.image_tag}"
+  cube_ops_image       = var.cubeops_image != "" ? var.cubeops_image : "${local.image_registry}/${local.image_namespace}/cube-ops:${var.image_tag}"
+  cube_proxy_image     = var.cubeproxy_image != "" ? var.cubeproxy_image : "${local.image_registry}/${local.image_namespace}/cube-proxy:${var.image_tag}"
+  cube_webui_image     = var.webui_image != "" ? var.webui_image : "${local.image_registry}/${local.image_namespace}/cube-webui:${var.image_tag}"
+  cube_lcm_image       = var.cube_lifecycle_manager_image != "" ? var.cube_lifecycle_manager_image : "${local.image_registry}/${local.image_namespace}/cube-lifecycle-manager:${var.image_tag}"
+  templatecenter_image = var.templatecenter_image != "" ? var.templatecenter_image : "${local.image_registry}/${local.image_namespace}/cube-templatecenter:${var.image_tag}"
+  cube_admin_token     = var.cube_admin_token != "" ? var.cube_admin_token : random_password.cube_admin_token[0].result
 
   # cube_db / cube_user are wired through Terraform (var.cube_db / var.cube_user)
   # so the MySQL account/database created in main.tf, the cube-master conf Secret
@@ -32,6 +33,7 @@ locals {
   # cube-master URL: in-cluster Service DNS (cube-api / cube-proxy reach
   # cube-master over the cluster network, so the internal CLB IP is not needed).
   cubemaster_url = "http://cubemaster.cubesandbox.svc.cluster.local:8089"
+  cubeops_url    = "http://cube-ops.cubesandbox.svc.cluster.local:3010"
 
   # cube-master runs as an HA Deployment backed by the shared CFS store. The
   # replica count is the single source of truth for BOTH spec.replicas AND the
@@ -39,6 +41,12 @@ locals {
   # var.cubemaster_replicas docs in variables.tf for why under-reporting the
   # master count oversubscribes the compute nodes.
   cubemaster_replicas = var.cubemaster_replicas
+  # Fixed host directory backing cubemaster's and cube-templatecenter's
+  # "data" volume when use_cfs=false. A hostPath (not emptyDir -- emptyDir is
+  # per-Pod and never shared) at the SAME path lets both Pods see the same
+  # files as long as they land on the same node, which the templatecenter
+  # deployment's required podAffinity guarantees.
+  artifact_store_host_path = "/data/cube-sandbox/cubemaster-artifact-store"
   # Multi-node scheduling: pick randomly from the top scored compute nodes.
   # The multi-node guide recommends 3 as a small-cluster starting point; cap at
   # the actual compute-node count so the default 2-node POC uses 2.
@@ -76,50 +84,58 @@ locals {
       replace(
         replace(
           replace(
-            fileexists("${path.module}/cubeproxy-nginx.conf") ? file("${path.module}/cubeproxy-nginx.conf") : (
-              fileexists("${path.module}/../../cubeproxy/nginx.conf.template") ? file("${path.module}/../../cubeproxy/nginx.conf.template") : <<-EOF
-                user root;
-                worker_processes auto;
-                error_log /data/log/cube-proxy/error.log notice;
-                daemon off;
-                events { worker_connections 100000; }
-                http {
-                  include mime.types;
-                  default_type application/octet-stream;
-                  server {
-                    listen __CUBE_PROXY_HTTP_PORT__;
-                    server_name _;
-                    location / { return 404; }
-                  }
-                  server {
-                    listen __CUBE_PROXY_HTTPS_PORT__ ssl;
-                    server_name _;
-                    ssl_certificate /usr/local/openresty/nginx/certs/__CUBE_PROXY_SSL_CERT__;
-                    ssl_certificate_key /usr/local/openresty/nginx/certs/__CUBE_PROXY_SSL_KEY__;
-                    location / { return 404; }
-                  }
-                  server {
-                    listen __CUBE_PROXY_ADMIN_LISTEN__:8082;
-                    server_name _;
-                    location / { return 404; }
-                  }
-                }
-              EOF
+            replace(
+              replace(
+                fileexists("${path.module}/cubeproxy-nginx.conf") ? file("${path.module}/cubeproxy-nginx.conf") : (
+                  fileexists("${path.module}/../../cubeproxy/nginx.conf.template") ? file("${path.module}/../../cubeproxy/nginx.conf.template") : <<-EOF
+                    user root;
+                    worker_processes auto;
+                    error_log /data/log/cube-proxy/error.log notice;
+                    daemon off;
+                    events { worker_connections 100000; }
+                    http {
+                      include mime.types;
+                      default_type application/octet-stream;
+                      server {
+                        listen __CUBE_PROXY_HTTP_PORT__;
+                        server_name _;
+                        location / { return 404; }
+                      }
+                      server {
+                        listen __CUBE_PROXY_HTTPS_PORT__ ssl;
+                        server_name _;
+                        ssl_certificate /usr/local/openresty/nginx/certs/__CUBE_PROXY_SSL_CERT__;
+                        ssl_certificate_key /usr/local/openresty/nginx/certs/__CUBE_PROXY_SSL_KEY__;
+                        location / { return 404; }
+                      }
+                      server {
+                        listen __CUBE_PROXY_ADMIN_LISTEN__:__CUBE_PROXY_ADMIN_PORT__;
+                        server_name _;
+                        location / { return 404; }
+                      }
+                    }
+                  EOF
+                ),
+                "__CUBE_PROXY_HTTP_PORT__",
+                "8081"
+              ),
+              "__CUBE_PROXY_HTTPS_PORT__",
+              "8080"
             ),
-            "__CUBE_PROXY_HTTP_PORT__",
-            "8081"
+            "__CUBE_PROXY_GRPC_PORT__",
+            "9090"
           ),
-          "__CUBE_PROXY_HTTPS_PORT__",
-          "8080"
+          "__CUBE_PROXY_SSL_CERT__",
+          "cube.app+3.pem"
         ),
-        "__CUBE_PROXY_SSL_CERT__",
-        "cube.app+3.pem"
+        "__CUBE_PROXY_SSL_KEY__",
+        "cube.app+3-key.pem"
       ),
-      "__CUBE_PROXY_SSL_KEY__",
-      "cube.app+3-key.pem"
+      "__CUBE_PROXY_ADMIN_LISTEN__",
+      "0.0.0.0"
     ),
-    "__CUBE_PROXY_ADMIN_LISTEN__:8082",
-    "0.0.0.0:8082"
+    "__CUBE_PROXY_ADMIN_PORT__",
+    tostring(var.cube_proxy_admin_port)
   )
 
   # Precondition for creating the TKE addons
@@ -128,6 +144,15 @@ locals {
 
 resource "random_password" "cube_admin_token" {
   count   = var.cube_admin_token == "" ? 1 : 0
+  length  = 32
+  special = false
+}
+
+# Shared secret gating CubeTemplateCenter -> CubeMaster build-status callbacks
+# (POST /internal/template/jobs/:job_id/status; both sides read it as
+# CUBE_TEMPLATE_CALLBACK_TOKEN).
+resource "random_password" "template_callback_token" {
+  count   = local.deploy_addons ? 1 : 0
   length  = 32
   special = false
 }
@@ -253,17 +278,23 @@ resource "kubernetes_secret" "cubemaster_conf" {
   }
 
   data = {
+    # Shared with the templatecenter Deployment: TC presents it as
+    # X-Cube-Template-Callback-Token on build-status callbacks.
+    "cube-template-callback-token" = random_password.template_callback_token[0].result
     "conf.yaml" = yamlencode({
       common = {
         http_port                          = 8089
         http_readtimeout                   = 120
         http_writetimeout                  = 360
         http_idletimeout                   = 360
-        sync_meta_data_interval            = "30s"
+        cube_ops_addr                      = local.cubeops_url
+        sync_meta_data_interval            = "1s"
         sync_metric_data_interval          = "1s"
         collect_metric_interval            = "1s"
         default_headless_service_nodes_num = local.cubemaster_replicas
         enable_check_com_net_id_param      = false
+        # CubeMaster no longer has a templatecenter_enabled switch: every
+        # template-from-image build is forwarded to CubeTemplateCenter.
       }
       log = {
         module    = "cubemaster"
@@ -278,6 +309,7 @@ resource "kubernetes_secret" "cubemaster_conf" {
         }
         common_timeout_insec       = 30
         create_image_timeout_insec = 300
+        app_snapshot_timeout_insec = 300
         create_concurrent_limit    = 100
         destroy_concurent_limit    = 100
         enable_exposed_port        = true
@@ -306,18 +338,6 @@ resource "kubernetes_secret" "cubemaster_conf" {
         # is populated, and deploy/one-click/tests/test_package_layout.sh statically
         # checks THIS template uses cube_network_config (and not cubevs_context).
         cube_box_req_template = "{\"volumes\":[{\"name\":\"tmp\",\"volume_source\":{\"empty_dir\":{\"medium\":0}}}],\"containers\":[{\"name\":\"cubebox-default\",\"envs\":[{\"key\":\"TZ\",\"value\":\"Asia/Shanghai\"},{\"key\":\"TERM\",\"value\":\"xterm\"}],\"volume_mounts\":[{\"name\":\"tmp\",\"container_path\":\"/\"}],\"security_context\":{\"privileged\":true,\"readonly_rootfs\":false,\"no_new_privs\":false}}],\"network_type\":\"tap\",\"cube_network_config\":{\"allowInternetAccess\":true,\"denyOut\":[\"10.0.0.0/8\",\"100.64.0.0/10\",\"172.16.0.0/12\",\"192.168.0.0/16\"]}}"
-      }
-      ossdb_config = {
-        addr                       = "${tencentcloud_mysql_instance.mysql.intranet_ip}:3306"
-        user                       = local.cube_user
-        pwd                        = local.cube_password
-        db_name                    = local.cube_db
-        conn_timeout               = 5
-        read_timeout               = 5
-        write_timeout              = 5
-        max_idle_conns             = 5
-        max_open_conns             = 20
-        max_conn_life_time_seconds = 300
       }
       instance_db_config = {
         addr                       = "${tencentcloud_mysql_instance.mysql.intranet_ip}:3306"
@@ -406,6 +426,24 @@ resource "kubernetes_deployment" "cubemaster" {
             name  = "CUBE_MASTER_CONFIG_PATH"
             value = "/usr/local/services/cubetoolbox/CubeMaster/conf.yaml"
           }
+          # Every template-from-image build is forwarded to CubeTemplateCenter;
+          # without this address the requests fail with "CUBE_TEMPLATE_CENTER_ADDR
+          # is not configured".
+          env {
+            name  = "CUBE_TEMPLATE_CENTER_ADDR"
+            value = "http://cube-templatecenter.cubesandbox.svc.cluster.local:8090"
+          }
+          # Rejects forged TC build-status callbacks (the BUILT payload becomes
+          # the rootfs nodes boot from).
+          env {
+            name = "CUBE_TEMPLATE_CALLBACK_TOKEN"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.cubemaster_conf[0].metadata[0].name
+                key  = "cube-template-callback-token"
+              }
+            }
+          }
           port {
             name           = "http"
             container_port = 8089
@@ -447,9 +485,15 @@ resource "kubernetes_deployment" "cubemaster" {
             secret_name = kubernetes_secret.cubemaster_conf[0].metadata[0].name
           }
         }
-        # Default no-CFS mode uses pod-local emptyDir storage, suitable for the
-        # default single-replica cube-master. Set use_cfs=true when scaling
-        # cube-master beyond one replica or when persistent shared storage is needed.
+        # Default no-CFS mode uses a hostPath volume, NOT emptyDir: emptyDir is
+        # per-Pod and is NEVER shared between two Pods even when they land on
+        # the same node, which is exactly what cubemaster and cube-templatecenter
+        # need (TC writes the ext4, cubemaster serves the download -- design
+        # 9.7). hostPath at a fixed path is genuinely shared by every Pod
+        # scheduled onto that node. This only works for a single cubemaster
+        # replica pinned to one node (enforced by the templatecenter
+        # deployment's lifecycle.precondition below); set use_cfs=true for
+        # multi-replica cube-master or real cross-node shared storage.
         dynamic "volume" {
           for_each = var.use_cfs ? [1] : []
           content {
@@ -464,7 +508,10 @@ resource "kubernetes_deployment" "cubemaster" {
           for_each = var.use_cfs ? [] : [1]
           content {
             name = "data"
-            empty_dir {}
+            host_path {
+              path = local.artifact_store_host_path
+              type = "DirectoryOrCreate"
+            }
           }
         }
         # Both the public cert and the private key are projected here:
@@ -523,6 +570,286 @@ resource "kubernetes_service" "cubemaster" {
     port {
       name     = "http"
       port     = 8089
+      protocol = "TCP"
+    }
+  }
+}
+
+# ---------------------------------------------------------------
+# CubeTemplateCenter: Deployment → ClusterIP Service
+# Always deployed with the addons (TC is mandatory: CubeMaster has no
+# in-process build fallback). TC is the data-plane half of
+# template building: it pulls the image, builds the ext4, and reports status
+# back to CubeMaster. CubeMaster keeps the control plane (DB, distribution).
+# ---------------------------------------------------------------
+# cube-templatecenter configuration file. Like cubemaster's, it embeds the
+# MySQL and Redis credentials, so it is a Secret (not a ConfigMap) mounted as
+# a file into the pod at CUBE_TEMPLATE_CENTER_CONFIG_PATH. Same database as
+# CubeMaster, deliberately: TC uses it for schema migration and the DB
+# session locks (build dedup / reconciler) that must be shared with
+# CubeMaster's registration path.
+resource "kubernetes_secret" "templatecenter_conf" {
+  count = local.deploy_addons ? 1 : 0
+  type  = "Opaque"
+  metadata {
+    name      = "cube-templatecenter-conf"
+    namespace = kubernetes_namespace.cubesandbox[0].metadata[0].name
+  }
+
+  data = {
+    "conf.yaml" = yamlencode({
+      common = {
+        http_port                 = 8090
+        http_readtimeout          = 120
+        http_writetimeout         = 360
+        http_idletimeout          = 360
+        sync_meta_data_interval   = "30s"
+        sync_metric_data_interval = "1s"
+        collect_metric_interval   = "1s"
+        # CUBE_MASTER_ADDR env (set on the Deployment) wins over this value.
+        master_addr = "http://cubemaster.cubesandbox.svc.cluster.local:8089"
+      }
+      log = {
+        module    = "templatecenter"
+        path      = "/data/log/CubeTemplateCenter"
+        file_size = 100
+        file_num  = 10
+        level     = "info"
+      }
+      instance_db_config = {
+        addr                       = "${tencentcloud_mysql_instance.mysql.intranet_ip}:3306"
+        user                       = local.cube_user
+        pwd                        = local.cube_password
+        db_name                    = local.cube_db
+        conn_timeout               = 5
+        read_timeout               = 5
+        write_timeout              = 5
+        max_idle_conns             = 5
+        max_open_conns             = 20
+        max_conn_life_time_seconds = 300
+      }
+      # TC's config loader reads redis / redis_read / redis_write (the chart
+      # ships all three); keep them identical.
+      redis = {
+        nodes        = "${tencentcloud_redis_instance.redis.ip}:6379"
+        password     = var.redis_password
+        db_no        = 0
+        max_idle     = 8
+        max_active   = 32
+        idle_timeout = 30
+        max_retry    = 2
+      }
+      redis_read = {
+        nodes        = "${tencentcloud_redis_instance.redis.ip}:6379"
+        password     = var.redis_password
+        db_no        = 0
+        max_idle     = 8
+        max_active   = 32
+        idle_timeout = 30
+        max_retry    = 2
+      }
+      redis_write = {
+        nodes        = "${tencentcloud_redis_instance.redis.ip}:6379"
+        password     = var.redis_password
+        db_no        = 0
+        max_idle     = 8
+        max_active   = 32
+        idle_timeout = 30
+        max_retry    = 2
+      }
+      auth = {
+        enable = false
+      }
+    })
+  }
+}
+
+resource "kubernetes_deployment" "templatecenter" {
+  count      = local.deploy_addons ? 1 : 0
+  depends_on = [kubernetes_deployment.cubemaster, kubernetes_secret.templatecenter_conf]
+
+  # use_cfs=false backs the shared "data" volume with a hostPath, which only
+  # exists on one node, so both cubemaster and TC must stay single-replica
+  # there: with several master replicas the required podAffinity below could
+  # co-locate TC with ANY of them (an artifact cubemaster #2 built might sit
+  # on a node TC never shares), and a second TC replica could neither read
+  # the first one's ext4 files nor take over its builds. use_cfs=true switches
+  # the store to a shared NFS export, which lifts both limits -- replicas
+  # coordinate duplicate builds through DB session locks (see
+  # CubeTemplateCenter/pkg/build). Fail the plan instead of deploying
+  # something that 404s downloads intermittently.
+  lifecycle {
+    precondition {
+      condition     = var.use_cfs || local.cubemaster_replicas == 1
+      error_message = "use_cfs=false requires cubemaster_replicas=1: the artifact store is a node-local hostPath with no cross-node sharing, so with several master replicas cube-templatecenter could co-locate with a master replica that never built the artifact. Set use_cfs=true for a multi-replica cube-master."
+    }
+    precondition {
+      condition     = var.use_cfs || var.templatecenter_replicas == 1
+      error_message = "use_cfs=false requires templatecenter_replicas=1: the artifact store is a node-local hostPath with no cross-node sharing, so a second replica could neither read the first one's ext4 files nor take over its builds. Set use_cfs=true for multiple cube-templatecenter replicas."
+    }
+  }
+
+  metadata {
+    name      = "cube-templatecenter"
+    namespace = kubernetes_namespace.cubesandbox[0].metadata[0].name
+    labels    = { app = "cube-templatecenter" }
+  }
+  spec {
+    # Single replica with the default node-local hostPath store (enforced by
+    # the lifecycle preconditions above); multiple replicas are allowed with
+    # use_cfs=true, where every replica mounts the same NFS export and
+    # duplicate builds of one spec are coordinated through DB session locks.
+    replicas = var.templatecenter_replicas
+    selector {
+      match_labels = { app = "cube-templatecenter" }
+    }
+    template {
+      metadata {
+        labels = { app = "cube-templatecenter" }
+      }
+      spec {
+        # With use_cfs=false TC must land on the SAME NODE as a cubemaster
+        # Pod: the "data" volume below is a hostPath, which only that node
+        # can see. required, not preferred: a TC scheduled elsewhere would
+        # find an empty hostPath directory and build into a disk cubemaster
+        # never serves from, so every download would 404. With use_cfs=true
+        # the store is a shared NFS export any node can mount, so no
+        # co-location constraint is needed (and one would only pointlessly
+        # pile every replica onto the master node).
+        dynamic "affinity" {
+          for_each = var.use_cfs ? [] : [1]
+          content {
+            pod_affinity {
+              required_during_scheduling_ignored_during_execution {
+                topology_key = "kubernetes.io/hostname"
+                label_selector {
+                  match_labels = { app = "cubemaster" }
+                }
+              }
+            }
+          }
+        }
+        container {
+          name  = "cube-templatecenter"
+          image = local.templatecenter_image
+          env {
+            name  = "CUBE_TEMPLATE_CENTER_CONFIG_PATH"
+            value = "/usr/local/services/cubetoolbox/CubeTemplateCenter/conf.yaml"
+          }
+          env {
+            name  = "CUBE_MASTER_ADDR"
+            value = "http://cubemaster.cubesandbox.svc.cluster.local:8089"
+          }
+          # Presented as X-Cube-Template-Callback-Token on build-status
+          # callbacks; must match CubeMaster's CUBE_TEMPLATE_CALLBACK_TOKEN.
+          env {
+            name = "CUBE_TEMPLATE_CALLBACK_TOKEN"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.cubemaster_conf[0].metadata[0].name
+                key  = "cube-template-callback-token"
+              }
+            }
+          }
+          # TC writes the ext4 into the same shared store CubeMaster serves
+          # downloads from. When use_cfs=false, that store is a hostPath, so
+          # TC must run on the same node as CubeMaster (enforced by the
+          # required podAffinity below) to see the same directory.
+          env {
+            name  = "CUBE_TEMPLATE_CENTER_ARTIFACT_STORE_DIR"
+            value = "/data/CubeMaster/storage"
+          }
+          port {
+            name           = "http"
+            container_port = 8090
+          }
+          readiness_probe {
+            http_get {
+              path = "/health"
+              port = 8090
+            }
+            initial_delay_seconds = 10
+            period_seconds        = 10
+          }
+          volume_mount {
+            name       = "data"
+            mount_path = "/data/CubeMaster/storage"
+          }
+          # The process refuses to start without its conf
+          # (CUBE_TEMPLATE_CENTER_CONFIG_PATH); mount it from the Secret.
+          volume_mount {
+            name       = "cube-templatecenter-conf"
+            mount_path = "/usr/local/services/cubetoolbox/CubeTemplateCenter/conf.yaml"
+            sub_path   = "conf.yaml"
+            read_only  = true
+          }
+          volume_mount {
+            name       = "cube-egress-ca"
+            mount_path = "/etc/cube/ca"
+            read_only  = true
+          }
+        }
+        # Share the same storage backend as CubeMaster: the same NFS export
+        # when use_cfs=true, or the same fixed hostPath directory otherwise
+        # (never emptyDir -- see the required podAffinity above and the
+        # comment on cubemaster's own "data" volume for why).
+        dynamic "volume" {
+          for_each = var.use_cfs ? [1] : []
+          content {
+            name = "data"
+            nfs {
+              server = tencentcloud_cfs_file_system.cubemaster_data[0].mount_ip
+              path   = "/"
+            }
+          }
+        }
+        dynamic "volume" {
+          for_each = var.use_cfs ? [] : [1]
+          content {
+            name = "data"
+            host_path {
+              path = local.artifact_store_host_path
+              type = "DirectoryOrCreate"
+            }
+          }
+        }
+        volume {
+          name = "cube-egress-ca"
+          secret {
+            secret_name = kubernetes_secret.cube_egress_ca[0].metadata[0].name
+            items {
+              key  = "cube-root-ca.crt"
+              path = "cube-root-ca.crt"
+            }
+          }
+        }
+        volume {
+          name = "cube-templatecenter-conf"
+          secret {
+            secret_name = kubernetes_secret.templatecenter_conf[0].metadata[0].name
+            items {
+              key  = "conf.yaml"
+              path = "conf.yaml"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_service" "templatecenter" {
+  count = local.deploy_addons ? 1 : 0
+  metadata {
+    name      = "cube-templatecenter"
+    namespace = kubernetes_namespace.cubesandbox[0].metadata[0].name
+  }
+  spec {
+    type     = "ClusterIP"
+    selector = { app = "cube-templatecenter" }
+    port {
+      name     = "http"
+      port     = 8090
       protocol = "TCP"
     }
   }
@@ -635,8 +962,21 @@ resource "kubernetes_service" "cube_api" {
 }
 
 # ---------------------------------------------------------------
-# cube-ops: Deployment -> ClusterIP Service
+# cube-ops: Deployment → CLB Service (private network)
 # ---------------------------------------------------------------
+
+resource "kubernetes_secret" "cube_ops_conf" {
+  count = local.deploy_addons ? 1 : 0
+  type  = "Opaque"
+  metadata {
+    name      = "cube-ops-conf"
+    namespace = kubernetes_namespace.cubesandbox[0].metadata[0].name
+  }
+
+  data = {
+    "redis-password" = var.redis_password
+  }
+}
 
 resource "kubernetes_deployment" "cube_ops" {
   count = local.deploy_addons ? 1 : 0
@@ -696,6 +1036,23 @@ resource "kubernetes_deployment" "cube_ops" {
             name  = "CUBEMASTER_MIGRATION_SKIP_FINGERPRINT_CHECK"
             value = "true"
           }
+          env {
+            name  = "REDIS_HOST"
+            value = tencentcloud_redis_instance.redis.ip
+          }
+          env {
+            name  = "REDIS_PORT"
+            value = "6379"
+          }
+          env {
+            name = "REDIS_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.cube_ops_conf[0].metadata[0].name
+                key  = "redis-password"
+              }
+            }
+          }
 
           port {
             name           = "http"
@@ -722,17 +1079,33 @@ resource "kubernetes_deployment" "cube_ops" {
   ]
 }
 
+# cube-ops private-network CLB Service
+# NOTE: cube-ops always stays VPC-internal regardless of enable_public_network,
+# so it does NOT use replace_triggered_by — its CLB type never changes. Compute
+# nodes (outside the TKE cluster) reach cube-ops:3010 via this CLB for node
+# registration / heartbeat.
 resource "kubernetes_service" "cube_ops" {
   count = local.deploy_addons ? 1 : 0
-
   metadata {
     name      = "cube-ops"
     namespace = kubernetes_namespace.cubesandbox[0].metadata[0].name
     labels    = { app = "cube-ops" }
+    annotations = {
+      "service.kubernetes.io/qcloud-loadbalancer-internal-subnetid" = tencentcloud_subnet.cluster.id
+      "service.cloud.tencent.com/modification-protection"           = "false"
+      "service.cloud.tencent.com/pass-to-target"                    = "true"
+      "service.cloud.tencent.com/security-groups"                   = tencentcloud_security_group.clb.id
+    }
+  }
+  lifecycle {
+    # TKE controller-manager injects runtime annotations; ignore to avoid drift.
+    ignore_changes = [
+      metadata[0].annotations,
+    ]
   }
 
   spec {
-    type     = "ClusterIP"
+    type     = "LoadBalancer"
     selector = { app = "cube-ops" }
 
     port {
@@ -785,6 +1158,23 @@ resource "kubernetes_deployment" "cube_lifecycle_manager" {
       }
 
       spec {
+        # Prefer spreading the replicas across nodes so a node failure cannot
+        # take both down. Preferred rather than required: a single-node TKE
+        # cluster must still be able to schedule both.
+        affinity {
+          pod_anti_affinity {
+            preferred_during_scheduling_ignored_during_execution {
+              weight = 100
+              pod_affinity_term {
+                label_selector {
+                  match_labels = { app = "cube-lifecycle-manager" }
+                }
+                topology_key = "kubernetes.io/hostname"
+              }
+            }
+          }
+        }
+
         container {
           name  = "cube-lifecycle-manager"
           image = local.cube_lcm_image
@@ -832,6 +1222,26 @@ resource "kubernetes_deployment" "cube_lifecycle_manager" {
             name  = "CUBE_LCM_DISCOVERY_REFRESH"
             value = var.cube_lifecycle_manager_discovery_refresh
           }
+          # Active-standby. Both replicas consume lifecycle events and serve
+          # /internal/resume; the Redis lease only gates idle sweep/kill and
+          # stale cube-proxy pruning. Without these the replicas would all
+          # report themselves leader and run singleton work uncoordinated.
+          env {
+            name  = "CUBE_LCM_LEADER_ELECTION_ENABLED"
+            value = var.cube_lifecycle_manager_leader_election_enabled ? "true" : "false"
+          }
+          env {
+            name  = "CUBE_LCM_LEADER_LEASE_TTL"
+            value = var.cube_lifecycle_manager_leader_lease_ttl
+          }
+          env {
+            name  = "CUBE_LCM_LEADER_RENEW_INTERVAL"
+            value = var.cube_lifecycle_manager_leader_renew_interval
+          }
+          env {
+            name  = "CUBE_LCM_LEADER_RETRY_INTERVAL"
+            value = var.cube_lifecycle_manager_leader_retry_interval
+          }
           env {
             name = "CUBE_LCM_ADMIN_TOKEN"
             value_from {
@@ -865,6 +1275,28 @@ resource "kubernetes_deployment" "cube_lifecycle_manager" {
           }
         }
       }
+    }
+  }
+
+  lifecycle {
+    # Both directions matter, and they fail differently.
+    precondition {
+      condition = !var.cube_lifecycle_manager_leader_election_enabled || var.cube_lifecycle_manager_replicas >= 2
+      error_message = join("", [
+        "cube_lifecycle_manager_leader_election_enabled=true requires ",
+        "cube_lifecycle_manager_replicas >= 2; a single replica has nothing to fail over to.",
+      ])
+    }
+    # The dangerous direction: several replicas with election off all report
+    # themselves leader, so each one independently runs the idle sweep and
+    # pushes to every cube-proxy. Redis state locks keep that from corrupting
+    # anything, but it is duplicated work, not high availability.
+    precondition {
+      condition = var.cube_lifecycle_manager_leader_election_enabled || var.cube_lifecycle_manager_replicas == 1
+      error_message = join("", [
+        "cube_lifecycle_manager_replicas > 1 requires ",
+        "cube_lifecycle_manager_leader_election_enabled=true; otherwise every replica runs singleton work.",
+      ])
     }
   }
 
@@ -1000,6 +1432,11 @@ resource "kubernetes_deployment" "cube_proxy" {
             protocol       = "TCP"
           }
           port {
+            name           = "grpc"
+            container_port = 9090
+            protocol       = "TCP"
+          }
+          port {
             name           = "http80"
             container_port = 80
             protocol       = "TCP"
@@ -1011,7 +1448,7 @@ resource "kubernetes_deployment" "cube_proxy" {
           }
           port {
             name           = "admin"
-            container_port = 8082
+            container_port = var.cube_proxy_admin_port
             protocol       = "TCP"
           }
           env {
@@ -1057,11 +1494,11 @@ resource "kubernetes_deployment" "cube_proxy" {
           }
           env {
             name  = "CUBE_PROXY_ADMIN_URL"
-            value = "http://$(POD_IP):8082"
+            value = "http://$(POD_IP):${var.cube_proxy_admin_port}"
           }
           env {
             name  = "CUBE_PROXY_RESUME_URL"
-            value = "http://$(POD_IP):8082"
+            value = "http://$(POD_IP):${var.cube_proxy_admin_port}"
           }
           env {
             name  = "CUBE_PROXY_NODE_IP"
@@ -1194,7 +1631,7 @@ resource "kubernetes_deployment" "cube_proxy" {
   }
 }
 
-# cube-proxy CLB Service (public network 80/443)
+# cube-proxy CLB Service (public network 80/443/9090)
 resource "kubernetes_service" "cube_proxy" {
   count = local.deploy_addons ? 1 : 0
   metadata {
@@ -1203,7 +1640,7 @@ resource "kubernetes_service" "cube_proxy" {
     # Public mode: a public CLB billed by traffic (internet-charge-type).
     # Internal mode (default): pin to a VPC-internal subnet for a private VIP.
     annotations = merge({
-      "service.cloud.tencent.com/specify-protocol"        = "{\"80\":{\"protocol\":[\"TCP\"]},\"443\":{\"protocol\":[\"TCP\"]}}"
+      "service.cloud.tencent.com/specify-protocol"        = "{\"80\":{\"protocol\":[\"TCP\"]},\"443\":{\"protocol\":[\"TCP\"]},\"9090\":{\"protocol\":[\"TCP\"]}}"
       "service.cloud.tencent.com/modification-protection" = "false"
       "service.cloud.tencent.com/pass-to-target"          = "true"
       "service.cloud.tencent.com/security-groups"         = tencentcloud_security_group.clb.id
@@ -1216,6 +1653,10 @@ resource "kubernetes_service" "cube_proxy" {
   lifecycle {
     # TKE controller-manager injects runtime annotations (e.g. bindedip,
     # loadbalanceId) that would otherwise cause perpetual drift on every plan.
+    # NOTE: because annotations are ignored after create, upgrading an existing
+    # cluster will add Service port 9090 via spec.ports but will NOT refresh
+    # specify-protocol. Operators must manually patch the annotation to include
+    # 9090, or recreate this Service, for CLB to expose plaintext gRPC.
     ignore_changes = [
       metadata[0].annotations,
     ]
@@ -1240,6 +1681,12 @@ resource "kubernetes_service" "cube_proxy" {
       name        = "tcp-ssl-443"
       port        = 443
       target_port = 8080
+      protocol    = "TCP"
+    }
+    port {
+      name        = "tcp-grpc-9090"
+      port        = 9090
+      target_port = 9090
       protocol    = "TCP"
     }
   }
@@ -1408,6 +1855,10 @@ output "tke_cubemaster_clb_ip" {
 
 output "tke_cube_api_clb_ip" {
   value = local.deploy_addons ? kubernetes_service.cube_api[0].status[0].load_balancer[0].ingress[0].ip : ""
+}
+
+output "tke_cube_ops_clb_ip" {
+  value = local.deploy_addons ? kubernetes_service.cube_ops[0].status[0].load_balancer[0].ingress[0].ip : ""
 }
 
 output "tke_cube_proxy_clb_ip" {

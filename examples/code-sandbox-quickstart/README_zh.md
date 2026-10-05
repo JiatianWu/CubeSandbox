@@ -8,8 +8,8 @@ Cube Sandbox 最基础的使用方式：创建沙箱、在其中运行 Python �
 
 **Cube Sandbox** 是轻量级 MicroVM 平台，控制面和数据面完全兼容 [E2B SDK](https://e2b.dev)。其设计分为两个平面：
 
-- **控制面 (Control Plane)**：负责沙箱生命周期管理。每次 `Sandbox.create()` 调用都会在 50ms 内从模板快照启动一个新的 KVM MicroVM。指令流经 CubeAPI/Master，最终由 Cubelet 在 VM 内通过 `cube-agent` (PID 1) 拉起 `envd` 服务。
-- **数据面 (Data Plane)**：负责沙箱内的代码执行和数据交互。流量经由 CubeProxy 直接路由至沙箱内的 `envd`，支持在隔离环境内运行 Python 或 Shell 脚本。沙箱完全隔离——拥有独立内核、文件系统和网络。`with` 块退出时，沙箱自动销毁。
+- **控制面 (Control Plane)**：负责沙箱生命周期管理。每次 `Sandbox.create()` 调用都会在 50ms 内从模板快照启动一个新的 KVM MicroVM。本示例使用的官方 `sandbox-code` 镜像中，创建请求到达 Cubelet 后，由 VM 内的 `cube-agent` (PID 1) 拉起 `envd`。
+- **数据面 (Data Plane)**：负责通过沙箱内的代码解释器执行代码，同时将 `commands.run`、`files.read/write` 等请求经由 CubeProxy 直接路由至沙箱内的 `envd`。沙箱完全隔离——拥有独立内核、文件系统和网络。`with` 块退出时，沙箱自动销毁。
 
 ```text
                              用户脚本 (E2B SDK)
@@ -18,7 +18,7 @@ Cube Sandbox 最基础的使用方式：创建沙箱、在其中运行 Python �
         ┌─────────────────────────────┴─────────────────────────────┐
         │                                                           │
  【1. 管理流程 Control Plane】                            【2. 调用流程 Data Plane】
-  (如 Sandbox.create / delete)                        (如 run_code, commands.run)
+  (如 Sandbox.create / delete)             (如 run_code, commands.run, files.read/write)
         │                                                           │
         ▼  REST API (端口 3000)                                     ▼  WSS / HTTP
      CubeAPI                                                    CubeProxy
@@ -31,14 +31,14 @@ Cube Sandbox 最基础的使用方式：创建沙箱、在其中运行 Python �
      Cubelet ──────────────┼──► cube-agent ──► envd  ◄──────────┼───┘
                            │     (PID 1)         │              │
                            │                     ▼              │
-                           │                Python / Shell      │
+                           │          Code Interpreter / envd   │
                            └────────────────────────────────────┘
 ```
 
 ## 2. 前置条件
 
 - 已部署的 Cube Sandbox 环境
-- Python 3.8+
+- Python 3.9+（`cubesandbox` 与 `e2b-code-interpreter` 依赖）
 
 ```bash
 pip install -r requirements.txt
@@ -73,6 +73,20 @@ cp .env.example .env
 
 之后直接运行任意示例脚本即可，无需手动 `export`。
 
+**集群外本地开发：** 若无法解析 `*.cube.app`，在 `.env` 中设置
+`CUBE_REMOTE_PROXY_BASE=https://<节点IP>:443`（CubeProxy 常用 443/8080/9090）。
+`load_local_dotenv()` 仅加载 `.env`；需要数据面的 E2B 脚本会调用
+`ensure_dev_sidecar()` 启动同级
+[`examples/e2b-dev-sidecar/`](../e2b-dev-sidecar/) 并为 **E2B SDK**
+（`e2b_code_interpreter`）打补丁，经本地 sidecar 转发数据面到 CubeProxy。
+需完整克隆本仓库；sidecar 启动失败时脚本会 warn 并继续。仅控制面的脚本
+（如 `create.py`）不会启动 sidecar。同目录下使用 `cubesandbox` SDK 的脚本
+（如 `auto-kill.py`）**不受** sidecar 补丁影响，集群外仍需 `*.cube.app` DNS
+或其它路由。`apply_create_time_envs()` 仅在 dev sidecar 生效时用 HTTP；
+否则 `/init` 默认走 HTTPS（仅在有意使用明文 HTTP 的部署中才用
+`CUBE_ENVD_INIT_SCHEME` 覆盖）。单次重试超时可调 `CUBE_ENVD_INIT_ATTEMPT_TIMEOUT_S`
+（默认每次 `5` 秒）。
+
 或直接导出：
 
 ```bash
@@ -93,9 +107,9 @@ python exec_code.py
 预期输出：
 
 ```
-Python 3.x.x (...)
 hello cube
-sum(1..100) = 5050
+
+Execution(Results: [], Logs: Logs(stdout: ['hello cube\n'], stderr: []), Error: None)
 ```
 
 ### 第四步 — 执行 Shell 命令
@@ -153,7 +167,7 @@ python create_with_envs.py
 预期输出:
 
 ```text
-user-session-test
+session is user-session-test
 ```
 
 ### pause.py — 暂停与恢复
@@ -256,6 +270,8 @@ requests.get(url, headers={"e2b-traffic-access-token": sandbox.traffic_access_to
 | `Template not found` | 模板 ID 错误 | 重新运行 `cubemastercli tpl list` |
 | `Connection refused` | CubeAPI 不可达 | 检查 `E2B_API_URL` 及端口 3000 |
 | `Sandbox timeout` | 沙箱超过 TTL | 增大 `Sandbox.create()` 中的 `timeout` |
+| `create_with_envs.py` 打印 `session is ` 但值为空 | cubebox/VNC 模板 create-time env 未落到 shell | 示例会 best-effort 调 `apply_create_time_envs()`（失败仅 warn）；仍为空则用 `commands.run(..., envs={...})` |
+| 设置 `CUBE_REMOTE_PROXY_BASE` 后 sidecar 未生效 | 只拷贝了 quickstart 目录或 sidecar 启动失败 | 使用完整仓库；检查 warn 信息。控制面脚本仍可运行，数据面需 sidecar 或 DNS |
 
 ## 6. 目录结构
 

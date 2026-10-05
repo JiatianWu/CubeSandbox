@@ -30,6 +30,14 @@ func (s *Sandbox) GetHost(port int) string {
 	return fmt.Sprintf("%d-%s.%s", port, s.SandboxID, domain)
 }
 
+func (s *Sandbox) addTrafficTokenHeaders(req *http.Request) {
+	if s.TrafficAccessToken == "" {
+		return
+	}
+	req.Header.Set("e2b-traffic-access-token", s.TrafficAccessToken)
+	req.Header.Set("cube-traffic-access-token", s.TrafficAccessToken)
+}
+
 func (s *Sandbox) GetInfo(ctx context.Context) (*SandboxInfo, error) {
 	if err := s.ensureClient(); err != nil {
 		return nil, err
@@ -134,6 +142,35 @@ func (s *Sandbox) SetTimeout(ctx context.Context, timeout time.Duration) error {
 	return s.client.doJSON(ctx, http.MethodPost, path, payload, nil, http.StatusNoContent)
 }
 
+// UpdateNetwork replaces the sandbox's egress policy.
+//
+// network is the complete desired policy, not a patch: a field left at its zero
+// value clears whatever the sandbox currently has.
+//
+// The new policy applies to established connections as well as new ones — a
+// connection it no longer permits is reset rather than left running.
+//
+// Errors wrap ErrSandboxNotFound (404) or an *APIError for other HTTP errors,
+// including 409 when the sandbox is not running.
+func (s *Sandbox) UpdateNetwork(ctx context.Context, network UpdateNetworkOptions) error {
+	if err := s.ensureClient(); err != nil {
+		return err
+	}
+	internetAccessDisabled := network.AllowInternetAccess != nil && !*network.AllowInternetAccess
+	payload, err := buildNetworkPayload(network.NetworkOptions, internetAccessDisabled)
+	if err != nil {
+		return err
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	if network.AllowInternetAccess != nil {
+		payload["allowInternetAccess"] = *network.AllowInternetAccess
+	}
+	path := "/sandboxes/" + url.PathEscape(s.SandboxID) + "/network"
+	return s.client.doJSON(ctx, http.MethodPut, path, payload, nil, http.StatusNoContent)
+}
+
 func (s *Sandbox) Kill(ctx context.Context) error {
 	if err := s.ensureClient(); err != nil {
 		return err
@@ -194,6 +231,7 @@ func (s *Sandbox) RunCode(ctx context.Context, code string, opts RunCodeOptions)
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	s.addTrafficTokenHeaders(req)
 
 	resp, err := s.client.dataHTTP.Do(req)
 	if err != nil {

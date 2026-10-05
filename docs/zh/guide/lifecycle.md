@@ -38,14 +38,17 @@ Go：`cubesandbox.NeverTimeout`；Python：`from cubesandbox import NEVER_TIMEOU
    create()       ┌────▼────┐   timeout & on_timeout=pause   ┌─────────┐
   ───────────────►│ running │ ──────────────────────────────►│ paused  │
                   │         │◄──────── connect() 或          │         │
-                  └─┬─────┬─┘     auto_resume 触发的请求     └────┬────┘
-                    │     │                                       │
-        kill()      │     │ timeout & on_timeout=kill             │ kill()
-        ────────────┘     └─────────────────┐                     │
-                                            ▼                     ▼
-                                      ┌────────────┐
-                                      │ terminated │
-                                      └────────────┘
+                  └──┬────┬─┘     auto_resume 触发的请求      └──┬────┬─┘
+                     │    │                                     │    │
+                     │    │ timeout & on_timeout=kill           │    │ timeout & on_timeout=kill
+                     │    └────────────────┐                    │    └──────────────┐
+                     │                     ▼                    │                   ▼
+                     │               ┌────────────┐◄────────────┘
+                     │               │ terminated │
+                     │               └──────▲─────┘
+                     │                      │
+                     │ kill()               │ kill()
+                     └──────────────────────┘
 ```
 
 ## 创建沙箱
@@ -90,7 +93,7 @@ print(info)
 # }
 ```
 
-`endAt` 表示按当前 `timeout` 估算的下一次超时时间。每次接收到新请求或调用 `set_timeout`（若有），`endAt` 会被刷新。对于**永不超时**的沙箱没有截止时间，因此响应中会**省略** `endAt`，而不是把它渲染成等于 `startedAt`。
+`endAt` 表示按当前 `timeout` 估算的下一次超时时间。每次接收到新请求或调用 `set_timeout`（若有），`endAt` 会被刷新。暂停不会取消有限的空闲截止时间，因此沙箱处于暂停状态时，详情和列表 API 仍会返回相同的 `endAt`。对于**永不超时**的沙箱没有截止时间，因此响应中会**省略** `endAt`，而不是把它渲染成等于 `startedAt`。
 
 ## 列出运行中的沙箱
 
@@ -111,42 +114,68 @@ sandbox.kill()
 
 `kill()` 和 `DELETE /sandboxes/{sandboxID}` 均可用于删除处于 `running` 或 `paused` 状态的沙箱。
 
-删除 `paused` 沙箱时，CubeSandbox 会先在内部恢复其运行时状态，再执行正常销毁流程。因此，删除 `paused` 沙箱通常比删除 `running` 沙箱耗时更长。接口仍保持同步语义：只有沙箱及相关资源清理完成后，才会返回 `204 No Content`。
+删除 `paused` 沙箱时，CubeSandbox **不会**先 Resume／唤醒 MicroVM。控制面直接删除 paused tombstone、清理 pause 快照（catalog／CoW），并清除 pause 元数据。Plugin volume 的 refcount 已在 Pause 时调整，删除路径无需为销毁再挂载一遍。
 
-内部恢复仅用于完成删除，不会被视为一次独立的恢复操作：
+接口仍保持同步语义：只有清理完成后才返回 `204 No Content`。该路径不是一次 Resume：
 
 * 不会触发 `sandbox.resumed` 生命周期事件；
 * 不会重置空闲超时；
-* 不会改变 DELETE 接口的同步语义。
-
-为给销毁流程预留足够时间，内部恢复最多执行五秒。如果当前请求剩余时间不足以完成恢复和销毁，CubeSandbox 会在开始销毁前返回可重试错误。
+* 不需要节点容量准入（不再有「删除前恢复」）。
 
 删除暂停状态的沙箱时，通常会遇到以下几类情况：
 
-* 删除成功时返回 **`204 No Content`**，表示沙箱及相关资源已经完成清理。
+* 删除成功时返回 **`204 No Content`**，表示沙箱、pause 快照及相关资源已经完成清理。
 
-* 如果恢复未通过资源准入检查，会返回 **`409 Conflict`**。例如节点容量不足，或沙箱缺少恢复所需的资源元数据。此时沙箱仍保持 `paused` 状态。客户端应根据响应中的诊断信息处理：资源释放后可以重试；如果缺少资源元数据，则需要修复或重新创建沙箱。
-
-* 如果沙箱正在进入暂停状态，或其他生命周期操作尚未完成，会返回 **`503 Service Unavailable`**，并携带 `Retry-After: 2`。客户端应等待至少两秒后重试。
-
-* 如果删除前的恢复或状态准备未能在时间预算内完成，或者剩余时间不足以启动销毁流程，会返回 **`503 Service Unavailable`**，并携带 `Retry-After: 5`。客户端应先查询沙箱状态，再等待至少五秒后重试。
+* 如果沙箱正在进入暂停状态，或其他生命周期操作（pause／resume／delete）尚未完成并持有沙箱锁，会返回 **`503 Service Unavailable`**，并携带 `Retry-After: 2`。客户端应等待至少两秒后重试。
 
 `Retry-After` 的单位为秒，仅用于提示客户端等待后重试。它不表示 CubeSandbox 会在后台继续删除，也不会启动后台重试任务。
 
 `404 Not Found`、`408 Request Timeout` 以及 `running` 沙箱的删除行为保持不变。
-
-如果恢复过程返回错误，但运行时状态确认沙箱已经处于 `running`，CubeSandbox 仍会继续执行销毁。若后续销毁失败，则按照现有销毁错误语义返回；不会重新暂停沙箱，也不会创建后台清理任务。
 
 ## 显式暂停 / 恢复
 
 ```python
 sandbox.pause()                       # 主动保存快照，释放 CPU/内存
 # ... 一段时间过去 ...
-sandbox.connect()                     # 从快照恢复
+sandbox = Sandbox.connect(sandbox.sandbox_id, timeout=300)  # 从快照恢复，并重置空闲超时
 sandbox.run_code("print('back!')")    # 像没暂停过一样继续用
 ```
 
-可参考示例：[`examples/code-sandbox-quickstart/pause.py`](https://github.com/tencentcloud/CubeSandbox/blob/master/examples/code-sandbox-quickstart/pause.py)。
+`pause()` **不会取消**空闲回收。默认 `on_timeout="kill"` 时，之后被暂停的沙箱空闲仍超过 `timeout` 一样会被销毁。若要保住暂停中的沙箱，请传 `timeout=NEVER_TIMEOUT`、省略 `timeout`（且服务端未设正数默认）、或把 `timeout` 设得足够大——见下文 [行为说明](#行为说明)。
+
+`connect(timeout=...)` 可以更新空闲超时，无论沙箱已经在运行，还是需要先从暂停状态恢复。对于运行中的沙箱，正数 timeout 只会在请求窗口更长时延长 deadline；如果要主动缩短生命周期，请使用 `set_timeout(...)`：
+
+| `connect(timeout=...)` | 效果 |
+|---|---|
+| 不传 / `None` | 保持当前超时 |
+| `NEVER_TIMEOUT`（`-1`） | 连接后永不超时 |
+| `N > 0` | 确保至少剩余 N 秒；运行中或暂停中的沙箱保留更长的现有 deadline，否则在连接后重新开 N 秒窗口 |
+| `0` 或 `N < -1` | 拒绝请求并返回 HTTP 400 |
+
+连接暂停中的沙箱时，底层 Resume 如果与另一个生命周期操作同时切换，可能返回 HTTP 409；请等沙箱进入稳定状态后重试。
+
+已弃用的 `resume(timeout=...)` 保留原有的 `0` 语义：
+
+| `resume(timeout=...)` | 效果 |
+|---|---|
+| 不传 / `None` | 保持当前超时 |
+| `0` | 保持当前超时（立刻到期请用 `set_timeout(0)`） |
+| `NEVER_TIMEOUT`（`-1`） | 恢复后永不超时 |
+| `N > 0` | 从恢复时刻起重新开 N 秒窗口 |
+| `N < -1` | 拒绝请求并返回 HTTP 400 |
+
+可参考示例：[`examples/code-sandbox-quickstart/pause.py`](https://github.com/tencentcloud/CubeSandbox/blob/master/examples/code-sandbox-quickstart/pause.py)。跨机 Resume（S3 后端且 `remote_status=ready`）见 [跨机快照](./cross-node-snapshot.md)。
+
+### Resume 后的 CubeProxy 缓存
+
+Resume 会重建 guest NIC／主机端口，并重写 Redis 沙箱代理路由。CubeMaster 随后 best-effort 调用 CubeProxy `POST /admin/backend_cache/delete` 清理 `local_cache`，避免流量仍打到 pause 前的旧 IP（同机 504）。
+
+要使该清理成功，**CubeMaster 与 CubeProxy 必须配置相同的 admin token**：
+
+- CubeMaster：`cubeproxy.admin_token`（请求头 `X-Cube-Admin-Token`）
+- CubeProxy：`nginx.conf` 中的 `$cube_admin_token`（见 `CubeProxy/lua/admin_phase.lua`）
+
+若只配一侧或两端不一致，清理会返回 **403**：Redis 路由已正确，但 CubeProxy 可能继续使用过期缓存直至条目过期。使用 Resume 时请在部署／Helm 中对齐该 token。
 
 ## 平台自动暂停 / 自动恢复
 
@@ -173,7 +202,7 @@ sandbox = Sandbox.create(
 
 ### 自动恢复后的 timeout 重置
 
-每次自动恢复成功后，沙箱获得一个**全新的 `timeout` 计时窗口**（与 e2b 同样语义），所以"恢复 → 短暂使用 → 再次空闲超时 → 再次暂停"的循环可以无缝持续。
+每次自动恢复成功后，**空闲计时重置**，但超时时长不变。所以"恢复 → 短暂使用 → 再次空闲超时 → 再次暂停"的循环可以无缝持续。
 
 ### 何时算"活跃"
 
@@ -182,7 +211,7 @@ sandbox = Sandbox.create(
 - 通过 SDK 调用：`sandbox.run_code(...)`、`sandbox.commands.run(...)`、`sandbox.files.read(...)` / `write(...)`。
 - 通过 HTTP 直连沙箱内的服务（例如 `getHost()` 返回的 URL）。
 
-未配置 `auto_pause` / 不传 `lifecycle` 的沙箱默认行为是 `on_timeout="kill"`：空闲超过 `timeout` 秒后，平台会主动销毁该沙箱。这与 e2b `lifecycle.on_timeout="kill"` 语义一致。若不希望被自动回收，可传 `timeout=NEVER_TIMEOUT`、省略 `timeout`（且服务端未设正数默认）、把 `timeout` 设得足够大，或通过定期活动刷新空闲计时。
+未配置 `auto_pause` / 不传 `lifecycle` 的沙箱默认行为是 `on_timeout="kill"`：空闲超过 `timeout` 秒后，平台会主动销毁该沙箱。这与 e2b `lifecycle.on_timeout="kill"` 语义一致。手动 `pause()` **不会取消** auto-kill：之后被暂停的沙箱，空闲仍超过 `timeout` 时一样会被销毁。若要保住暂停中的沙箱，请传 `timeout=NEVER_TIMEOUT`、省略 `timeout`（且服务端未设正数默认）、把 `timeout` 设得足够大，或通过定期活动刷新空闲计时。
 
 ### 端到端示例
 
@@ -217,9 +246,9 @@ python examples/code-sandbox-quickstart/auto-kill.py
 同一段里的 `create_timeout_insec` 与空闲 TTL 无关，仅限制创建/调度 RPC 的截止时间。更多 CubeMaster 配置项见[服务管理 — CubeMaster 配置项](service-management.md#cubemaster-settings)。
 
 - **暂停的状态保真度**：CPU 寄存器、进程内存、TCP 连接（无外部对端）、文件系统改动都会随快照保留；面向外部的连接（如 sandbox 主动建立的 outbound socket）会在暂停时断开，恢复后由应用层自行重连。
-- **集群一致性**：自动暂停由部署在 control 节点上的 `cube-lifecycle-manager` 服务统一协调；它消费 CubeMaster 通过 Redis stream 发布的生命周期事件，通过 Redis 注册表实时发现所有在线的 CubeProxy 副本并广播状态。多副本环境下用 Redis SETNX 互斥锁确保同一沙箱不会被并发暂停或恢复。
+- **集群一致性**：自动暂停由 `cube-lifecycle-manager` 协调。Helm chart 与 Terraform 一键部署默认都是两个温备副本。两个副本都消费生命周期事件、发现 CubeProxy 并处理恢复回调，由 Redis 租约选出一个副本执行空闲扫描、销毁和过期注册清理。leader 故障切换后沙箱可能多一次 pause/resume，下次请求会照常 auto-resume（见 [Kubernetes FAQ](kubernetes/faq.md)）。每沙箱 Redis 状态转换与 CubeMaster lifecycle lock 共同串行化跨副本的有效暂停/恢复操作。
 - **失败回退**：自动恢复 RPC 失败时，CubeProxy 直接对客户端返回 503 + `Retry-After`，不会让用户卡在长超时上；当沙箱已经被销毁（`killing` / `killed`），则返回 410 Gone 让客户端立即停止重试。
-- **故障排查**：控制节点上执行 `docker logs cube-lifecycle-manager` 查看运行日志，关键事件包括 `create event applied`、`auto-paused sandbox`、`auto-resumed sandbox`、`timeout-killed sandbox`。每个 CubeProxy 副本额外提供 `GET http://<node-ip>:8082/admin/healthz`，其中 `heartbeat_last_pushed_ms` 表示该副本最近一次向 manager 上报心跳的时间戳。
+- **故障排查**：控制节点上执行 `docker logs cube-lifecycle-manager` 查看运行日志，关键事件包括 `create event applied`、`auto-paused sandbox`、`auto-resumed sandbox`、`timeout-killed sandbox`。每个 CubeProxy 副本额外提供 `GET http://<node-ip>:8082/admin/healthz`，其中 `heartbeat_last_pushed_ms` 表示该副本最近一次向 manager 上报心跳的时间戳。管理端口默认为 `8082`；由于 CubeProxy 使用主机网络，当该端口已被占用时可通过 `CUBE_PROXY_ADMIN_PORT` 覆盖。
 
 ### 暂停资源释放与节点调度配额
 
@@ -256,10 +285,11 @@ resume rejected by paused_resource_release_ratio policy: need 1024MB > quota 512
 - 磁盘和 MvmNum **不受 ratio 影响**——暂停快照始终占用存储空间，沙箱对象始终存在。
 - `ratio=0` 是零值安全的默认值：如果从未配置过此项，行为与旧版本完全一致，升级不会产生意外。
 - 此项为**节点级配置**，不同节点可以设置不同的比值，灵活应对异构硬件或分池部署的需求。
-- 当节点上一大批沙箱同时被唤醒、单节点无法承载时，控制面会返回 409 并给出具体配额数字。后续版本将支持**跨节点恢复**，让沙箱可以在集群内自由漂移，最大化整集群利用率。
+- 当节点上一大批沙箱同时被唤醒、单节点无法承载时，控制面会返回 409 并给出具体配额数字。对使用 S3 后端的沙箱，调度器可以回退到其它兼容节点恢复——跨机条件与调度规则见[跨机快照](./cross-node-snapshot.md)。
 
 ## 下一步
 
+- [Agent 平台 freeze / resume](./agent-platform-freeze.md) — 手动 pause 保留、envd 前先 connect、Volume 与 snapshot 区别。
 - [模板概览](./templates.md) —— 沙箱基于模板启动，模板的构建过程也会影响首次冷启动开销。
 - [快速开始](./quickstart.md) —— 完整跑通"创建沙箱 → 执行代码 → 销毁"的最短路径。
 - 上游参考：[e2b · Sandbox lifecycle](https://e2b.dev/docs/sandbox)、[e2b · Auto-resume](https://e2b.dev/docs/sandbox/auto-resume)。

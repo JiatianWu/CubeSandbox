@@ -35,14 +35,14 @@ COMPOSE_FILE="${PROXY_DIR}/docker-compose.yaml"
 #   3. default    → int.tencentcloudcr.com (overseas/international)
 #
 # The image is published by CubeProxy/Makefile's `make push` to both
-# registries under the same :v0.6.0 tag; either default resolves
+# registries under the same :v0.7.2 tag; either default resolves
 # to whatever the operator most recently published.
 #
 # Compatibility: CUBE_PROXY_IMAGE_TAG is deprecated (local compose build era).
 # A non-default leftover value is honored once with a warning; the old default
 # cube-proxy:one-click is ignored so upgrades adopt the pre-published image.
-CUBE_PROXY_IMAGE_INT_DEFAULT="cube-sandbox-int.tencentcloudcr.com/cube-sandbox/cube-proxy:v0.6.0"
-CUBE_PROXY_IMAGE_CN_DEFAULT="cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/cube-proxy:v0.6.0"
+CUBE_PROXY_IMAGE_INT_DEFAULT="cube-sandbox-int.tencentcloudcr.com/cube-sandbox/cube-proxy:v0.7.2"
+CUBE_PROXY_IMAGE_CN_DEFAULT="cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/cube-proxy:v0.7.2"
 if [[ -z "${CUBE_SANDBOX_CUBE_PROXY_IMAGE:-}" && -n "${CUBE_PROXY_IMAGE_TAG:-}" ]]; then
   if [[ "${CUBE_PROXY_IMAGE_TAG}" == "cube-proxy:one-click" ]]; then
     log "CUBE_PROXY_IMAGE_TAG=cube-proxy:one-click is deprecated and ignored; set CUBE_SANDBOX_CUBE_PROXY_IMAGE or MIRROR to select the pre-published cube-proxy image"
@@ -63,16 +63,23 @@ CUBE_SANDBOX_NODE_IP="${CUBE_SANDBOX_NODE_IP:-}"
 CUBE_PROXY_REDIS_IP="${CUBE_PROXY_REDIS_IP:-127.0.0.1}"
 CUBE_PROXY_REDIS_PORT="${CUBE_PROXY_REDIS_PORT:-${CUBE_SANDBOX_REDIS_PORT:-6379}}"
 CUBE_PROXY_REDIS_PASSWORD="${CUBE_PROXY_REDIS_PASSWORD:-${CUBE_SANDBOX_REDIS_PASSWORD:-ceuhvu123}}"
+CUBE_PROXY_REDIS_MASTER_NAME="${CUBE_PROXY_REDIS_MASTER_NAME:-${CUBE_EXTERNAL_REDIS_MASTER_NAME:-}}"
+CUBE_PROXY_REDIS_SENTINEL_NODES="${CUBE_PROXY_REDIS_SENTINEL_NODES:-${CUBE_EXTERNAL_REDIS_SENTINEL_NODES:-}}"
+CUBE_PROXY_REDIS_SENTINEL_PASSWORD="${CUBE_PROXY_REDIS_SENTINEL_PASSWORD:-${CUBE_EXTERNAL_REDIS_SENTINEL_PASSWORD:-}}"
 CUBE_PROXY_HTTPS_PORT="${CUBE_PROXY_HTTPS_PORT:-443}"
 CUBE_PROXY_HTTP_PORT="${CUBE_PROXY_HTTP_PORT:-80}"
+CUBE_PROXY_GRPC_PORT="${CUBE_PROXY_GRPC_PORT:-9090}"
 CUBE_PROXY_SSL_CERT="${CUBE_PROXY_SSL_CERT:-cube.app+3.pem}"
 CUBE_PROXY_SSL_KEY="${CUBE_PROXY_SSL_KEY:-cube.app+3-key.pem}"
-# Address the /admin/* server (port 8082) binds to. Defaults to the node's
+# Address the /admin/* server binds to. Defaults to the node's
 # cluster-reachable IP so cube-lifecycle-manager (running on the control
 # node) can push meta / state updates here. Token auth via
 # $cube_admin_token below prevents outside abuse; operators may further
 # tighten this with iptables / security groups.
 CUBE_PROXY_ADMIN_LISTEN="${CUBE_PROXY_ADMIN_LISTEN:-${CUBE_SANDBOX_NODE_IP}}"
+# Port the /admin/* server binds to. cube-proxy uses host networking, so this
+# port must be free on the host; override when 8082 is already taken.
+CUBE_PROXY_ADMIN_PORT="${CUBE_PROXY_ADMIN_PORT:-8082}"
 
 # Address of cube-lifecycle-manager reachable from this cube-proxy replica.
 # Consumed by the Lua $cube_sidecar_addr variable used by the
@@ -92,8 +99,8 @@ CUBE_ADMIN_TOKEN="${CUBE_ADMIN_TOKEN:-}"
 # ── CubeProxy service registration for cube-lifecycle-manager discovery ──
 # Enabled by default now that CLM owns lifecycle coordination.
 CUBE_PROXY_REGISTRY_ENABLE="${CUBE_PROXY_REGISTRY_ENABLE:-1}"
-CUBE_PROXY_ID="${CUBE_PROXY_ID:-${CUBE_SANDBOX_NODE_IP}:8082}"
-CUBE_PROXY_ADMIN_URL="${CUBE_PROXY_ADMIN_URL:-http://${CUBE_SANDBOX_NODE_IP}:8082}"
+CUBE_PROXY_ID="${CUBE_PROXY_ID:-${CUBE_SANDBOX_NODE_IP}:${CUBE_PROXY_ADMIN_PORT}}"
+CUBE_PROXY_ADMIN_URL="${CUBE_PROXY_ADMIN_URL:-http://${CUBE_SANDBOX_NODE_IP}:${CUBE_PROXY_ADMIN_PORT}}"
 CUBE_PROXY_RESUME_URL="${CUBE_PROXY_RESUME_URL:-${CUBE_PROXY_ADMIN_URL}}"
 CUBE_PROXY_NODE_IP="${CUBE_PROXY_NODE_IP:-${CUBE_SANDBOX_NODE_IP}}"
 CUBE_PROXY_VERSION="${CUBE_PROXY_VERSION:-}"
@@ -101,7 +108,24 @@ CUBE_PROXY_HEARTBEAT_INTERVAL_MS="${CUBE_PROXY_HEARTBEAT_INTERVAL_MS:-5000}"
 CUBE_PROXY_REGISTRY_REDIS_HOST="${CUBE_PROXY_REGISTRY_REDIS_HOST:-${CUBE_PROXY_REDIS_IP}}"
 CUBE_PROXY_REGISTRY_REDIS_PORT="${CUBE_PROXY_REGISTRY_REDIS_PORT:-${CUBE_PROXY_REDIS_PORT}}"
 CUBE_PROXY_REGISTRY_REDIS_PASSWORD="${CUBE_PROXY_REGISTRY_REDIS_PASSWORD:-${CUBE_PROXY_REDIS_PASSWORD}}"
-CUBE_PROXY_REGISTRY_REDIS_DB="${CUBE_PROXY_REGISTRY_REDIS_DB:-0}"
+# Prefer CUBE_EXTERNAL_REDIS_DB; keep legacy per-component knobs as fallback
+# for hand-written / Terraform envs that still set them alone.
+if [[ -z "${CUBE_EXTERNAL_REDIS_DB:-}" \
+   && -n "${CUBE_PROXY_REDIS_DB:-}" \
+   && -n "${CUBE_PROXY_REGISTRY_REDIS_DB:-}" ]]; then
+  CUBE_PROXY_REDIS_DB="$(normalize_redis_db "${CUBE_PROXY_REDIS_DB}" "CUBE_PROXY_REDIS_DB")"
+  CUBE_PROXY_REGISTRY_REDIS_DB="$(normalize_redis_db \
+    "${CUBE_PROXY_REGISTRY_REDIS_DB}" "CUBE_PROXY_REGISTRY_REDIS_DB")"
+  [[ "${CUBE_PROXY_REDIS_DB}" == "${CUBE_PROXY_REGISTRY_REDIS_DB}" ]] \
+    || die "CUBE_PROXY_REDIS_DB (${CUBE_PROXY_REDIS_DB}) and CUBE_PROXY_REGISTRY_REDIS_DB (${CUBE_PROXY_REGISTRY_REDIS_DB}) conflict; set CUBE_EXTERNAL_REDIS_DB or make them equal"
+fi
+CUBE_PROXY_REDIS_DB="$(normalize_redis_db \
+  "${CUBE_EXTERNAL_REDIS_DB:-${CUBE_PROXY_REDIS_DB:-${CUBE_PROXY_REGISTRY_REDIS_DB:-0}}}" \
+  "CUBE_EXTERNAL_REDIS_DB/CUBE_PROXY_REDIS_DB")"
+CUBE_PROXY_REGISTRY_REDIS_DB="${CUBE_PROXY_REDIS_DB}"
+CUBE_PROXY_REGISTRY_REDIS_MASTER_NAME="${CUBE_PROXY_REGISTRY_REDIS_MASTER_NAME:-${CUBE_PROXY_REDIS_MASTER_NAME}}"
+CUBE_PROXY_REGISTRY_REDIS_SENTINEL_NODES="${CUBE_PROXY_REGISTRY_REDIS_SENTINEL_NODES:-${CUBE_PROXY_REDIS_SENTINEL_NODES}}"
+CUBE_PROXY_REGISTRY_REDIS_SENTINEL_PASSWORD="${CUBE_PROXY_REGISTRY_REDIS_SENTINEL_PASSWORD:-${CUBE_PROXY_REDIS_SENTINEL_PASSWORD}}"
 COMPOSE_DETACH="${ONE_CLICK_COMPOSE_DETACH:-1}"
 MKCERT_BUNDLED_BIN="${TOOLBOX_ROOT}/support/bin/mkcert"
 PREPARE_ONLY="${ONE_CLICK_PREPARE_ONLY:-0}"
@@ -116,6 +140,22 @@ case "${COMPOSE_DETACH}" in
   0|1) ;;
   *) die "unsupported ONE_CLICK_COMPOSE_DETACH: ${COMPOSE_DETACH} (expected 0 or 1)" ;;
 esac
+
+# Host-network ports cube-proxy binds must be valid TCP ports.
+_validate_host_port() {
+  local name="$1" port="$2"
+  [[ "${port}" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) \
+    || die "${name} must be a valid TCP port (1-65535), got: '${port}'"
+}
+_validate_host_port CUBE_PROXY_HTTP_PORT  "${CUBE_PROXY_HTTP_PORT}"
+_validate_host_port CUBE_PROXY_HTTPS_PORT "${CUBE_PROXY_HTTPS_PORT}"
+_validate_host_port CUBE_PROXY_GRPC_PORT  "${CUBE_PROXY_GRPC_PORT}"
+_validate_host_port CUBE_PROXY_ADMIN_PORT "${CUBE_PROXY_ADMIN_PORT}"
+if [[ "${CUBE_PROXY_ADMIN_PORT}" == "${CUBE_PROXY_HTTP_PORT}" \
+   || "${CUBE_PROXY_ADMIN_PORT}" == "${CUBE_PROXY_HTTPS_PORT}" \
+   || "${CUBE_PROXY_ADMIN_PORT}" == "${CUBE_PROXY_GRPC_PORT}" ]]; then
+  die "CUBE_PROXY_ADMIN_PORT (${CUBE_PROXY_ADMIN_PORT}) must differ from CUBE_PROXY_HTTP_PORT (${CUBE_PROXY_HTTP_PORT}), CUBE_PROXY_HTTPS_PORT (${CUBE_PROXY_HTTPS_PORT}) and CUBE_PROXY_GRPC_PORT (${CUBE_PROXY_GRPC_PORT})"
+fi
 
 install_mkcert() {
   if command -v mkcert >/dev/null 2>&1; then
@@ -158,10 +198,14 @@ prepare_proxy_certs
 render_template_atomic \
   "${GLOBAL_TEMPLATE}" \
   "${GLOBAL_CONF}" \
-  -e "s/__CUBE_PROXY_REDIS_IP__/$(escape_sed "${CUBE_PROXY_REDIS_IP}")/g" \
-  -e "s/__CUBE_PROXY_REDIS_PORT__/$(escape_sed "${CUBE_PROXY_REDIS_PORT}")/g" \
-  -e "s/__CUBE_PROXY_REDIS_PASSWORD__/$(escape_sed "${CUBE_PROXY_REDIS_PASSWORD}")/g" \
-  -e "s/__CUBE_PROXY_HOST_IP__/$(escape_sed "${CUBE_SANDBOX_NODE_IP}")/g" \
+  -e "s/__CUBE_PROXY_REDIS_IP__/$(escape_sed "${CUBE_PROXY_REDIS_IP}" '/')/g" \
+  -e "s/__CUBE_PROXY_REDIS_PORT__/$(escape_sed "${CUBE_PROXY_REDIS_PORT}" '/')/g" \
+  -e "s/__CUBE_PROXY_REDIS_PASSWORD__/$(escape_sed "${CUBE_PROXY_REDIS_PASSWORD}" '/')/g" \
+  -e "s/__CUBE_PROXY_REDIS_MASTER_NAME__/$(escape_sed "${CUBE_PROXY_REDIS_MASTER_NAME}" '/')/g" \
+  -e "s/__CUBE_PROXY_REDIS_SENTINEL_NODES__/$(escape_sed "${CUBE_PROXY_REDIS_SENTINEL_NODES}" '/')/g" \
+  -e "s/__CUBE_PROXY_REDIS_SENTINEL_PASSWORD__/$(escape_sed "${CUBE_PROXY_REDIS_SENTINEL_PASSWORD}" '/')/g" \
+  -e "s/__CUBE_PROXY_REDIS_DB__/$(escape_sed "${CUBE_PROXY_REDIS_DB}" '/')/g" \
+  -e "s/__CUBE_PROXY_HOST_IP__/$(escape_sed "${CUBE_SANDBOX_NODE_IP}" '/')/g" \
   -e "s#__CUBE_SIDECAR_NGX_ADDR__#$(escape_sed "${CUBE_SIDECAR_NGX_ADDR}" '#')#g" \
   -e "s#__CUBE_ADMIN_TOKEN__#$(escape_sed "${CUBE_ADMIN_TOKEN}" '#')#g"
 
@@ -173,7 +217,9 @@ render_template_atomic \
   "${NGINX_CONF}" \
   -e "s/__CUBE_PROXY_HTTPS_PORT__/$(escape_sed "${CUBE_PROXY_HTTPS_PORT}")/g" \
   -e "s/__CUBE_PROXY_HTTP_PORT__/$(escape_sed "${CUBE_PROXY_HTTP_PORT}")/g" \
+  -e "s/__CUBE_PROXY_GRPC_PORT__/$(escape_sed "${CUBE_PROXY_GRPC_PORT}")/g" \
   -e "s/__CUBE_PROXY_ADMIN_LISTEN__/$(escape_sed "${CUBE_PROXY_ADMIN_LISTEN}")/g" \
+  -e "s/__CUBE_PROXY_ADMIN_PORT__/$(escape_sed "${CUBE_PROXY_ADMIN_PORT}")/g" \
   -e "s/__CUBE_PROXY_SSL_CERT__/$(escape_sed "${CUBE_PROXY_SSL_CERT}")/g" \
   -e "s/__CUBE_PROXY_SSL_KEY__/$(escape_sed "${CUBE_PROXY_SSL_KEY}")/g"
 
@@ -195,7 +241,10 @@ render_template_atomic \
   -e "s#__CUBE_PROXY_REGISTRY_REDIS_HOST__#$(escape_sed "${CUBE_PROXY_REGISTRY_REDIS_HOST}" '#')#g" \
   -e "s#__CUBE_PROXY_REGISTRY_REDIS_PORT__#$(escape_sed "${CUBE_PROXY_REGISTRY_REDIS_PORT}" '#')#g" \
   -e "s#__CUBE_PROXY_REGISTRY_REDIS_PASSWORD__#$(escape_sed "${CUBE_PROXY_REGISTRY_REDIS_PASSWORD}" '#')#g" \
-  -e "s#__CUBE_PROXY_REGISTRY_REDIS_DB__#$(escape_sed "${CUBE_PROXY_REGISTRY_REDIS_DB}" '#')#g"
+  -e "s#__CUBE_PROXY_REGISTRY_REDIS_DB__#$(escape_sed "${CUBE_PROXY_REGISTRY_REDIS_DB}" '#')#g" \
+  -e "s#__CUBE_PROXY_REGISTRY_REDIS_MASTER_NAME__#$(escape_sed "${CUBE_PROXY_REGISTRY_REDIS_MASTER_NAME}" '#')#g" \
+  -e "s#__CUBE_PROXY_REGISTRY_REDIS_SENTINEL_NODES__#$(escape_sed "${CUBE_PROXY_REGISTRY_REDIS_SENTINEL_NODES}" '#')#g" \
+  -e "s#__CUBE_PROXY_REGISTRY_REDIS_SENTINEL_PASSWORD__#$(escape_sed "${CUBE_PROXY_REGISTRY_REDIS_SENTINEL_PASSWORD}" '#')#g"
 
 if [[ "${PREPARE_ONLY}" == "1" ]]; then
   log "cube proxy runtime files prepared under ${PROXY_DIR}"
@@ -205,12 +254,17 @@ fi
 compose_run down --remove-orphans >/dev/null 2>&1 || true
 docker_rm_if_exists "${CUBE_PROXY_CONTAINER_NAME}"
 
-# cube-proxy uses network_mode: host, so HTTP/HTTPS ports must be free on the
-# host before we attempt to start the container; otherwise the failure mode is
-# a cryptic "address already in use" from nginx inside the container.
-for port in "${CUBE_PROXY_HTTP_PORT}" "${CUBE_PROXY_HTTPS_PORT}"; do
+# Host networking: HTTP/HTTPS/gRPC/admin must be free. Name the specific
+# override variable so a collision on 80 does not tell the operator to change
+# CUBE_PROXY_ADMIN_PORT.
+for entry in "${CUBE_PROXY_HTTP_PORT}:CUBE_PROXY_HTTP_PORT" \
+             "${CUBE_PROXY_HTTPS_PORT}:CUBE_PROXY_HTTPS_PORT" \
+             "${CUBE_PROXY_GRPC_PORT}:CUBE_PROXY_GRPC_PORT" \
+             "${CUBE_PROXY_ADMIN_PORT}:CUBE_PROXY_ADMIN_PORT"; do
+  port="${entry%%:*}"
+  override_var="${entry##*:}"
   if command_output_contains_fixed_string "LISTEN" ss -lnt "( sport = :${port} )"; then
-    die "port ${port} is already in use; cube-proxy uses host networking and requires it to be free"
+    die "port ${port} is already in use; cube-proxy uses host networking and requires it to be free. Set ${override_var} to a free port (or stop the occupying process) and retry."
   fi
 done
 
@@ -245,6 +299,8 @@ done
 
 http_ready=0
 https_ready=0
+grpc_ready=0
+admin_ready=0
 for _ in {1..30}; do
   if [[ "${http_ready}" == "0" ]] && \
      command_output_contains_fixed_string "LISTEN" ss -lnt "( sport = :${CUBE_PROXY_HTTP_PORT} )"; then
@@ -254,14 +310,26 @@ for _ in {1..30}; do
      command_output_contains_fixed_string "LISTEN" ss -lnt "( sport = :${CUBE_PROXY_HTTPS_PORT} )"; then
     https_ready=1
   fi
-  if [[ "${http_ready}" == "1" && "${https_ready}" == "1" ]]; then
-    log "cube proxy listening on ${CUBE_PROXY_HTTP_PORT} and ${CUBE_PROXY_HTTPS_PORT}"
+  if [[ "${grpc_ready}" == "0" ]] && \
+     command_output_contains_fixed_string "LISTEN" ss -lnt "( sport = :${CUBE_PROXY_GRPC_PORT} )"; then
+    grpc_ready=1
+  fi
+  if [[ "${admin_ready}" == "0" ]] && \
+     command_output_contains_fixed_string "LISTEN" ss -lnt "( sport = :${CUBE_PROXY_ADMIN_PORT} )"; then
+    admin_ready=1
+  fi
+  if [[ "${http_ready}" == "1" && "${https_ready}" == "1" && "${grpc_ready}" == "1" && "${admin_ready}" == "1" ]]; then
+    log "cube proxy listening on ${CUBE_PROXY_HTTP_PORT}, ${CUBE_PROXY_HTTPS_PORT}, ${CUBE_PROXY_GRPC_PORT} and admin ${CUBE_PROXY_ADMIN_PORT}"
     exit 0
   fi
   sleep 2
 done
 
-if [[ "${http_ready}" != "1" ]]; then
-  die "cube proxy port ${CUBE_PROXY_HTTP_PORT} (HTTP) did not become ready"
+readiness_failures=()
+[[ "${http_ready}"  == "1" ]] || readiness_failures+=("HTTP port ${CUBE_PROXY_HTTP_PORT} (override CUBE_PROXY_HTTP_PORT)")
+[[ "${https_ready}" == "1" ]] || readiness_failures+=("HTTPS port ${CUBE_PROXY_HTTPS_PORT} (override CUBE_PROXY_HTTPS_PORT)")
+[[ "${grpc_ready}"  == "1" ]] || readiness_failures+=("gRPC port ${CUBE_PROXY_GRPC_PORT} (override CUBE_PROXY_GRPC_PORT)")
+[[ "${admin_ready}" == "1" ]] || readiness_failures+=("admin port ${CUBE_PROXY_ADMIN_PORT} (override CUBE_PROXY_ADMIN_PORT)")
+if [[ ${#readiness_failures[@]} -gt 0 ]]; then
+  die "cube proxy did not become ready on: ${readiness_failures[*]} -- check 'docker logs ${CUBE_PROXY_CONTAINER_NAME}' for a bind() failure (the listen directives bind at nginx master startup, so an already-in-use port crash-loops the container)."
 fi
-die "cube proxy port ${CUBE_PROXY_HTTPS_PORT} (HTTPS) did not become ready"

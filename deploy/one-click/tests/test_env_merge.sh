@@ -216,6 +216,24 @@ EOF
     || fail "read_env_key should keep seeing plain scalar values"
 }
 
+test_remove_env_kv_drops_key() {
+  local env_file="${TMP_DIR}/remove-sentinel.env"
+
+  upsert_env_kv "${env_file}" "CUBE_EXTERNAL_REDIS_HOST" "10.0.0.1"
+  upsert_env_kv "${env_file}" "CUBE_EXTERNAL_REDIS_MASTER_NAME" "mymaster"
+  upsert_env_kv "${env_file}" "CUBE_PROXY_REDIS_MASTER_NAME" "mymaster"
+  remove_env_kv "${env_file}" "CUBE_EXTERNAL_REDIS_MASTER_NAME"
+  remove_env_kv "${env_file}" "CUBE_PROXY_REDIS_MASTER_NAME"
+
+  assert_value "${env_file}" CUBE_EXTERNAL_REDIS_HOST 10.0.0.1
+  if grep -q '^CUBE_EXTERNAL_REDIS_MASTER_NAME=' "${env_file}"; then
+    fail "CUBE_EXTERNAL_REDIS_MASTER_NAME should be removed"
+  fi
+  if grep -q '^CUBE_PROXY_REDIS_MASTER_NAME=' "${env_file}"; then
+    fail "CUBE_PROXY_REDIS_MASTER_NAME should be removed"
+  fi
+}
+
 test_keeps_old_only_host_keys() {
   local new="${TMP_DIR}/new6.example" old="${TMP_DIR}/old6.env"
   local out="${TMP_DIR}/out6.env" diff="${TMP_DIR}/diff6.txt"
@@ -344,6 +362,56 @@ EOF
   assert_contains "${diff}" "[explicit]"
 }
 
+# Contract boundary: the merge stays generic — a .env value that EQUALS the
+# env.example default is never an explicit override, for toggle keys too.
+# Toggle intent (flipping ONE_CLICK_ENABLE_S3LVOL back to 0 on upgrade) is
+# handled outside the merge by snapshot_one_click_toggles /
+# apply_one_click_toggles (see tests/test_toggle_inputs.sh), and the final
+# value is persisted by install.sh's upsert_env_kv.
+test_dotenv_default_valued_key_not_explicit() {
+  local new="${TMP_DIR}/new_s3lvol.example" old="${TMP_DIR}/old_s3lvol.env"
+  local dotenv="${TMP_DIR}/new_s3lvol.env"
+  local out="${TMP_DIR}/out_s3lvol.env" diff="${TMP_DIR}/diff_s3lvol.txt"
+  cat > "${new}" <<'EOF'
+ONE_CLICK_ENABLE_S3LVOL=0
+CUBE_SANDBOX_MYSQL_PORT=3306
+EOF
+  cat > "${old}" <<'EOF'
+ONE_CLICK_ENABLE_S3LVOL=1
+CUBE_SANDBOX_MYSQL_PORT=3307
+EOF
+  cat > "${dotenv}" <<'EOF'
+ONE_CLICK_ENABLE_S3LVOL=0
+CUBE_SANDBOX_MYSQL_PORT=3306
+EOF
+
+  merge_env_three_way "${new}" "${old}" "" "${dotenv}" "${out}" "${diff}" 2>/dev/null
+
+  # Both keys equal the new defaults, so the old runtime values are preserved
+  # (cp env.example .env regression guard).
+  assert_value "${out}" ONE_CLICK_ENABLE_S3LVOL 1
+  assert_value "${out}" CUBE_SANDBOX_MYSQL_PORT 3307
+  assert_contains "${diff}" "[preserved]"
+  assert_contains "${diff}" "= ONE_CLICK_ENABLE_S3LVOL=1"
+}
+
+test_absent_dotenv_preserves_s3lvol() {
+  local new="${TMP_DIR}/new_s3lvol2.example" old="${TMP_DIR}/old_s3lvol2.env"
+  local out="${TMP_DIR}/out_s3lvol2.env" diff="${TMP_DIR}/diff_s3lvol2.txt"
+  cat > "${new}" <<'EOF'
+ONE_CLICK_ENABLE_S3LVOL=0
+EOF
+  cat > "${old}" <<'EOF'
+ONE_CLICK_ENABLE_S3LVOL=1
+EOF
+
+  merge_env_three_way "${new}" "${old}" "" "" "${out}" "${diff}" 2>/dev/null
+
+  assert_value "${out}" ONE_CLICK_ENABLE_S3LVOL 1
+  assert_contains "${diff}" "[preserved]"
+  assert_contains "${diff}" "= ONE_CLICK_ENABLE_S3LVOL=1"
+}
+
 test_version_lt() {
   version_lt 1.0.0 2.0.0 || fail "1.0.0 < 2.0.0 should be true"
   version_lt v0.2.2 v0.2.3 || fail "v0.2.2 < v0.2.3 should be true"
@@ -436,6 +504,42 @@ EOF
   assert_contains "${diff}" "[dropped] obsolete keys removed on upgrade:"
   assert_not_contains "${diff}" "sk-agenthub-secret"
   # A non-obsolete custom key is still preserved verbatim.
+  assert_value "${out}" MY_CUSTOM_KEEP stays
+}
+
+test_drops_legacy_build_keys() {
+  local new="${TMP_DIR}/new_build.example" old="${TMP_DIR}/old_build.env"
+  local out="${TMP_DIR}/out_build.env" diff="${TMP_DIR}/diff_build.txt"
+  write_new_example "${new}"
+  # Old runtime env leaked build-machine knobs from the previously shared
+  # env.example. They must be dropped rather than kept as extra custom keys.
+  cat > "${old}" <<'EOF'
+CUBE_SANDBOX_MYSQL_PORT=3306
+ONE_CLICK_CUBEMASTER_BUILD_MODE=local
+ONE_CLICK_CUBELET_BUILD_MODE=local
+ONE_CLICK_CUBE_API_BUILD_MODE=local
+ONE_CLICK_CUBEMASTER_BIN=/tmp/cubemaster
+ONE_CLICK_TEMPLATECENTER_BIN=/tmp/templatecenter
+ENVD_LOCAL_PATH=/tmp/envd
+ONE_CLICK_WEB_DIST_DIR=/tmp/web/dist
+ONE_CLICK_MKCERT_BIN=/tmp/mkcert
+CUBE_BUILD_TIME=2026-01-01T00:00:00Z
+MY_CUSTOM_KEEP=stays
+EOF
+
+  merge_env_three_way "${new}" "${old}" "" "" "${out}" "${diff}" 2>/dev/null
+
+  for k in \
+    ONE_CLICK_CUBEMASTER_BUILD_MODE ONE_CLICK_CUBELET_BUILD_MODE \
+    ONE_CLICK_CUBE_API_BUILD_MODE ONE_CLICK_CUBEMASTER_BIN \
+    ONE_CLICK_TEMPLATECENTER_BIN \
+    ENVD_LOCAL_PATH ONE_CLICK_WEB_DIST_DIR ONE_CLICK_MKCERT_BIN \
+    CUBE_BUILD_TIME; do
+    if grep -q "^${k}=" "${out}"; then
+      fail "build-only key ${k} should have been dropped from ${out}"
+    fi
+  done
+  assert_contains "${diff}" "[dropped] obsolete keys removed on upgrade:"
   assert_value "${out}" MY_CUSTOM_KEEP stays
 }
 
@@ -596,6 +700,7 @@ test_preserves_shell_sensitive_values
 test_upsert_env_kv_preserves_shell_sensitive_values
 test_upsert_env_kv_quotes_shell_metachar_only_values
 test_upsert_env_kv_keeps_plain_scalars_readable
+test_remove_env_kv_drops_key
 test_keeps_old_only_host_keys
 test_preserves_comments_and_structure
 test_two_way_fallback_without_baseline
@@ -603,9 +708,12 @@ test_two_way_migrates_legacy_cube_proxy_cert_dir_default
 test_two_way_migrates_single_quoted_legacy_cube_proxy_cert_dir_default
 test_two_way_preserves_custom_cube_proxy_cert_dir
 test_new_dotenv_overrides_take_priority
+test_dotenv_default_valued_key_not_explicit
+test_absent_dotenv_preserves_s3lvol
 test_version_lt
 test_diff_report_redacts_secrets
 test_drops_obsolete_agenthub_keys
+test_drops_legacy_build_keys
 test_migrates_custom_cube_proxy_image_tag
 test_drops_default_cube_proxy_image_tag_without_migration
 test_keeps_existing_cube_sandbox_cube_proxy_image_over_legacy_tag

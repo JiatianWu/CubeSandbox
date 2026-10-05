@@ -7,7 +7,7 @@
 部署完成后，你将获得一个完整可用的 Cube Sandbox 实例：
 
 - E2B 兼容 REST API 监听在 `3000` 端口
-- CubeMaster、Cubelet、network-agent、CubeShim 作为宿主机进程运行
+- CubeMaster、Cubelet、CubeShim 作为宿主机进程运行；network runtime 已内置在 Cubelet 中
 - MySQL 和 Redis 通过 Docker Compose 管理
 - CubeProxy 提供 TLS（mkcert）和 CoreDNS 域名路由（`cube.app`）
 
@@ -48,6 +48,7 @@
 
 - 需要联网拉取 `mysql:8.0` 和 `redis:7-alpine` Docker 镜像。
 - `mkcert` 二进制文件已内置在发布包中，安装时若系统尚未安装 `mkcert`，会自动从包内复制到 `/usr/local/bin/mkcert`，无需联网下载。
+- S3 Volume 插件是内置 S3 客户端的静态 Go 二进制，打包时从 `examples/volume/s3` 编译。控制节点无需任何 S3 命令行工具；挂载 Volume 的节点仍需 `s3fs`。可用 `ONE_CLICK_VOLUME_S3_BIN` 指定预编译二进制。
 - CubeProxy 镜像构建使用 Alpine 和 PyPI 软件源（可配置）。
 
 ## 第一步：构建部署包
@@ -56,7 +57,26 @@
 
 ### 1.1 准备内核文件
 
-获取编译好的 `vmlinux` 内核文件（自行编译或使用预编译版本），放置到指定目录：
+将编译好的 `vmlinux` 内核文件放入指定目录，两种方式：
+
+**方式 A —— 下载预编译内核（推荐）**
+
+Guest 内核已发布在专属的 `kernel-release-*` Release 上，无需自行编译：
+
+```bash
+# 普通（裸金属/KVM）guest 内核 —— 按目标架构选择
+wget -O deploy/one-click/assets/kernel-artifacts/vmlinux \
+  "https://cnb.cool/CubeSandbox/CubeSandbox/-/releases/download/kernel-release-260812-1/vmlinux-amd64"
+# （aarch64 使用 vmlinux-arm64）
+
+# 若目标主机以 PVM 方式部署，另需下载 PVM guest 内核
+wget -O deploy/one-click/assets/kernel-artifacts/vmlinux-pvm \
+  "https://cnb.cool/CubeSandbox/CubeSandbox/-/releases/download/kernel-release-260812-1/vmlinux-pvm-amd64"
+```
+
+上面的 tag 仅为示例 —— 最新 tag、CNB 镜像及完整资产列表见[下载与 Release 说明](./downloads.md)。
+
+**方式 B —— 自行编译 `vmlinux`**
 
 ```bash
 cp /path/to/vmlinux deploy/one-click/assets/kernel-artifacts/
@@ -66,17 +86,18 @@ cp /path/to/vmlinux deploy/one-click/assets/kernel-artifacts/
 
 ### 1.2 执行构建
 
-在仓库根目录执行：
+如需覆盖构建选项，先复制构建环境模板，然后在仓库根目录执行：
 
 ```bash
-cd cube-sandbox
+cd CubeSandbox
+cp deploy/one-click/build.env.example deploy/one-click/build.env
 ./deploy/one-click/build-release-bundle-builder.sh
 ```
 
 该脚本会：
 
 1. 构建或复用 `cube-sandbox-builder` Docker 镜像
-2. 在 builder 容器内编译所有组件（CubeMaster、Cubelet、cube-api、network-agent、cube-agent、CubeShim、cube-runtime）
+2. 在 builder 容器内编译所有组件（CubeMaster、Cubelet、cube-api、cube-agent、CubeShim、cube-runtime）
 3. 在宿主机上构建 Guest VM 镜像
 4. 将所有产物打包为发布包
 
@@ -92,11 +113,12 @@ deploy/one-click/dist/cube-sandbox-one-click-<version>.tar.gz
 
 发布包包含：
 
-- 所有编译后的二进制文件（cubemaster、cubelet、cube-api、network-agent、containerd-shim-cube-rs、cube-runtime）
+- 所有编译后的二进制文件（cubemaster、cubelet、cube-api、containerd-shim-cube-rs、cube-runtime）
 - Guest VM 镜像（`cube-guest-image-cpu.img`）
 - 内核包（`cube-kernel-scf.zip`）
 - CubeProxy 和 CoreDNS 的 Docker Compose 模板
 - MySQL/Redis 的 Docker Compose 模板
+- S3 Volume 插件二进制（`{CubeMaster,Cubelet}/plugin/cube-volume-s3`），供 Volume 创建/销毁与挂载/卸载使用
 - 安装脚本（`install.sh`、`install-compute.sh`、`down.sh`、`smoke.sh`）
 - 环境变量模板（`env.example`）
 
@@ -143,7 +165,7 @@ sudo ./install.sh
 6. 通过 Docker Compose 启动 MySQL 和 Redis
 7. 构建并启动 CubeProxy 容器
 8. 启动 CoreDNS 容器，配置宿主机 DNS 路由（`cube.app`）
-9. 启动宿主机进程：network-agent、cubemaster、cube-api、cubelet
+9. 启动宿主机进程：cubemaster、cube-api、cubelet
 10. 执行健康检查（如 `ONE_CLICK_RUN_QUICKCHECK=1`）
 
 安装完成后，安装器会把 `cubemastercli` 和 `cubecli` 软链接到 `/usr/local/bin`。
@@ -231,11 +253,14 @@ with Sandbox.create(template=template_id) as sandbox:
 sudo ./down.sh
 ```
 
-该命令会停止所有宿主机进程（cubelet、cubemaster、cube-api、network-agent）、Docker 容器（CubeProxy、CoreDNS、MySQL、Redis），并回滚 `cube.app` 的 DNS 路由配置。
+该命令会停止所有宿主机进程（cubelet、cubemaster、cube-api）、Docker 容器（CubeProxy、CoreDNS、MySQL、Redis），并回滚 `cube.app` 的 DNS 路由配置。
 
-### 重新安装
+### 升级或重新安装
 
-直接再次运行 `install.sh` 即可。安装脚本会自动停止已有部署再进行安装。
+机器上已有 CubeSandbox 时，再次运行 `install.sh` 默认执行**保留配置的升级**，不会
+覆盖已有配置。交互式运行会先询问是否升级（默认升级，输入 `n` 则改为整机重装）；
+脚本、CI 等非交互运行会直接升级。要丢弃现有配置并整机重装，请显式加上
+`--mode=install`。
 
 ### 查看日志
 
@@ -252,9 +277,11 @@ sudo ./down.sh
 
 ## 配置参考
 
-所有配置通过 `.env` 文件管理。以下为完整参数说明。
+安装时配置通过从 `env.example` 复制的 `.env` 文件管理。构建时选项位于构建机上的 `build.env`（从 `build.env.example` 复制）。
 
 ### 构建时选项
+
+将 `deploy/one-click/build.env.example` 复制为 `deploy/one-click/build.env`，在其中设置覆盖项（也可在 shell 中 export）。
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
@@ -262,8 +289,8 @@ sudo ./down.sh
 | `ONE_CLICK_CUBEMASTER_BUILD_MODE` | `local` | CubeMaster 构建模式（`local` = 从源码编译） |
 | `ONE_CLICK_CUBELET_BUILD_MODE` | `local` | Cubelet 构建模式 |
 | `ONE_CLICK_CUBE_API_BUILD_MODE` | `local` | cube-api 构建模式 |
-| `ONE_CLICK_NETWORK_AGENT_BUILD_MODE` | `local` | network-agent 构建模式 |
 | `ONE_CLICK_CUBE_AGENT_BUILD_MODE` | `local` | cube-agent 构建模式 |
+| `ONE_CLICK_CUBE_INIT_BUILD_MODE` | `local` | cube-init 构建模式 |
 | `ONE_CLICK_CUBE_SHIM_BUILD_MODE` | `local` | CubeShim 构建模式 |
 | `ONE_CLICK_CUBE_KERNEL_VMLINUX` | `assets/kernel-artifacts/vmlinux` | vmlinux 内核文件路径 |
 
@@ -273,13 +300,26 @@ sudo ./down.sh
 |------|------|
 | `ONE_CLICK_CUBEMASTER_BIN` | 预编译 cubemaster 路径 |
 | `ONE_CLICK_CUBEMASTERCLI_BIN` | 预编译 cubemastercli 路径 |
+| `ONE_CLICK_TEMPLATECENTER_BIN` | 预编译 templatecenter 路径 |
 | `ONE_CLICK_CUBELET_BIN` | 预编译 cubelet 路径 |
 | `ONE_CLICK_CUBECLI_BIN` | 预编译 cubecli 路径 |
 | `ONE_CLICK_CUBE_API_BIN` | 预编译 cube-api 路径 |
-| `ONE_CLICK_NETWORK_AGENT_BIN` | 预编译 network-agent 路径 |
-| `ONE_CLICK_CUBE_AGENT_BIN` | 预编译 cube-agent 路径 |
+| `ONE_CLICK_CUBE_AGENT_BIN` | 预编译 cube-agent 路径（打入 cube-agent.ext4） |
+| `ONE_CLICK_CUBE_INIT_BIN` | 预编译 cube-init 路径（注入 guest `/sbin/init`） |
 | `ONE_CLICK_CUBESHIM_BIN` | 预编译 containerd-shim-cube-rs 路径 |
 | `ONE_CLICK_CUBE_RUNTIME_BIN` | 预编译 cube-runtime 路径 |
+| `ONE_CLICK_MKCERT_BIN` | 构建时自定义 mkcert 二进制路径（默认：内置 `assets/bin/mkcert`） |
+| `ONE_CLICK_VOLUME_S3_BUILD_MODE` | S3 Volume 插件的构建模式（默认 `local`） |
+| `ONE_CLICK_VOLUME_S3_BIN` | 覆盖为预编译的 `cube-volume-s3`；设置后打包阶段不再编译 |
+
+构建性能选项（均为可选）：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `ONE_CLICK_BUILD_JOBS` | auto | 组件构建并发轨道数上限。auto = CPU 核数与 可用内存/3GiB 取较小值（在容器中构建时，可用内存会考虑 cgroup 限制）。设为 `1` 表示完全串行构建，设为较大值可取消上限。 |
+| `ONE_CLICK_DISABLE_PIGZ` | 空 | 设为 `1` 时，打包使用可移植的单线程 `gzip` 而非 `pigz`（并行 gzip），适用于希望使用一致的单一压缩工具、而非 pigz 并行分块格式的场景。 |
+| `ONE_CLICK_SEQUENTIAL_WEB_BUILD` | 空 | 设为 `1` 时，串行构建 WebUI，而不与 Guest 镜像构建并行重叠。 |
+| `CUBE_BUILD_TIME` | HEAD 提交日期（UTC） | 嵌入二进制并记录到 `release-manifest.json` / `VERSION.txt` 的 `built_at` 的构建时间戳。默认取 HEAD 提交日期，使同一提交上的重复构建字节一致并复用增量缓存；可覆盖为字面时间戳（如 `2026-01-01T00:00:00Z`）以使用真实构建时钟。 |
 
 ### 目标机选项
 
@@ -287,7 +327,7 @@ sudo ./down.sh
 |------|--------|------|
 | `ONE_CLICK_DEPLOY_ROLE` | `control` | 部署角色：`control` 为单机部署（默认）。计算节点请参阅[多机集群部署](./multi-node-deploy.md) |
 | `ONE_CLICK_CONTROL_PLANE_IP` | 空 | 仅计算节点模式使用。详见[多机集群部署 — 配置环境变量](./multi-node-deploy.md#第二步配置环境变量) |
-| `ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR` | 空 | 仅计算节点模式使用。详见[多机集群部署 — 配置环境变量](./multi-node-deploy.md#第二步配置环境变量) |
+| `ONE_CLICK_CONTROL_PLANE_CUBEOPS_ADDR` | 空 | 仅计算节点模式使用。Cubelet 向 CubeOps注册，端口 3010。详见[多机集群部署 — 配置环境变量](./multi-node-deploy.md#第二步配置环境变量) |
 | `CUBE_SANDBOX_NODE_IP` | 自动从 `eth0` 探测 | 节点主网卡 IP 地址。未设置时自动探测；若网卡名称不同请显式指定。 |
 | `CUBE_SANDBOX_NETWORK_CIDR` | `192.168.0.0/18` | cubevs 本地网络 CIDR，用于沙箱 IP 分配。格式为 IPv4 CIDR（如 `10.100.0.0/18`），掩码范围 /16~/24。若与宿主机网卡、路由或 DNS 解析器地址冲突，安装前置检测会直接中止安装。未设置时使用固定默认值。 |
 | `CUBE_SANDBOX_NETWORK_CIDR_SKIP_CONFLICT_CHECK` | `0` | 设为 `1` 可跳过默认或自定义沙箱 CIDR 的冲突检测（不推荐）。 |
@@ -316,17 +356,17 @@ sudo ./down.sh
 | `CUBE_PROXY_ENABLE` | `1` | 启用 CubeProxy（一键部署必须为 `1`） |
 | `CUBE_PROXY_HTTPS_PORT` | `443` | CubeProxy HTTPS 监听端口 |
 | `CUBE_PROXY_HTTP_PORT` | `80` | CubeProxy HTTP 监听端口；systemd 启动后 TCP listener 检查跟随该端口 |
+| `CUBE_PROXY_GRPC_PORT` | `9090` | CubeProxy 明文 gRPC（HTTP/2）监听端口 |
+| `CUBE_EGRESS_ADMIN_PORT` | `9091` | CubeEgress 本机 admin API 端口（策略推送）；install.sh 会同步改写 Cubelet `cube_egress_admin_url` |
 | `CUBE_PROXY_DNS_ENABLE` | `1` | 启用 CoreDNS（一键部署必须为 `1`） |
 | `CUBE_PROXY_DNS_ANSWER_IP` | `${CUBE_SANDBOX_NODE_IP}` | CoreDNS 对 `cube.app` 返回的 IP |
 | `CUBE_PROXY_COREDNS_BIND_ADDR` | `127.0.0.54` | CoreDNS 绑定地址 |
-| `ONE_CLICK_MKCERT_BIN` | `assets/bin/mkcert`（内置） | 构建时自定义 mkcert 二进制路径 |
 
 ### 进程监听地址
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `CUBEMASTER_ADDR` | `127.0.0.1:8089` | CubeMaster 监听地址 |
-| `NETWORK_AGENT_HEALTH_ADDR` | `127.0.0.1:19090` | network-agent 健康检查端点 |
 | `CUBE_API_BIND` | `0.0.0.0:3000` | cube-api 监听地址 |
 | `CUBE_API_HEALTH_ADDR` | `127.0.0.1:3000` | cube-api 健康检查地址 |
 | `CUBE_API_SANDBOX_DOMAIN` | `cube.app` | 沙箱域名，用于 CubeProxy 路由 |
@@ -354,9 +394,6 @@ sudo ./down.sh
 │   ├── bin/cubecli                   # 命令行工具
 │   ├── config/                       # Cubelet 配置
 │   └── dynamicconf/                  # 动态配置
-├── network-agent/
-│   ├── bin/network-agent             # 网络编排服务
-│   └── network-agent.yaml            # 配置文件
 ├── cube-shim/bin/
 │   ├── containerd-shim-cube-rs       # containerd shim
 │   └── cube-runtime                  # 运行时

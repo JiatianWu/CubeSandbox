@@ -11,10 +11,11 @@ export {
   type PauseOptions,
   type ListSnapshotsOptions,
   type NetworkOptions,
+  type UpdateNetworkOptions,
   type LifecycleOptions,
 } from "./sandbox.js";
 
-export { Config, resolveConfig, type ConfigOptions } from "./config.js";
+export { Config, resolveConfig, NEVER_TIMEOUT, type ConfigOptions } from "./config.js";
 
 export {
   Execution,
@@ -33,7 +34,17 @@ export {
   ApiError,
   FilesystemNotFoundError,
   PartialWriteError,
+  VolumeNotFoundError,
+  VolumeInUseError,
 } from "./exceptions.js";
+
+export {
+  Volume,
+  VolumeInfo,
+  VolumeMount,
+  MAX_VOLUME_NAME_LEN,
+  type VolumeMountsArg,
+} from "./volume.js";
 
 export {
   Commands,

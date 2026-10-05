@@ -88,7 +88,7 @@ eBPF-based kernel-space network data plane. Three BPF programs attached at strat
 - **LPM-trie network policy** enforcement at line rate.
 - **ARP proxy** for point-to-point TAP links.
 
-See [Network Architecture](./network.md) for the deep dive.
+See [CubeVS Network Model](./network.md) for the deep dive.
 
 ### CubeCoW (Storage Engine)
 
@@ -190,9 +190,10 @@ Security is enforced at multiple levels:
 
 ## Next Steps
 
-- [Network Architecture](./network.md) — deep dive into CubeVS, traffic flows, session tracking, and the policy engine.
+- [CubeVS Network Model](./network.md) — deep dive into CubeVS, traffic flows, session tracking, and the policy engine.
 - [Sandbox Lifecycle](../guide/lifecycle.md) — state model, auto-pause, and auto-resume.
 - [Snapshot, Rollback & Clone](../guide/snapshot-rollback-clone.md) — CubeCoW-powered advanced APIs.
+- [Cross-Node Snapshots](../guide/cross-node-snapshot.md) — S3 Pause / Resume / FromSnap on another node.
 - [Security Proxy](../guide/security-proxy.md) — CubeEgress domain filtering and credential injection.
 - [Performance Benchmark](../guide/performance-benchmark.md) — cold-start, snapshot, and density numbers.
 - [Templates Overview](../guide/templates.md) — the three-step template lifecycle.

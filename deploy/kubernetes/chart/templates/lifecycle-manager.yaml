@@ -1,5 +1,9 @@
 {{- if eq (include "cube.lifecycleManagerEnabled" .) "true" }}
-{{- $redisHost := default (include "cube.redisHost" .) .Values.lifecycleManager.redis.host -}}
+{{- $redisSentinel := eq (include "cube.redisSentinelEnabled" .) "true" -}}
+{{- $redisHost := "" -}}
+{{- if not $redisSentinel -}}
+{{- $redisHost = default (include "cube.redisHost" .) .Values.lifecycleManager.redis.host -}}
+{{- end -}}
 {{- $redisPort := default .Values.redis.port .Values.lifecycleManager.redis.port -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -30,6 +34,16 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- include "cube.controlPlanePlacement" . | nindent 6 }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: {{ .Release.Name }}
+                    app.kubernetes.io/component: lifecycle-manager
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: cube-lifecycle-manager
           image: {{ include "cube.cubeImage" (dict "image" .Values.images.lifecycleManager "context" $) | quote }}
@@ -37,14 +51,23 @@ spec:
           env:
             {{- include "cube.timezoneEnv" . | nindent 12 }}
             - name: CUBE_LCM_REDIS_ADDR
-              value: {{ printf "%s:%v" $redisHost $redisPort | quote }}
+              value: {{ if $redisSentinel }}{{ "" | quote }}{{ else }}{{ printf "%s:%v" $redisHost $redisPort | quote }}{{ end }}
             - name: CUBE_LCM_REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "cube.secretName" . }}
                   key: redis-password
             - name: CUBE_LCM_REDIS_DB
-              value: {{ .Values.lifecycleManager.redis.db | quote }}
+              value: {{ include "cube.redisDB" . | quote }}
+            - name: CUBE_LCM_REDIS_MASTER_NAME
+              value: {{ .Values.redis.masterName | default "" | quote }}
+            - name: CUBE_LCM_REDIS_SENTINEL_NODES
+              value: {{ .Values.redis.sentinelNodes | default "" | quote }}
+            - name: CUBE_LCM_REDIS_SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cube.secretName" . }}
+                  key: redis-sentinel-password
             - name: CUBE_LCM_CUBEMASTER_URL
               value: {{ printf "http://%s" (include "cube.masterEndpoint" .) | quote }}
             - name: CUBE_LCM_LISTEN_ADDR
@@ -63,6 +86,16 @@ spec:
               value: {{ .Values.lifecycleManager.bootstrapWarmup | quote }}
             - name: CUBE_LCM_STATE_LOCK_TTL
               value: {{ .Values.lifecycleManager.stateLockTTL | quote }}
+            - name: CUBE_LCM_EVENTBUS_ENABLED
+              value: {{ .Values.lifecycleManager.eventBusEnabled | quote }}
+            - name: CUBE_LCM_LEADER_ELECTION_ENABLED
+              value: {{ .Values.lifecycleManager.leaderElection.enabled | quote }}
+            - name: CUBE_LCM_LEADER_LEASE_TTL
+              value: {{ .Values.lifecycleManager.leaderElection.leaseTTL | quote }}
+            - name: CUBE_LCM_LEADER_RENEW_INTERVAL
+              value: {{ .Values.lifecycleManager.leaderElection.renewInterval | quote }}
+            - name: CUBE_LCM_LEADER_RETRY_INTERVAL
+              value: {{ .Values.lifecycleManager.leaderElection.retryInterval | quote }}
             - name: CUBE_LCM_ADMIN_TOKEN
               valueFrom:
                 secretKeyRef:

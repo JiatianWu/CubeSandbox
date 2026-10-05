@@ -1,6 +1,6 @@
 -- admin_phase.lua
 --
--- Admin endpoints called by cube-lifecycle-manager (CLM) to drive the
+-- Admin endpoints called by Cube Lifecycle Manager (CLM) to drive the
 -- auto-pause / auto-resume coordination dicts on this CubeProxy replica.
 -- See nginx.conf admin server block for routing.
 --
@@ -13,6 +13,7 @@
 -- {"error": "..."} body.
 
 local cjson = require "cjson.safe"
+local backend_cache = require "backend_cache"
 
 local META  = ngx.shared.cube_sandbox_meta
 local STATE = ngx.shared.cube_sandbox_state
@@ -105,14 +106,34 @@ local function handle_meta_delete()
     local sid, e2 = require_string(obj, "sandbox_id")
     if not sid then return reply_error(ngx.HTTP_BAD_REQUEST, e2) end
 
+    -- Invalidate fixed route metadata so the next data-plane request reloads
+    -- the sandbox route from Redis.
+    local deleted = backend_cache.invalidate_sandbox(sid)
     META:delete(sid)
     STATE:delete(sid)
     LAST:delete(sid)
-    return reply(ngx.HTTP_OK, { ok = true })
+    return reply(ngx.HTTP_OK, { ok = true, backend_cache_deleted = deleted })
+end
+
+-- POST /admin/backend_cache/delete
+--   body: {"sandbox_id": "..."}
+--   semantics: invalidate fixed ngx.shared.local_cache route metadata for this
+--              sandbox without scanning dynamic per-port entries.
+--              Used by CubeMaster after Resume rewrites Redis SandboxIP/ports.
+local function handle_backend_cache_delete()
+    local obj, err = read_json_body()
+    if not obj then return reply_error(ngx.HTTP_BAD_REQUEST, err) end
+    local sid, e2 = require_string(obj, "sandbox_id")
+    if not sid then return reply_error(ngx.HTTP_BAD_REQUEST, e2) end
+
+    local deleted = backend_cache.invalidate_sandbox(sid)
+    return reply(ngx.HTTP_OK, { ok = true, deleted = deleted })
 end
 
 -- POST /admin/state
---   body: {"sandbox_id": "...", "state": "running|pausing|paused"}
+--   body: {"sandbox_id": "...", "state": "running|pausing|paused|killing|killed"}
+--   CLM's sweeper pushes "killing" before the timeout-kill RPC; the Lua gate
+--   maps killing/killed to 410 Gone so in-flight requests fail fast.
 local function handle_state()
     local obj, err = read_json_body()
     if not obj then return reply_error(ngx.HTTP_BAD_REQUEST, err) end
@@ -120,9 +141,10 @@ local function handle_state()
     if not sid then return reply_error(ngx.HTTP_BAD_REQUEST, e2) end
     local st, e3 = require_string(obj, "state")
     if not st then return reply_error(ngx.HTTP_BAD_REQUEST, e3) end
-    if st ~= "running" and st ~= "pausing" and st ~= "paused" then
+    if st ~= "running" and st ~= "pausing" and st ~= "paused"
+        and st ~= "killing" and st ~= "killed" then
         return reply_error(ngx.HTTP_BAD_REQUEST,
-            "state must be one of running|pausing|paused")
+            "state must be one of running|pausing|paused|killing|killed")
     end
 
     local ok, set_err, forcible = STATE:set(sid, st)
@@ -203,6 +225,8 @@ local function dispatch()
         return handle_meta_upsert()
     elseif uri == "/admin/meta/delete" and method == "POST" then
         return handle_meta_delete()
+    elseif uri == "/admin/backend_cache/delete" and method == "POST" then
+        return handle_backend_cache_delete()
     elseif uri == "/admin/state" and method == "POST" then
         return handle_state()
     elseif uri == "/admin/last_active" and method == "GET" then

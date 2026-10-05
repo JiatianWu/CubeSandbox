@@ -11,11 +11,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/virtiofs"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 func TestSortRestoreVirtioMountsParentBeforeChild(t *testing.T) {
@@ -301,6 +301,61 @@ func TestGenerateRestoreVirtiofsOptOrdersParentBeforeNestedChildForAllAccessMode
 					{VirtiofsSource: tt.childSource, Destination: "/workspace/team-share/members/agent-a"},
 				}, mounts)
 			}
+		})
+	}
+}
+
+func TestGenerateRestoreVirtiofsOptSkipsGuestMountRestore(t *testing.T) {
+	t.Parallel()
+
+	storageInfo := &storage.StorageInfo{
+		HostDirBackendInfos: map[string]*storage.HostDirBackendInfo{
+			"writable": {
+				VolumeName: "writable",
+				BindPath:   "/data/cubelet/hostdir/sandbox/writable",
+				ShareDir:   "/data/cube-shared",
+			},
+		},
+	}
+	containerReq := &cubebox.ContainerConfig{
+		VolumeMounts: []*cubebox.VolumeMounts{
+			{Name: "writable", ContainerPath: "/mnt/data"},
+		},
+	}
+	cases := []struct {
+		name        string
+		annotations map[string]string
+	}{
+		{
+			name: "pause resume",
+			annotations: map[string]string{
+				constants.MasterAnnotationPauseSnapshotID:   "snap-pause1",
+				constants.MasterAnnotationRuntimeSnapshotID: "snap-pause1",
+			},
+		},
+		{
+			name: "fromsnap",
+			annotations: map[string]string{
+				constants.MasterAnnotationRuntimeSnapshotID: "snap-runtime1",
+			},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			flowOpts := &workflow.CreateContext{
+				ReqInfo:     &cubebox.RunCubeSandboxRequest{Annotations: tt.annotations},
+				StorageInfo: storageInfo,
+			}
+			specOpts, err := generateRestoreVirtiofsOpt(context.Background(), flowOpts, containerReq)
+			require.NoError(t, err)
+			require.Empty(t, specOpts)
+
+			sandboxOpts, err := generateSandboxVirtiofsOpt(context.Background(), flowOpts, false)
+			require.NoError(t, err)
+			spec := applySpecOpts(t, context.Background(), sandboxOpts)
+			require.NotEmpty(t, spec.Annotations[constants.AnnotationVirtiofs])
+			require.Contains(t, spec.Annotations[constants.AnnotationVirtiofs], `"remap_filter":true`)
 		})
 	}
 }

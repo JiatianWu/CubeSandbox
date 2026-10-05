@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"time"
+
+	"github.com/google/uuid"
+	cubelog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 // CMError carries a CubeMaster business error (non-zero ret_code) out of
@@ -90,21 +92,6 @@ func New(baseURL string) *Client {
 	}
 }
 
-// GetNodes fetches cluster node information from CubeMaster.
-func (c *Client) GetNodes(ctx context.Context) (json.RawMessage, error) {
-	return c.get(ctx, "/internal/meta/nodes")
-}
-
-// ClusterOverview fetches cluster overview from CubeMaster.
-func (c *Client) ClusterOverview(ctx context.Context) (json.RawMessage, error) {
-	return c.get(ctx, "/internal/meta/cluster/overview")
-}
-
-// ClusterVersions fetches version information from CubeMaster.
-func (c *Client) ClusterVersions(ctx context.Context) (json.RawMessage, error) {
-	return c.get(ctx, "/internal/meta/version-matrix")
-}
-
 // GetSandbox fetches sandbox detail from CubeMaster.
 //
 // sandboxID and instanceType are passed via query parameters using net/url
@@ -117,15 +104,6 @@ func (c *Client) GetSandbox(ctx context.Context, sandboxID, instanceType string)
 		"sandbox_id":    sandboxID,
 		"instance_type": instanceType,
 	})
-}
-
-// GetNode fetches a single node's detail from CubeMaster.
-//
-// nodeID is appended to the path; values.QueryEscape handles any character
-// that would otherwise be reserved in the URL path.
-func (c *Client) GetNode(ctx context.Context, nodeID string) (json.RawMessage, error) {
-	escaped := url.PathEscape(nodeID)
-	return c.get(ctx, fmt.Sprintf("/internal/meta/nodes/%s", escaped))
 }
 
 // ListSandboxes fetches the sandbox list from CubeMaster.
@@ -158,10 +136,7 @@ func (c *Client) GetTemplate(ctx context.Context, templateID string) (json.RawMe
 
 // DeleteSnapshot deletes a snapshot via CubeMaster.
 func (c *Client) DeleteSnapshot(ctx context.Context, snapshotID string) (json.RawMessage, error) {
-	body := map[string]interface{}{
-		"request_id": fmt.Sprintf("cubeops-del-snap-%d", time.Now().UnixNano()),
-	}
-	return c.deleteWithBody(ctx, fmt.Sprintf("/cube/snapshot/%s", snapshotID), body)
+	return c.deleteWithBody(ctx, fmt.Sprintf("/cube/snapshot/%s", snapshotID), map[string]interface{}{})
 }
 
 // RollbackSandbox rolls back a sandbox to a snapshot via CubeMaster.
@@ -177,7 +152,6 @@ func (c *Client) UpdateSandbox(ctx context.Context, body interface{}) (json.RawM
 // ConnectSandbox resumes a paused sandbox via CubeMaster (POST /cube/sandbox/connect).
 func (c *Client) ConnectSandbox(ctx context.Context, sandboxID string, timeout int) (json.RawMessage, error) {
 	return c.post(ctx, "/cube/sandbox/connect", map[string]interface{}{
-		"request_id":    fmt.Sprintf("req-%d", time.Now().UnixNano()),
 		"sandbox_id":    sandboxID,
 		"instance_type": "cubebox",
 		"timeout":       timeout,
@@ -263,6 +237,49 @@ func (c *Client) AdoptTemplateCompatBaseline(ctx context.Context, body interface
 	return c.post(ctx, "/cube/template/compat", body)
 }
 
+// RequestIDFromContext returns the inbound trace RequestID, or a fresh UUID
+// when none is set. Outbound bodies reuse it for cross-service correlation.
+func RequestIDFromContext(ctx context.Context) string {
+	if rt := cubelog.GetTraceInfo(ctx); rt != nil && rt.RequestID != "" {
+		return rt.RequestID
+	}
+	return uuid.NewString()
+}
+
+// EnsureRequestID writes requestID/RequestID/request_id into body, returns the
+// id used. All three spellings are written because CubeMaster binds a different
+// one per endpoint; unknown keys are ignored on decode. Non-map bodies —
+// including a typed-nil map, which escapes the `body == nil` check and would
+// panic on assignment — are a no-op.
+func EnsureRequestID(ctx context.Context, body interface{}) string {
+	rid := RequestIDFromContext(ctx)
+	if body == nil || rid == "" {
+		return rid
+	}
+	m, ok := body.(map[string]interface{})
+	if !ok || m == nil {
+		return rid
+	}
+	m["requestID"] = rid
+	m["RequestID"] = rid
+	m["request_id"] = rid
+	return rid
+}
+
+// EnsureRequestIDQuery injects the inbound trace RequestID into query params
+// and returns the id that was used (see EnsureRequestID).
+//
+// Both `requestID` and `request_id` are written because CubeMaster binds a
+// different one per endpoint; PascalCase `RequestID` is not read from query.
+func EnsureRequestIDQuery(ctx context.Context, params map[string]string) string {
+	rid := RequestIDFromContext(ctx)
+	if params != nil {
+		params["requestID"] = rid
+		params["request_id"] = rid
+	}
+	return rid
+}
+
 // --- internal helpers ---
 
 func (c *Client) get(ctx context.Context, path string) (json.RawMessage, error) {
@@ -270,6 +287,13 @@ func (c *Client) get(ctx context.Context, path string) (json.RawMessage, error) 
 	if err != nil {
 		return nil, err
 	}
+	rid := RequestIDFromContext(ctx)
+	setTraceHeaders(req, rid)
+	// Inject RequestID into query params for cross-service trace correlation.
+	q := req.URL.Query()
+	q.Set("requestID", rid)
+	q.Set("request_id", rid)
+	req.URL.RawQuery = q.Encode()
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -283,6 +307,7 @@ func (c *Client) getWithQuery(ctx context.Context, path string, params map[strin
 	if err != nil {
 		return nil, err
 	}
+	rid := EnsureRequestIDQuery(ctx, params)
 	q := req.URL.Query()
 	for k, v := range params {
 		if v != "" {
@@ -290,6 +315,7 @@ func (c *Client) getWithQuery(ctx context.Context, path string, params map[strin
 		}
 	}
 	req.URL.RawQuery = q.Encode()
+	setTraceHeaders(req, rid)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -299,6 +325,7 @@ func (c *Client) getWithQuery(ctx context.Context, path string, params map[strin
 }
 
 func (c *Client) post(ctx context.Context, path string, body interface{}) (json.RawMessage, error) {
+	rid := EnsureRequestID(ctx, body)
 	var bodyReader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -314,6 +341,7 @@ func (c *Client) post(ctx context.Context, path string, body interface{}) (json.
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	setTraceHeaders(req, rid)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -327,6 +355,7 @@ func (c *Client) delete(ctx context.Context, path string) (json.RawMessage, erro
 	if err != nil {
 		return nil, err
 	}
+	setTraceHeaders(req, RequestIDFromContext(ctx))
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -336,6 +365,7 @@ func (c *Client) delete(ctx context.Context, path string) (json.RawMessage, erro
 }
 
 func (c *Client) deleteWithBody(ctx context.Context, path string, body interface{}) (json.RawMessage, error) {
+	rid := EnsureRequestID(ctx, body)
 	var bodyReader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -351,6 +381,7 @@ func (c *Client) deleteWithBody(ctx context.Context, path string, body interface
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	setTraceHeaders(req, rid)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -388,4 +419,55 @@ func trimTrailingSlash(s string) string {
 		s = s[:len(s)-1]
 	}
 	return s
+}
+
+func setTraceHeaders(req *http.Request, rid string) {
+	// CubeOps is the caller here; the inbound client identity stays in our stat
+	// log. CubeMaster uses X-Caller for logging, sandbox caller label and gRPC
+	// pool keying only — not authn/authz or quotas.
+	req.Header.Set("X-Caller", "cubeops")
+	// rid is passed in, not re-derived from req.Context(), so the header matches
+	// the body/query id.
+	if rid != "" {
+		req.Header.Set("X-RequestID", rid)
+	}
+}
+
+// CountNodeSandboxes returns how many sandboxes CubeMaster reports on hostID.
+// Uses /cube/sandbox/inventory which surfaces cubelet list failures as a
+// non-success ret_code (fail-closed) — see service.ErrSandboxCheckFailed.
+func (c *Client) CountNodeSandboxes(ctx context.Context, hostID string) (int, error) {
+	if hostID == "" {
+		return 0, errors.New("CountNodeSandboxes: host_id is required")
+	}
+	raw, err := c.getWithQuery(ctx, "/cube/sandbox/inventory", map[string]string{
+		"host_id":   hostID,
+		"start_idx": "1",
+		"size":      "1",
+	})
+	if err != nil {
+		return 0, err
+	}
+	var env struct {
+		Ret struct {
+			RetCode int    `json:"ret_code"`
+			RetMsg  string `json:"ret_msg"`
+		} `json:"ret"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return 0, fmt.Errorf("count node sandboxes: unmarshal envelope: %w", err)
+	}
+	if env.Ret.RetCode != 0 && env.Ret.RetCode != 200 {
+		return 0, &CMError{RetCode: env.Ret.RetCode, RetMsg: env.Ret.RetMsg}
+	}
+	trimmed := bytes.TrimSpace(env.Data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return 0, errors.New("count node sandboxes: data missing or null (cubelet may be unreachable)")
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(env.Data, &items); err != nil {
+		return 0, fmt.Errorf("count node sandboxes: unexpected data shape: %s", string(env.Data))
+	}
+	return len(items), nil
 }

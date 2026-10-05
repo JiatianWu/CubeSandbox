@@ -16,14 +16,14 @@ import (
 
 	"github.com/containerd/containerd/v2/pkg/oci"
 	jsoniter "github.com/json-iterator/go"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/virtiofs"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/ret"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
 func generateSandboxVirtiofsOpt(ctx context.Context, flowOpts *workflow.CreateContext, coldStart bool) ([]oci.SpecOpts, error) {
@@ -60,6 +60,7 @@ func generateSandboxVirtiofsOpt(ctx context.Context, flowOpts *workflow.CreateCo
 				AllowedDirs: v.bindPaths,
 				ReadOnly:    k.readOnly,
 				Cache:       constants.VirtiofsCacheNone,
+				RemapFilter: flowOpts.IsGuestMountRestore(),
 			},
 		}
 		if k.readOnly {
@@ -97,6 +98,14 @@ func generateSandboxVirtiofsOpt(ctx context.Context, flowOpts *workflow.CreateCo
 
 func generateRestoreVirtiofsOpt(ctx context.Context, flowOpts *workflow.CreateContext, containerReq *cubebox.ContainerConfig) ([]oci.SpecOpts, error) {
 	var specOpts []oci.SpecOpts
+	// Pause / FromSnap: container /mnt/* binds are already in guest memory.
+	// Re-emitting exec.mounts would re-enter do_exec_mount and fail (ENOENT on
+	// /.container_rw/... or EBUSY on virtio_rw). Create-from-template still
+	// needs these annotations for newly attached volumes.
+	if flowOpts != nil && flowOpts.IsGuestMountRestore() {
+		log.G(ctx).Infof("[hostdir] memory restore: skip propagation exec.mount / umount annotations")
+		return specOpts, nil
+	}
 	if flowOpts.StorageInfo == nil {
 		return specOpts, nil
 	}

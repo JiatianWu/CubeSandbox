@@ -44,14 +44,13 @@ Cube Sandbox provides a Docker-based builder image for a consistent build enviro
 # Build the builder image
 make builder-image
 
-# From mainland China, fetch the llvm.sh installer and clang-14 apt packages from
-# a China mirror (the LLVM GPG key still comes from apt.llvm.org)
+# From mainland China, source apt packages from China-reachable mirrors
 make builder-image MIRROR=cn
 
 # Start an interactive shell inside the builder
 make builder-shell
 
-# Build all Go components (CubeMaster, Cubelet, network-agent)
+# Build all Go components (CubeMaster, Cubelet, …)
 make all
 
 # Build individual components
@@ -59,6 +58,9 @@ make cubemaster
 make cubelet
 make agent
 make shim
+
+# Remove local Go/Rust build artifacts (not global caches)
+make clean
 ```
 
 See the [Makefile](./Makefile) for the full list of build targets.
@@ -75,14 +77,13 @@ See the [Makefile](./Makefile) for the full list of build targets.
 | `agent/` | Rust | In-guest daemon running inside each sandbox |
 | `hypervisor/` | Rust | KVM-based MicroVM manager (Cloud Hypervisor fork) |
 | `mvs/` / `CubeNet/` | Go | CubeVS eBPF-based network isolation |
-| `network-agent/` | Go | Network management service |
 | `deploy/` | Shell | Deployment scripts and guest image tooling |
 | `examples/` | Python | SDK examples and end-to-end scenarios |
 | `docs/` | Markdown | VitePress documentation site (EN + ZH) |
 
 ## Submitting a Pull Request
 
-1. **Fork** the repository and create a feature branch from `main`.
+1. **Fork** the repository and create a feature branch from `master`.
 2. **Make your changes** — keep commits focused and atomic.
 3. **Test** — make sure existing tests and linters still pass.
 4. **Add tests** — add focused test coverage when behavior changes.

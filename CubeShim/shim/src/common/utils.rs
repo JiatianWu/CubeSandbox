@@ -227,9 +227,44 @@ impl Utils {
             .map_err(|e| format!("open file {} failed:{}", IMAGE_VERSION, e))?;
 
         let mut version = String::new();
-
         file.read_to_string(&mut version)
             .map_err(|e| format!("read file {} failed:{}", IMAGE_VERSION, e))?;
+        Ok(version.trim().to_string())
+    }
+
+    /// Read version file next to the OS image plane file
+    /// (`…/cube-image/cube-guest-image-cpu.img` → `…/cube-image/version`).
+    pub fn get_image_version_for_path(image_path: &str) -> CResult<String> {
+        let image = PathBuf::from(image_path);
+        let img_version = image
+            .parent()
+            .map(|p| p.join("version"))
+            .ok_or_else(|| format!("invalid os image path (no parent): {}", image_path))?;
+
+        let mut file = File::open(img_version.clone())
+            .map_err(|e| format!("open file {:?} failed:{}", img_version.clone(), e))?;
+
+        let mut version = String::new();
+        file.read_to_string(&mut version)
+            .map_err(|e| format!("read file {:?} failed:{}", img_version, e))?;
+        Ok(version.trim().to_string())
+    }
+
+    /// Read version file next to cube-agent.ext4
+    /// (`…/cube-agent/cube-agent.ext4` → `…/cube-agent/version`).
+    pub fn get_agent_version(agent_path: &str) -> CResult<String> {
+        let agent = PathBuf::from(agent_path);
+        let ver_path = agent
+            .parent()
+            .map(|p| p.join("version"))
+            .ok_or_else(|| format!("invalid agent path (no parent): {}", agent_path))?;
+
+        let mut file = File::open(ver_path.clone())
+            .map_err(|e| format!("open file {:?} failed:{}", ver_path.clone(), e))?;
+
+        let mut version = String::new();
+        file.read_to_string(&mut version)
+            .map_err(|e| format!("read file {:?} failed:{}", ver_path, e))?;
         Ok(version.trim().to_string())
     }
 
@@ -306,6 +341,12 @@ impl Utils {
             Err(e) => Err(format!("resolve ivshmem path failed:{}", e)),
         };
 
+        // Regular-sandbox host logs. Template builds write under
+        // /data/log/template and never create this dir, so this is a no-op
+        // for app_snapshot_create. Task.Delete on a live shim is not enough:
+        // after a crash containerd reaps via the delete subcommand.
+        let ret_logdir = crate::container::remove_sandbox_log_dir_sync(sandbox_id);
+
         let mut err_msg = String::new();
         if let Err(e) = ret_vmdir {
             err_msg = err_msg + e.as_str();
@@ -316,6 +357,10 @@ impl Utils {
         }
 
         if let Err(e) = ret_ivshmem {
+            err_msg = err_msg + e.as_str();
+        }
+
+        if let Err(e) = ret_logdir {
             err_msg = err_msg + e.as_str();
         }
 

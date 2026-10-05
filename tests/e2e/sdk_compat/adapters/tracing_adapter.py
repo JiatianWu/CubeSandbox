@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from adapters.base import SandboxAdapter
@@ -80,28 +81,113 @@ class TracingSandboxAdapter(SandboxAdapter):
             output=_content_summary,
         )
 
-    def run_code(self, code: str, *, timeout: int = 60) -> CodeResult:
+    def list_files(self, path: str) -> list[dict[str, Any]]:
+        return self._trace.capture(
+            "list_files",
+            {"backend": self.backend, "sandbox_id": self.sandbox_id, "path": path},
+            lambda: self._wrapped.list_files(path),
+        )
+
+    def stat_file(self, path: str) -> dict[str, Any]:
+        return self._trace.capture(
+            "stat_file",
+            {"backend": self.backend, "sandbox_id": self.sandbox_id, "path": path},
+            lambda: self._wrapped.stat_file(path),
+        )
+
+    def file_exists(self, path: str) -> bool:
+        return self._trace.capture(
+            "file_exists",
+            {"backend": self.backend, "sandbox_id": self.sandbox_id, "path": path},
+            lambda: self._wrapped.file_exists(path),
+        )
+
+    def remove_file(self, path: str) -> None:
+        return self._trace.capture(
+            "remove_file",
+            {"backend": self.backend, "sandbox_id": self.sandbox_id, "path": path},
+            lambda: self._wrapped.remove_file(path),
+        )
+
+    def rename_file(self, old_path: str, new_path: str) -> dict[str, Any]:
+        return self._trace.capture(
+            "rename_file",
+            {
+                "backend": self.backend,
+                "sandbox_id": self.sandbox_id,
+                "old_path": old_path,
+                "new_path": new_path,
+            },
+            lambda: self._wrapped.rename_file(old_path, new_path),
+        )
+
+    def make_dir(self, path: str) -> None:
+        return self._trace.capture(
+            "make_dir",
+            {"backend": self.backend, "sandbox_id": self.sandbox_id, "path": path},
+            lambda: self._wrapped.make_dir(path),
+        )
+
+    def write_files(self, files: list[tuple[str, str | bytes]]) -> int:
+        return self._trace.capture(
+            "write_files",
+            {
+                "backend": self.backend,
+                "sandbox_id": self.sandbox_id,
+                "files": [
+                    {"path": path, **_content_summary(content)}
+                    for path, content in files
+                ],
+            },
+            lambda: self._wrapped.write_files(files),
+            output=lambda written: {"written": written},
+        )
+
+    def watch_dir_events(
+        self,
+        path: str,
+        operation: Callable[[], None],
+        *,
+        timeout: float = 5,
+        until: Callable[[list[dict[str, str]]], bool] | None = None,
+    ) -> list[dict[str, str]]:
+        return self._trace.capture(
+            "watch_dir_events",
+            {
+                "backend": self.backend,
+                "sandbox_id": self.sandbox_id,
+                "path": path,
+                "timeout": timeout,
+            },
+            lambda: self._wrapped.watch_dir_events(
+                path,
+                operation,
+                timeout=timeout,
+                until=until,
+            ),
+        )
+
+    def run_code(
+        self,
+        code: str,
+        *,
+        env_vars: dict[str, str] | None = None,
+        timeout: int = 60,
+    ) -> CodeResult:
         return self._trace.capture(
             "run_code",
             {
                 "backend": self.backend,
                 "sandbox_id": self.sandbox_id,
                 "code": code,
+                "env_vars": env_vars,
                 "timeout": timeout,
             },
-            lambda: self._wrapped.run_code(code, timeout=timeout),
-        )
-
-    def get_host(self, port: int) -> str:
-        return self._trace.capture(
-            "get_host",
-            {
-                "backend": self.backend,
-                "sandbox_id": self.sandbox_id,
-                "port": port,
-            },
-            lambda: self._wrapped.get_host(port),
-            output=lambda host: {"host": host},
+            lambda: self._wrapped.run_code(
+                code,
+                env_vars=env_vars,
+                timeout=timeout,
+            ),
         )
 
     def pause(self, *, timeout: int = 60) -> None:
@@ -129,6 +215,83 @@ class TracingSandboxAdapter(SandboxAdapter):
         )
         return wrap_adapter(resumed, self._trace)
 
+    def resume_idle_timeout(self, timeout: int | None) -> SandboxAdapter:
+        resumed = self._trace.capture(
+            "resume_idle_timeout",
+            {
+                "backend": self.backend,
+                "sandbox_id": self.sandbox_id,
+                "timeout": timeout,
+            },
+            lambda: self._wrapped.resume_idle_timeout(timeout),
+            output=lambda result: {"sandbox_id": result.sandbox_id},
+        )
+        return wrap_adapter(resumed, self._trace)
+
+    def set_timeout(self, timeout: int) -> None:
+        return self._trace.capture(
+            "set_timeout",
+            {"backend": self.backend, "sandbox_id": self.sandbox_id, "timeout": timeout},
+            lambda: self._wrapped.set_timeout(timeout),
+        )
+
+    def create_snapshot(self) -> str:
+        return self._trace.capture(
+            "create_snapshot",
+            {
+                "backend": self.backend,
+                "sandbox_id": self.sandbox_id,
+            },
+            self._wrapped.create_snapshot,
+            output=lambda snapshot_id: {"snapshot_id": snapshot_id},
+        )
+
+    def delete_snapshot(self, snapshot_id: str) -> None:
+        return self._trace.capture(
+            "delete_snapshot",
+            {
+                "backend": self.backend,
+                "sandbox_id": self.sandbox_id,
+                "snapshot_id": snapshot_id,
+            },
+            lambda: self._wrapped.delete_snapshot(snapshot_id),
+            output=lambda _: {"deleted": True},
+        )
+
+    def rollback(self, snapshot_id: str) -> dict[str, Any]:
+        return self._trace.capture(
+            "rollback",
+            {
+                "backend": self.backend,
+                "sandbox_id": self.sandbox_id,
+                "snapshot_id": snapshot_id,
+            },
+            lambda: self._wrapped.rollback(snapshot_id),
+        )
+
+    def clone(self, n: int = 1, *, concurrency: int = 1) -> list[SandboxAdapter]:
+        clones = self._trace.capture(
+            "clone",
+            {
+                "backend": self.backend,
+                "sandbox_id": self.sandbox_id,
+                "count": n,
+                "concurrency": concurrency,
+            },
+            lambda: self._wrapped.clone(n=n, concurrency=concurrency),
+            output=lambda results: {
+                "sandbox_ids": [result.sandbox_id for result in results],
+            },
+        )
+        return [wrap_adapter(clone, self._trace) for clone in clones]
+
+    def list_snapshot_ids(self) -> set[str]:
+        return self._trace.capture(
+            "list_snapshot_ids",
+            {"backend": self.backend, "sandbox_id": self.sandbox_id},
+            self._wrapped.list_snapshot_ids,
+        )
+
     def get_host(self, port: int) -> str:
         return self._trace.capture(
             "get_host",
@@ -149,6 +312,21 @@ class TracingSandboxAdapter(SandboxAdapter):
             },
             self._wrapped.traffic_access_token,
             output=lambda token: {"token_present": bool(token)},
+        )
+
+    def update_network(self, network: dict | None = None) -> None:
+        return self._trace.capture(
+            "update_network",
+            {
+                "backend": self.backend,
+                "sandbox_id": self.sandbox_id,
+                # The policy itself, not just its keys: when a case asserts that
+                # a connection was or was not torn down, the trace has to show
+                # which policy caused it.
+                "network": network,
+            },
+            lambda: self._wrapped.update_network(network),
+            output=lambda _: {"updated": True},
         )
 
     def kill(self) -> None:

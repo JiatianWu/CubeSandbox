@@ -6,24 +6,27 @@ package templatecenter
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	cubeboxv1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db/models"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter/image"
+	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 	"gorm.io/gorm"
 )
 
@@ -48,6 +51,36 @@ func TestNormalizeTemplateImageRequestDefaults(t *testing.T) {
 	}
 	if !strings.HasPrefix(req.TemplateID, "tpl-") {
 		t.Fatalf("unexpected generated TemplateID: %q", req.TemplateID)
+	}
+	if req.Backend != "" {
+		t.Fatalf("Backend=%q, omit must stay empty for historical create-from-image", req.Backend)
+	}
+}
+
+func TestNormalizeTemplateImageRequestBackendS3(t *testing.T) {
+	req, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
+		Request:           &types.Request{RequestID: "req-1"},
+		SourceImageRef:    "docker.io/library/nginx:latest",
+		WritableLayerSize: "20Gi",
+		Backend:           "S3",
+	})
+	if err != nil {
+		t.Fatalf("normalizeTemplateImageRequest failed: %v", err)
+	}
+	if req.Backend != "s3" {
+		t.Fatalf("Backend=%q, want s3", req.Backend)
+	}
+}
+
+func TestNormalizeTemplateImageRequestRejectsUnknownBackend(t *testing.T) {
+	_, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
+		Request:           &types.Request{RequestID: "req-1"},
+		SourceImageRef:    "docker.io/library/nginx:latest",
+		WritableLayerSize: "20Gi",
+		Backend:           "nfs",
+	})
+	if err == nil {
+		t.Fatal("expected unsupported backend error")
 	}
 }
 
@@ -217,46 +250,19 @@ func TestNormalizeTemplateImageRequestAllowsCIDRAllowOutWithoutDenyAll(t *testin
 	}
 }
 
-func TestNormalizeTemplateImageRequestRejectsTooManyCustomExposedPorts(t *testing.T) {
-
-	_, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
+func TestNormalizeTemplateImageRequestAllowsMoreThanThreeCustomExposedPorts(t *testing.T) {
+	req, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
 		Request:           &types.Request{RequestID: "req-1"},
 		SourceImageRef:    "docker.io/library/nginx:latest",
 		WritableLayerSize: "20Gi",
-		ExposedPorts:      []int32{9000, 9001, 9002, 9003},
+		ExposedPorts:      []int32{9000, 9001, 9002, 9003, 80},
 	})
-	if err == nil || !strings.Contains(err.Error(), "at most 3 custom exposed ports") {
-		t.Fatalf("unexpected error: %v", err)
+	if err != nil {
+		t.Fatalf("normalizeTemplateImageRequest failed: %v", err)
 	}
-}
-
-func TestDefaultTemplateExposedPortsContainsOnly49983(t *testing.T) {
-	got := defaultTemplateExposedPorts()
-	want := map[int32]struct{}{49983: {}}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("defaultTemplateExposedPorts()=%v, want %v", got, want)
-	}
-}
-
-func TestCountCustomTemplateExposedPortsTreats49983AsReserved(t *testing.T) {
-	if count := countCustomTemplateExposedPorts([]int32{49983, 9000}); count != 1 {
-		t.Fatalf("countCustomTemplateExposedPorts([49983, 9000])=%d, want 1", count)
-	}
-	if count := countCustomTemplateExposedPorts([]int32{8080, 9000}); count != 2 {
-		t.Fatalf("countCustomTemplateExposedPorts([8080, 9000])=%d, want 2", count)
-	}
-}
-
-func TestNormalizeTemplateImageRequestTreatsOnlyCubeletDefaultsAsReserved(t *testing.T) {
-
-	_, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
-		Request:           &types.Request{RequestID: "req-1"},
-		SourceImageRef:    "docker.io/library/nginx:latest",
-		WritableLayerSize: "20Gi",
-		ExposedPorts:      []int32{80, 9000, 9001, 9002},
-	})
-	if err == nil || !strings.Contains(err.Error(), "at most 3 custom exposed ports") {
-		t.Fatalf("unexpected error: %v", err)
+	want := []int32{80, 9000, 9001, 9002, 9003}
+	if !reflect.DeepEqual(req.ExposedPorts, want) {
+		t.Fatalf("ExposedPorts=%v, want %v", req.ExposedPorts, want)
 	}
 }
 
@@ -569,7 +575,7 @@ func TestGenerateTemplateCreateRequestInjectsImmutableRootfsMetadata(t *testing.
 		Ext4SizeBytes:           1024,
 		DownloadToken:           "token-1",
 	}
-	got, err := generateTemplateCreateRequest(req, artifact, image.DockerImageConfig{
+	got, err := generateTemplateCreateRequest(context.Background(), req, artifact, DockerImageConfig{
 		Entrypoint: []string{"/bin/sh"},
 		Cmd:        []string{"-c", "echo ok"},
 		Env:        []string{"A=B"},
@@ -593,11 +599,76 @@ func TestGenerateTemplateCreateRequestInjectsImmutableRootfsMetadata(t *testing.
 	if got.Containers[0].Image == nil || got.Containers[0].Image.Image != "artifact-1" {
 		t.Fatalf("artifact image was not injected")
 	}
+	if got.Containers[0].Image.Annotations[constants.CubeAnnotationRootfsArtifactURL] != "http://master.example/cube/template/artifact/download?artifact_id=artifact-1&token=token-1" {
+		t.Fatalf("unexpected artifact download url: %q", got.Containers[0].Image.Annotations[constants.CubeAnnotationRootfsArtifactURL])
+	}
 	if got.Containers[0].Image.Annotations[constants.CubeAnnotationRootfsArtifactSHA256] != "sha256-1" {
 		t.Fatalf("unexpected artifact sha annotation")
 	}
 	if got.Annotations[constants.AnnotationsExposedPort] != "80:8080" {
 		t.Fatalf("unexpected exposed ports annotation: %q", got.Annotations[constants.AnnotationsExposedPort])
+	}
+	if got.Backend != "" {
+		t.Fatalf("Backend=%q, omit must not invent a backend", got.Backend)
+	}
+	if _, ok := got.Annotations[constants.CubeAnnotationStorageBackend]; ok {
+		t.Fatal("omitted backend must not inject cube.master.storage.backend")
+	}
+}
+
+func TestGenerateTemplateCreateRequestUsesMasterDownloadEndpointForS3Artifacts(t *testing.T) {
+	req := &types.CreateTemplateFromImageReq{
+		Request:           &types.Request{RequestID: "req-s3"},
+		SourceImageRef:    "docker.io/library/nginx:latest",
+		TemplateID:        "template-s3",
+		WritableLayerSize: "20Gi",
+		InstanceType:      cubeboxv1.InstanceType_cubebox.String(),
+		NetworkType:       cubeboxv1.NetworkType_tap.String(),
+	}
+	artifact := &models.RootfsArtifact{
+		ArtifactID:              "artifact-s3",
+		TemplateSpecFingerprint: "fingerprint-s3",
+		Ext4SHA256:              "sha256-s3",
+		Ext4SizeBytes:           2048,
+		DownloadToken:           "token-s3",
+		MasterNodeIP:            "http://0.0.0.0:8089",
+		ArtifactURL:             "http://minio:9000/cube-volumes/artifact-s3.ext4?sig=stale",
+	}
+	got, err := generateTemplateCreateRequest(context.Background(), req, artifact, DockerImageConfig{}, "http://master.example")
+	if err != nil {
+		t.Fatalf("generateTemplateCreateRequest failed: %v", err)
+	}
+	want := "http://master.example/cube/template/artifact/download?artifact_id=artifact-s3&token=token-s3"
+	if got.Containers[0].Image.Annotations[constants.CubeAnnotationRootfsArtifactURL] != want {
+		t.Fatalf("artifact download url=%q, want %q", got.Containers[0].Image.Annotations[constants.CubeAnnotationRootfsArtifactURL], want)
+	}
+}
+
+func TestGenerateTemplateCreateRequestFallsBackToArtifactRowForS3WhenNoExplicitBase(t *testing.T) {
+	req := &types.CreateTemplateFromImageReq{
+		Request:           &types.Request{RequestID: "req-s3-row"},
+		SourceImageRef:    "docker.io/library/nginx:latest",
+		TemplateID:        "template-s3-row",
+		WritableLayerSize: "20Gi",
+		InstanceType:      cubeboxv1.InstanceType_cubebox.String(),
+		NetworkType:       cubeboxv1.NetworkType_tap.String(),
+	}
+	artifact := &models.RootfsArtifact{
+		ArtifactID:              "artifact-s3-row",
+		TemplateSpecFingerprint: "fingerprint-s3-row",
+		Ext4SHA256:              "sha256-s3-row",
+		Ext4SizeBytes:           2048,
+		DownloadToken:           "token-s3-row",
+		MasterNodeIP:            "http://master-from-row:8089",
+		ArtifactURL:             "http://minio:9000/cube-volumes/artifact-s3-row.ext4?sig=stale",
+	}
+	got, err := generateTemplateCreateRequest(context.Background(), req, artifact, DockerImageConfig{}, "")
+	if err != nil {
+		t.Fatalf("generateTemplateCreateRequest failed: %v", err)
+	}
+	want := "http://master-from-row:8089/cube/template/artifact/download?artifact_id=artifact-s3-row&token=token-s3-row"
+	if got.Containers[0].Image.Annotations[constants.CubeAnnotationRootfsArtifactURL] != want {
+		t.Fatalf("artifact download url=%q, want %q", got.Containers[0].Image.Annotations[constants.CubeAnnotationRootfsArtifactURL], want)
 	}
 }
 
@@ -620,7 +691,7 @@ func TestGenerateTemplateCreateRequestAppliesDNSConfigOverride(t *testing.T) {
 		Ext4SizeBytes:           1024,
 		DownloadToken:           "token-1",
 	}
-	got, err := generateTemplateCreateRequest(req, artifact, image.DockerImageConfig{}, "http://master.example")
+	got, err := generateTemplateCreateRequest(context.Background(), req, artifact, DockerImageConfig{}, "http://master.example")
 	if err != nil {
 		t.Fatalf("generateTemplateCreateRequest failed: %v", err)
 	}
@@ -684,7 +755,7 @@ func TestGenerateTemplateCreateRequestClonesCubeNetworkRules(t *testing.T) {
 		DownloadToken:           "token-1",
 	}
 
-	got, err := generateTemplateCreateRequest(req, artifact, image.DockerImageConfig{}, "http://master.example")
+	got, err := generateTemplateCreateRequest(context.Background(), req, artifact, DockerImageConfig{}, "http://master.example")
 	require.NoError(t, err)
 	require.NotNil(t, got.CubeNetworkConfig)
 	require.NotNil(t, got.CubeNetworkConfig.MaskRequestHost)
@@ -740,7 +811,7 @@ func TestGenerateTemplateCreateRequestAddsIvshmemAnnotation(t *testing.T) {
 		Ext4SizeBytes:           1024,
 		DownloadToken:           "token-1",
 	}
-	got, err := generateTemplateCreateRequest(req, artifact, image.DockerImageConfig{}, "http://master.example")
+	got, err := generateTemplateCreateRequest(context.Background(), req, artifact, DockerImageConfig{}, "http://master.example")
 	if err != nil {
 		t.Fatalf("generateTemplateCreateRequest failed: %v", err)
 	}
@@ -1036,6 +1107,57 @@ func TestValidateReusableRootfsArtifactHandlesMissingRecord(t *testing.T) {
 	}
 }
 
+func TestValidateReusableRootfsArtifactFileAcceptsMatchingStat(t *testing.T) {
+	data := []byte("artifact-data")
+	path, _ := writeRootfsArtifactTestFile(t, data)
+
+	err := validateReusableRootfsArtifactFile(&models.RootfsArtifact{
+		ArtifactID:    "rfs-1",
+		Ext4Path:      path,
+		Ext4SHA256:    strings.Repeat("b", 64),
+		Ext4SizeBytes: int64(len(data)),
+	})
+	if err != nil {
+		t.Fatalf("validateReusableRootfsArtifactFile failed: %v", err)
+	}
+}
+
+func TestValidateReusableRootfsArtifactFileRejectsMissingFile(t *testing.T) {
+	err := validateReusableRootfsArtifactFile(&models.RootfsArtifact{
+		ArtifactID:    "rfs-1",
+		Ext4Path:      filepath.Join(t.TempDir(), "missing.ext4"),
+		Ext4SHA256:    strings.Repeat("a", 64),
+		Ext4SizeBytes: 1024,
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("expected missing file error, got %v", err)
+	}
+}
+
+func TestValidateReusableRootfsArtifactFileRejectsSizeMismatch(t *testing.T) {
+	path, _ := writeRootfsArtifactTestFile(t, []byte("artifact-data"))
+
+	err := validateReusableRootfsArtifactFile(&models.RootfsArtifact{
+		ArtifactID:    "rfs-1",
+		Ext4Path:      path,
+		Ext4SizeBytes: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "size mismatch") {
+		t.Fatalf("expected size mismatch error, got %v", err)
+	}
+}
+
+func TestValidateReusableRootfsArtifactFileRejectsNonRegularFile(t *testing.T) {
+	err := validateReusableRootfsArtifactFile(&models.RootfsArtifact{
+		ArtifactID:    "rfs-1",
+		Ext4Path:      t.TempDir(),
+		Ext4SizeBytes: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("expected non-regular file error, got %v", err)
+	}
+}
+
 func TestRootfsArtifactSoftDeleted(t *testing.T) {
 	if rootfsArtifactSoftDeleted(nil) {
 		t.Fatal("nil record should not be treated as deleted")
@@ -1048,6 +1170,16 @@ func TestRootfsArtifactSoftDeleted(t *testing.T) {
 	if !rootfsArtifactSoftDeleted(record) {
 		t.Fatal("soft-deleted record should be detected")
 	}
+}
+
+func writeRootfsArtifactTestFile(t *testing.T, data []byte) (string, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "artifact.ext4")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	sum := sha256.Sum256(data)
+	return path, hex.EncodeToString(sum[:])
 }
 
 func TestManagedArtifactDirRecognizesWorkAndStoreRoots(t *testing.T) {
@@ -1069,7 +1201,7 @@ func TestManagedArtifactDirRecognizesWorkAndStoreRoots(t *testing.T) {
 
 func TestManagedArtifactDirRecognizesFallbackStoreRoot(t *testing.T) {
 	t.Setenv("CUBEMASTER_ROOTFS_ARTIFACT_STORE_DIR", "")
-	fallbackRoot := image.ArtifactFallbackStoreRootDir()
+	fallbackRoot := ArtifactFallbackStoreRootDir()
 	if dir, ok := managedArtifactDir("artifact-fallback", filepath.Join(fallbackRoot, "artifact-fallback", "artifact-fallback.ext4")); !ok || dir != filepath.Join(fallbackRoot, "artifact-fallback") {
 		t.Fatalf("managedArtifactDir should accept fallback store root, got dir=%q ok=%v", dir, ok)
 	}
@@ -1128,86 +1260,6 @@ func TestCleanupFailedRootfsArtifactDelegatesToLastOwnerCleanup(t *testing.T) {
 	// does not pin the artifact and block its own failure cleanup.
 	if gotExclude != "tpl-owner" {
 		t.Fatalf("expected own template excluded, got %q", gotExclude)
-	}
-}
-
-func TestBuildRootfsArtifactFinalizesBuildResult(t *testing.T) {
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-
-	artifact := &models.RootfsArtifact{
-		ArtifactID:              "artifact-1",
-		TemplateSpecFingerprint: "fingerprint-1",
-		WritableLayerSize:       "20Gi",
-	}
-	source := &image.PreparedSource{
-		Digest:       "sha256:digest",
-		MasterNodeIP: "http://master.example",
-		ConfigJSON:   `{"Cmd":["nginx"]}`,
-		Config:       image.DockerImageConfig{Cmd: []string{"nginx"}, Env: []string{"A=B"}},
-	}
-	req := &types.CreateTemplateFromImageReq{
-		Request:           &types.Request{RequestID: "req-1"},
-		TemplateID:        "tpl-1",
-		SourceImageRef:    "docker.io/library/nginx:latest",
-		WritableLayerSize: "20Gi",
-		InstanceType:      cubeboxv1.InstanceType_cubebox.String(),
-		NetworkType:       cubeboxv1.NetworkType_tap.String(),
-	}
-
-	patches.ApplyFunc(image.BuildExt4, func(ctx context.Context, src *image.PreparedSource, opts image.BuildOptions) (image.BuildResult, error) {
-		if src != source {
-			t.Fatalf("unexpected source passed to BuildExt4: %#v", src)
-		}
-		if opts.ArtifactID != artifact.ArtifactID {
-			t.Fatalf("BuildOptions.ArtifactID=%q, want %q", opts.ArtifactID, artifact.ArtifactID)
-		}
-		return image.BuildResult{Ext4Path: "/tmp/artifact-1.ext4", SHA256: "sha-ext4", SizeBytes: 1234}, nil
-	})
-
-	var updateValues map[string]any
-	patches.ApplyFunc(updateRootfsArtifact, func(ctx context.Context, artifactID string, values map[string]any) error {
-		if artifactID != artifact.ArtifactID {
-			t.Fatalf("artifactID=%q, want %q", artifactID, artifact.ArtifactID)
-		}
-		updateValues = values
-		return nil
-	})
-	patches.ApplyFunc(getRootfsArtifactByID, func(ctx context.Context, artifactID string) (*models.RootfsArtifact, error) {
-		if artifactID != artifact.ArtifactID {
-			t.Fatalf("artifactID=%q, want %q", artifactID, artifact.ArtifactID)
-		}
-		latest := *artifact
-		return &latest, nil
-	})
-
-	got, generatedReq, err := buildRootfsArtifact(context.Background(), artifact, req, source, "http://master.example", nil, "")
-	if err != nil {
-		t.Fatalf("buildRootfsArtifact failed: %v", err)
-	}
-	if got.Ext4Path != "/tmp/artifact-1.ext4" || got.Ext4SHA256 != "sha-ext4" || got.Ext4SizeBytes != 1234 {
-		t.Fatalf("artifact build result was not finalized: %#v", got)
-	}
-	if got.Status != ArtifactStatusReady {
-		t.Fatalf("Status=%q, want READY", got.Status)
-	}
-	if got.DownloadToken == "" {
-		t.Fatal("DownloadToken should be generated")
-	}
-	if generatedReq == nil || len(generatedReq.Containers) != 1 || generatedReq.Containers[0].Image == nil {
-		t.Fatalf("generated request missing rootfs image: %#v", generatedReq)
-	}
-	if generatedReq.Containers[0].Image.Annotations[constants.CubeAnnotationRootfsArtifactSHA256] != "sha-ext4" {
-		t.Fatalf("generated request did not include ext4 sha annotation")
-	}
-	if updateValues["ext4_path"] != "/tmp/artifact-1.ext4" ||
-		updateValues["ext4_sha256"] != "sha-ext4" ||
-		updateValues["ext4_size_bytes"] != int64(1234) ||
-		updateValues["status"] != ArtifactStatusReady {
-		t.Fatalf("unexpected persisted values: %#v", updateValues)
-	}
-	if _, ok := updateValues["generated_request_json"].(string); !ok {
-		t.Fatalf("generated_request_json was not persisted as string: %#v", updateValues)
 	}
 }
 
@@ -1348,6 +1400,8 @@ func TestRunRedoTemplateImageJobStopsOnArtifactCleanupFailure(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
+	artifactData := []byte("artifact-data")
+	artifactPath, artifactSHA := writeRootfsArtifactTestFile(t, artifactData)
 	targets := []*node.Node{{InsID: "node-a", IP: "10.0.0.1", Healthy: true}}
 	generatedReqPayload, _ := json.Marshal(&types.CreateCubeSandboxReq{
 		InstanceType: cubeboxv1.InstanceType_cubebox.String(),
@@ -1388,6 +1442,12 @@ func TestRunRedoTemplateImageJobStopsOnArtifactCleanupFailure(t *testing.T) {
 	patches.ApplyFunc(getRootfsArtifactByID, func(ctx context.Context, artifactID string) (*models.RootfsArtifact, error) {
 		return &models.RootfsArtifact{
 			ArtifactID:           artifactID,
+			Ext4Path:             artifactPath,
+			Ext4SHA256:           artifactSHA,
+			Ext4SizeBytes:        int64(len(artifactData)),
+			DownloadToken:        "token-1",
+			MasterNodeIP:         "http://master.example",
+			Status:               ArtifactStatusReady,
 			GeneratedRequestJSON: string(generatedReqPayload),
 		}, nil
 	})
@@ -1415,31 +1475,67 @@ func TestRunRedoTemplateImageJobStopsOnArtifactCleanupFailure(t *testing.T) {
 	}
 }
 
-func TestRunRedoTemplateImageJobRegeneratesRequestForRedoTemplateID(t *testing.T) {
+func TestRunRedoTemplateImageJobReloadsArtifactAfterBuildLock(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
-	const redoTemplateID = "tpl-redo"
-	const staleTemplateID = "tpl-stale"
+	const (
+		artifactID = "artifact-lock-refresh"
+		staleToken = "token-a"
+		freshToken = "token-b"
+	)
+	artifactData := []byte("artifact-data")
+	artifactPath, artifactSHA := writeRootfsArtifactTestFile(t, artifactData)
 	targets := []*node.Node{{InsID: "node-a", IP: "10.0.0.1", Healthy: true}}
-	staleReqPayload, _ := json.Marshal(&types.CreateCubeSandboxReq{
-		InstanceType: cubeboxv1.InstanceType_cubebox.String(),
-		Annotations: map[string]string{
-			constants.CubeAnnotationAppSnapshotTemplateID:      staleTemplateID,
-			constants.CubeAnnotationAppSnapshotTemplateVersion: DefaultTemplateVersion,
-		},
-	})
-	imageConfigPayload, _ := json.Marshal(image.DockerImageConfig{
-		Entrypoint: []string{"/bin/sh"},
-		Cmd:        []string{"-c", "echo ok"},
-	})
+	// The row as this redo first observes it: the previous build FAILED, so
+	// the reusability gate rejects it and the redo downgrades to the
+	// BUILDING_EXT4 branch -- the only path that still reloads the row under
+	// artifactBuildLocks (prepareRootfsArtifactForRedoBuild).
+	staleArtifact := &models.RootfsArtifact{
+		ArtifactID:              artifactID,
+		TemplateSpecFingerprint: "fingerprint-1",
+		Ext4Path:                artifactPath,
+		Ext4SHA256:              artifactSHA,
+		Ext4SizeBytes:           int64(len(artifactData)),
+		DownloadToken:           staleToken,
+		Status:                  ArtifactStatusFailed,
+		GeneratedRequestJSON:    `{}`,
+		ImageConfigJSON:         `{}`,
+		SourceImageDigest:       "sha256:digest",
+	}
+	// The row a concurrent rebuild commits while this redo waits on the build
+	// lock: READY again with a fresh token/sha the redo must pick up.
+	freshArtifact := *staleArtifact
+	freshArtifact.Status = ArtifactStatusReady
+	freshArtifact.DownloadToken = freshToken
+	freshArtifact.Ext4SHA256 = strings.Repeat("b", 64)
+
+	buildLock := &sync.Mutex{}
+	buildLock.Lock()
+	lockHeld := true
+	artifactBuildLocks.Delete(artifactID)
+	artifactBuildLocks.Store(artifactID, buildLock)
+	defer func() {
+		if lockHeld {
+			buildLock.Unlock()
+		}
+		artifactBuildLocks.Delete(artifactID)
+	}()
+
+	initialRead := make(chan struct{})
+	lockedReload := make(chan struct{})
+	lookupCalls := 0
+	distributedToken := ""
+	distributedSHA := ""
+	generatedToken := ""
+	generatedSHA := ""
 
 	patches.ApplyFunc(getTemplateImageJobRecordByID, func(ctx context.Context, jobID string) (*models.TemplateImageJob, error) {
 		return &models.TemplateImageJob{
 			JobID:       jobID,
-			TemplateID:  redoTemplateID,
-			ResumePhase: JobPhaseSnapshotting,
-			ArtifactID:  "artifact-1",
+			TemplateID:  "tpl-1",
+			ResumePhase: JobPhaseDistributing,
+			ArtifactID:  artifactID,
 		}, nil
 	})
 	patches.ApplyFunc(updateTemplateImageJob, func(ctx context.Context, jobID string, values map[string]any) error {
@@ -1448,9 +1544,8 @@ func TestRunRedoTemplateImageJobRegeneratesRequestForRedoTemplateID(t *testing.T
 	patches.ApplyFunc(unmarshalTemplateImageJobRequest, func(payload string) (*types.CreateTemplateFromImageReq, error) {
 		return &types.CreateTemplateFromImageReq{
 			Request:           &types.Request{RequestID: "req-1"},
-			TemplateID:        staleTemplateID,
+			TemplateID:        "tpl-1",
 			InstanceType:      cubeboxv1.InstanceType_cubebox.String(),
-			NetworkType:       cubeboxv1.NetworkType_tap.String(),
 			WritableLayerSize: "20Gi",
 			SourceImageRef:    "docker.io/library/nginx:latest",
 		}, nil
@@ -1461,81 +1556,120 @@ func TestRunRedoTemplateImageJobRegeneratesRequestForRedoTemplateID(t *testing.T
 	patches.ApplyFunc(resolveRedoTargets, func(instanceType string, req *types.RedoTemplateFromImageReq, replicas []models.TemplateReplica) ([]*node.Node, error) {
 		return targets, nil
 	})
-	patches.ApplyFunc(getRootfsArtifactByID, func(ctx context.Context, artifactID string) (*models.RootfsArtifact, error) {
-		return &models.RootfsArtifact{
-			ArtifactID:              artifactID,
-			TemplateSpecFingerprint: "fingerprint-1",
-			Ext4SHA256:              "sha256",
-			Ext4SizeBytes:           1024,
-			DownloadToken:           "token-1",
-			GeneratedRequestJSON:    string(staleReqPayload),
-			ImageConfigJSON:         string(imageConfigPayload),
-			SourceImageDigest:       "sha256:digest",
-			WritableLayerSize:       "20Gi",
-			Status:                  ArtifactStatusReady,
-		}, nil
-	})
-	patches.ApplyFunc(cleanupTemplateReplicasOnNodes, func(ctx context.Context, templateID string, replicas []models.TemplateReplica, targets []*node.Node) error {
-		if templateID != redoTemplateID {
-			t.Fatalf("cleanup templateID = %q, want %q", templateID, redoTemplateID)
+	patches.ApplyFunc(getRootfsArtifactByID, func(ctx context.Context, gotArtifactID string) (*models.RootfsArtifact, error) {
+		lookupCalls++
+		switch lookupCalls {
+		case 1:
+			// Reusability gate (unlocked): previous build failed -> not
+			// reusable, so the redo downgrades to BUILDING_EXT4.
+			close(initialRead)
+			copy := *staleArtifact
+			return &copy, nil
+		case 2:
+			// Foreign-artifact re-check on the downgrade path (unlocked): a
+			// plain local failure, not held by another CubeMaster.
+			copy := *staleArtifact
+			return &copy, nil
+		case 3:
+			// Locked reload inside prepareRootfsArtifactForRedoBuild. This is
+			// the lookup the build lock exists for: it must observe the row
+			// the concurrent rebuild committed.
+			close(lockedReload)
+			copy := freshArtifact
+			return &copy, nil
+		default:
+			return nil, fmt.Errorf("unexpected artifact lookup %d", lookupCalls)
 		}
+	})
+	patches.ApplyFunc(cleanupArtifactOnNodes, func(ctx context.Context, gotArtifactID, instanceType string, targets []*node.Node) error {
 		return nil
 	})
-	patches.ApplyFunc(ensureTemplateDefinitionWithOptions, func(ctx context.Context, templateID string, storedReq *types.CreateCubeSandboxReq, instanceType, version string, _ definitionCreateOptions) (bool, error) {
-		if templateID != redoTemplateID {
-			t.Fatalf("definition templateID = %q, want %q", templateID, redoTemplateID)
+	patches.ApplyFunc(distributeRootfsArtifact, func(ctx context.Context, req *types.CreateTemplateFromImageReq, generatedReq *types.CreateCubeSandboxReq, artifact *models.RootfsArtifact, templateID, jobID string) ([]*node.Node, int32, int32, int32, error) {
+		distributedToken = artifact.DownloadToken
+		distributedSHA = artifact.Ext4SHA256
+		if generatedReq != nil && len(generatedReq.Containers) > 0 && generatedReq.Containers[0].Image != nil {
+			generatedToken = generatedReq.Containers[0].Image.Annotations[constants.CubeAnnotationRootfsArtifactToken]
+			generatedSHA = generatedReq.Containers[0].Image.Annotations[constants.CubeAnnotationRootfsArtifactSHA256]
 		}
-		if got := storedReq.Annotations[constants.CubeAnnotationAppSnapshotTemplateID]; got != redoTemplateID {
-			t.Fatalf("stored request templateID = %q, want %q", got, redoTemplateID)
-		}
+		return targets, 1, 1, 0, nil
+	})
+	patches.ApplyFunc(cleanupTemplateReplicasOnNodes, func(ctx context.Context, templateID string, replicas []models.TemplateReplica, targets []*node.Node, backend string) error {
+		return nil
+	})
+	patches.ApplyFunc(ensureTemplateDefinitionWithOptions, func(ctx context.Context, templateID string, storedReq *types.CreateCubeSandboxReq, instanceType, version string, opts definitionCreateOptions) (bool, error) {
 		return true, nil
 	})
-
-	var capturedReq *types.CreateCubeSandboxReq
 	patches.ApplyFunc(createTemplateReplicasOnNodes, func(ctx context.Context, templateID string, req *types.CreateCubeSandboxReq, targets []*node.Node, opts replicaRunOptions) ([]ReplicaStatus, error) {
-		if templateID != redoTemplateID {
-			t.Fatalf("replica templateID = %q, want %q", templateID, redoTemplateID)
-		}
-		capturedReq = req
 		return []ReplicaStatus{{NodeID: "node-a", Status: ReplicaStatusReady}}, nil
 	})
-	patches.ApplyFunc(refreshTemplateReplicaSummary, func(ctx context.Context, templateID string) error {
-		return nil
+	patches.ApplyFunc(refreshTemplateReplicaSummary, func(ctx context.Context, templateID, jobID string) (string, error) {
+		return "", nil
 	})
 	patches.ApplyFunc(GetTemplateInfo, func(ctx context.Context, templateID string) (*TemplateInfo, error) {
 		return &TemplateInfo{TemplateID: templateID, Status: StatusReady}, nil
 	})
 
-	runRedoTemplateImageJob(context.Background(), "job-1", &types.RedoTemplateFromImageReq{
-		Request:    &types.Request{RequestID: "req-redo"},
-		TemplateID: redoTemplateID,
-	}, "http://master.example")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runRedoTemplateImageJob(context.Background(), "job-lock-refresh", &types.RedoTemplateFromImageReq{
+			Request:    &types.Request{RequestID: "req-redo"},
+			TemplateID: "tpl-1",
+		}, "http://master.example")
+	}()
 
-	if capturedReq == nil {
-		t.Fatal("expected generated request to be passed to replica creation")
+	select {
+	case <-initialRead:
+	case <-time.After(5 * time.Second):
+		t.Fatal("redo did not read the stale artifact")
 	}
-	if got := capturedReq.Annotations[constants.CubeAnnotationAppSnapshotTemplateID]; got != redoTemplateID {
-		t.Fatalf("generated request templateID = %q, want %q", got, redoTemplateID)
+	// The decisive reload must happen under the build lock. The gate and the
+	// foreign re-check (lookups 1-2) may run unlocked, but the lookup that
+	// decides which artifact version gets distributed (lookup 3, inside
+	// prepareRootfsArtifactForRedoBuild) must not fire before the lock.
+	select {
+	case <-lockedReload:
+		t.Fatal("redo reloaded the artifact before acquiring the build lock")
+	case <-time.After(50 * time.Millisecond):
 	}
-	if got := capturedReq.Containers[0].Image.Annotations[constants.CubeAnnotationRootfsArtifactURL]; !strings.Contains(got, "artifact_id=artifact-1") {
-		t.Fatalf("generated request should rebuild artifact URL, got %q", got)
+
+	// Simulate the concurrent rebuild committing token B before releasing the
+	// build lock. Redo must reload this version after it acquires the lock.
+	buildLock.Unlock()
+	lockHeld = false
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("redo did not finish after the build lock was released")
 	}
-	if got := capturedReq.Containers[0].Command; !reflect.DeepEqual(got, []string{"/bin/sh"}) {
-		t.Fatalf("generated request command = %v, want image config entrypoint", got)
+	if lookupCalls != 3 {
+		t.Fatalf("artifact lookups = %d, want reusability gate + foreign re-check + locked reload", lookupCalls)
+	}
+	if distributedToken != freshToken || generatedToken != freshToken {
+		t.Fatalf("distributed token=%q generated token=%q, want refreshed %q", distributedToken, generatedToken, freshToken)
+	}
+	if distributedSHA != freshArtifact.Ext4SHA256 || generatedSHA != freshArtifact.Ext4SHA256 {
+		t.Fatalf("distributed sha=%q generated sha=%q, want refreshed %q", distributedSHA, generatedSHA, freshArtifact.Ext4SHA256)
 	}
 }
 
-func TestRunRedoTemplateImageJobRequiresLocalImageForBuildRedo(t *testing.T) {
+func TestRunRedoTemplateImageJobFailsOnArtifactReloadError(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
+	const artifactID = "artifact-reload-error"
+	reloadErr := errors.New("database connection reset")
 	targets := []*node.Node{{InsID: "node-a", IP: "10.0.0.1", Healthy: true}}
+	lookupCalls := 0
 	var lastUpdate map[string]any
+
 	patches.ApplyFunc(getTemplateImageJobRecordByID, func(ctx context.Context, jobID string) (*models.TemplateImageJob, error) {
 		return &models.TemplateImageJob{
 			JobID:       jobID,
 			TemplateID:  "tpl-1",
-			ResumePhase: JobPhaseBuildingExt4,
+			ResumePhase: JobPhaseDistributing,
+			ArtifactID:  artifactID,
 		}, nil
 	})
 	patches.ApplyFunc(updateTemplateImageJob, func(ctx context.Context, jobID string, values map[string]any) error {
@@ -1548,7 +1682,7 @@ func TestRunRedoTemplateImageJobRequiresLocalImageForBuildRedo(t *testing.T) {
 			TemplateID:        "tpl-1",
 			InstanceType:      cubeboxv1.InstanceType_cubebox.String(),
 			WritableLayerSize: "20Gi",
-			SourceImageRef:    "private.example/app:latest",
+			SourceImageRef:    "docker.io/library/nginx:latest",
 		}, nil
 	})
 	patches.ApplyFunc(ListReplicas, func(ctx context.Context, templateID string) ([]models.TemplateReplica, error) {
@@ -1557,22 +1691,38 @@ func TestRunRedoTemplateImageJobRequiresLocalImageForBuildRedo(t *testing.T) {
 	patches.ApplyFunc(resolveRedoTargets, func(instanceType string, req *types.RedoTemplateFromImageReq, replicas []models.TemplateReplica) ([]*node.Node, error) {
 		return targets, nil
 	})
-	patches.ApplyFunc(image.PrepareLocalSource, func(ctx context.Context, spec image.SourceSpec) (*image.PreparedSource, error) {
-		return nil, errors.New("redo requires source image private.example/app:latest to still exist locally")
+	patches.ApplyFunc(getRootfsArtifactByID, func(ctx context.Context, gotArtifactID string) (*models.RootfsArtifact, error) {
+		lookupCalls++
+		if gotArtifactID != artifactID {
+			return nil, fmt.Errorf("artifact id = %q, want %q", gotArtifactID, artifactID)
+		}
+		if lookupCalls == 1 {
+			return &models.RootfsArtifact{ArtifactID: artifactID}, nil
+		}
+		return nil, reloadErr
 	})
 
-	runRedoTemplateImageJob(context.Background(), "job-2", &types.RedoTemplateFromImageReq{
+	runRedoTemplateImageJob(context.Background(), "job-reload-error", &types.RedoTemplateFromImageReq{
 		Request:    &types.Request{RequestID: "req-redo"},
 		TemplateID: "tpl-1",
 	}, "http://master.example")
 
-	if lastUpdate == nil {
-		t.Fatal("expected job status update")
+	// Current lookup ordering: (1) the reusability gate, (2) the
+	// foreign-artifact re-check on the downgrade path, (3) the locked reload
+	// inside prepareRootfsArtifactForRedoBuild. The injected DB error hits
+	// lookups 2-3, so the locked reload fails as well: the redo must fail
+	// closed rather than reuse bytes it could not verify.
+	if lookupCalls != 3 {
+		t.Fatalf("artifact lookups = %d, want reusability gate + foreign re-check + locked reload", lookupCalls)
 	}
-	if lastUpdate["status"] != JobStatusFailed {
-		t.Fatalf("unexpected status update: %+v", lastUpdate)
+	if lastUpdate == nil || lastUpdate["status"] != JobStatusFailed || lastUpdate["phase"] != JobPhaseBuildingExt4 {
+		t.Fatalf("unexpected redo failure update: %+v", lastUpdate)
 	}
-	if got, _ := lastUpdate["error_message"].(string); !strings.Contains(got, "still exist locally") {
-		t.Fatalf("unexpected error message: %q", got)
+	// prepareRootfsArtifactForRedoBuild deliberately collapses the reload
+	// error into "not reusable", and with local ext4 builds disabled in
+	// CubeMaster the only honest outcome is failing the job so the caller
+	// forwards a full rebuild to CubeTemplateCenter.
+	if got, _ := lastUpdate["error_message"].(string); !strings.Contains(got, "full rebuild") || !strings.Contains(got, "CubeTemplateCenter") {
+		t.Fatalf("unexpected reload failure message: %q", got)
 	}
 }

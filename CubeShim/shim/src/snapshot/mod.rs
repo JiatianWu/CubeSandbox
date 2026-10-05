@@ -13,7 +13,7 @@ use crate::sandbox::disk::Disk;
 use crate::sandbox::net::Interface;
 use crate::sandbox::net::Net;
 
-use crate::sandbox::pmem::Pmem;
+use crate::sandbox::pmem::{Pmem, HYP_AGENT_ID, HYP_OS_IMAGE_ID};
 
 use cube_hypervisor;
 use cube_hypervisor::config::BackendFsConfig;
@@ -123,6 +123,7 @@ impl Snapshot {
             self.store_metadata()
         }
         .await;
+
         let resume_result = self.api_resume_vm().await;
 
         match (snapshot_result, resume_result) {
@@ -289,11 +290,9 @@ impl Snapshot {
             rate_limiter_config: None,
         };
 
-        if let Some(p) = self.pmem.get(0) {
-            if p.id == "pmem-agent" {
-                self.pmem.remove(0);
-            }
-        }
+        // Annotation pmems must not re-add OS/agent builtins already in VmConfig.
+        self.pmem
+            .retain(|p| p.id != HYP_AGENT_ID && p.id != HYP_OS_IMAGE_ID);
 
         vm_config
             .add_disks(&self.disk)
@@ -394,6 +393,9 @@ impl Snapshot {
     fn store_metadata(&self) -> CResult<()> {
         let mut snap_info = SnapshotInfo::new(self.res.cpu, self.res.memory);
         snap_info.image_version = Utils::get_image_version()?;
+        snap_info.agent_version = Some(Utils::get_agent_version(
+            crate::hypervisor::config::DEFAULT_AGENT_PATH,
+        )?);
         snap_info.kernel_version = Utils::get_kernel_version(self.kernel.as_str())?;
         snap_info.app_snapshot_container_id = self.container_id.clone();
         for d in &self.disk {
@@ -427,16 +429,42 @@ impl Snapshot {
         }
         let path = Path::new(self.path.as_str());
         if path.exists() {
-            if self.force {
-                fs::remove_dir_all(path)
-                    .map_err(|e| format!("Failed to clean path:{}, err:{}", CUBE_SYS_PATH, e))?;
-            } else {
+            if !self.force {
                 return Err(format!("Paht:{} exist", &self.path));
             }
+            // Clear contents in place. S3 mounts metadata/ as a volume;
+            // remove_dir_all on the mount point returns EBUSY (os error 16).
+            if path.is_dir() {
+                clear_dir_contents(path)?;
+            } else {
+                fs::remove_file(path)
+                    .map_err(|e| format!("Failed to clean path:{}, err:{}", path.display(), e))?;
+                fs::create_dir_all(path)
+                    .map_err(|e| format!("Failed to create path:{}, err:{}", path.display(), e))?;
+            }
+        } else {
+            fs::create_dir_all(path)
+                .map_err(|e| format!("Failed to create path:{}, err:{}", path.display(), e))?;
         }
-        fs::create_dir_all(path)
-            .map_err(|e| format!("Failed to create path:{}, err:{}", CUBE_SYS_PATH, e))?;
 
         Ok(())
     }
+}
+
+fn clear_dir_contents(path: &Path) -> CResult<()> {
+    for entry in fs::read_dir(path)
+        .map_err(|e| format!("Failed to read path:{}, err:{}", path.display(), e))?
+    {
+        let entry =
+            entry.map_err(|e| format!("Failed to read path:{}, err:{}", path.display(), e))?;
+        let child = entry.path();
+        if child.is_dir() {
+            fs::remove_dir_all(&child)
+                .map_err(|e| format!("Failed to clean path:{}, err:{}", child.display(), e))?;
+        } else {
+            fs::remove_file(&child)
+                .map_err(|e| format!("Failed to clean path:{}, err:{}", child.display(), e))?;
+        }
+    }
+    Ok(())
 }

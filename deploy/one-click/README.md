@@ -5,20 +5,37 @@ This directory is used to build and deliver the single-machine one-click release
 ## Directory Overview
 
 - `build-release-bundle-builder.sh`: Recommended entry point. Compiles the components needed by one-click inside a builder image, then continues the release package assembly on the host machine.
-- `build-vm-assets.sh`: Builds `containerd-shim-cube-rs`, `cube-runtime`, and `cube-agent`; injects `cube-agent` into the guest image as `/sbin/init`; and collects the guest kernel.
+- `build-vm-assets.sh`: Builds `containerd-shim-cube-rs`, `cube-runtime`, guest image (with `cube-init` as `/sbin/init`), and independent `cube-agent.ext4`; collects the guest kernel.
+- `build-guest-image.sh`: Builds guest OS image with lightweight `cube-init` only (no baked-in agent).
+- `build-agent-ext4.sh`: Builds independent `cube-agent/cube-agent.ext4` (+ `version`) for virtio-pmem1.
 - `build-release-bundle.sh`: Low-level packaging entry point. Consumes either the source tree or `ONE_CLICK_*_BIN` pre-built artifacts, assembles `sandbox-package`, and produces the final release package.
 - `config-cube.toml`: Default one-click runtime configuration template.
-- `support/`: `docker compose` templates for MySQL/Redis, installed to `/usr/local/services/cubetoolbox/support/` on the target machine; `support/bin/mkcert` is the bundled mkcert binary.
+- `support/`: `docker compose` templates for MySQL/Redis/MinIO, installed to `/usr/local/services/cubetoolbox/support/` on the target machine; `support/bin/mkcert` is the bundled mkcert binary.
 - `cubeproxy/`: Compose template, `global.conf` template, and CoreDNS template for `cube proxy`.
 - `webui/`: Nginx runtime files for the dashboard, installed to `/usr/local/services/cubetoolbox/webui/` on the target machine.
 - `install.sh`: Entry point for installing and starting the control node on the target machine (defaults to all-in-one mode).
 - `install-compute.sh`: Entry point for installing a compute node on the target machine.
 - `down.sh`: Stops the services and dependencies installed by one-click.
 - `smoke.sh`: Runs basic health checks.
-- `env.example`: Shared environment variable template for both the build machine and the target machine.
+- `env.example`: Target-machine environment variable template.
+- `build.env.example`: Build-machine environment variable template for assembling the release bundle.
 - `lib/common.sh`: Common shell utility functions.
 - `scripts/one-click/`: Validation and maintenance helpers used by the systemd-managed deployment after installation.
 - `terraform/tencentcloud/`: Terraform deployer for a **clustered** CubeSandbox on Tencent Cloud (TKE control plane + CVM compute nodes). `create.sh` is the entry point; `destroy.sh` tears everything down. These files are shipped both at the release-bundle top level and inside `sandbox-package` (see "Tencent Cloud Cluster Deployment").
+
+## Root Makefile Targets (agent-independent pmem)
+
+From the repository root, these targets build via the unified builder image (`make builder-image` first if needed):
+
+```bash
+make cube-init          # guest PID1 binary → _output/bin/cube-init (alias: guest-init)
+make agent-ext4         # independent plane file → _output/cube-agent/{cube-agent.ext4,version}
+                        # (alias: cube-agent-ext4)
+make pmem-assets        # cube-init + agent-ext4
+make help               # list all root targets
+```
+
+For the full runtime layout (shim + guest image + agent.ext4 + kernel), use `./build-vm-assets.sh` or the release-bundle entry points below.
 
 ## Supported Operating Systems
 
@@ -40,7 +57,14 @@ export ONE_CLICK_CUBE_KERNEL_VMLINUX=/abs/path/to/vmlinux
 export ONE_CLICK_CUBE_KERNEL_PVM_VMLINUX=/abs/path/to/vmlinux-pvm
 ```
 
-The installed runtime still uses `cube-kernel-scf/vmlinux` as the active guest kernel path. The package stores the ordinary guest kernel as `vmlinux-bm` and keeps `vmlinux` as a symlink: by default it points to `vmlinux-bm`; if the target machine sets `CUBE_PVM_ENABLE=1` during installation, the installer points it to `vmlinux-pvm`.
+Kernel multi-version inventory (content-addressed):
+
+- On install, `vmlinux-bm` / `vmlinux-pvm` are each inventoried under `component_versions/cube-kernel-scf/sha256-<12 hex>/`
+- Each inventory dir contains: `vmlinux-bm|pvm`, `vmlinux` symlink, `variant` (`bm`/`pvm`), and `version` (`sha256:<64 hex>` for shim)
+- `KERNEL_TAG` / `PVM_KERNEL_TAG` are **not** inventory directory names; `release-manifest` `kernel.version` / `pvm_version` also record content short hashes
+- Ensure maps the digest from Master identity onto that short key
+
+The installed runtime still uses `cube-kernel-scf/vmlinux` as the active guest kernel path. The package stores `vmlinux-bm` and keeps `vmlinux` as a symlink: by default it points to `vmlinux-bm`; if the target machine sets `CUBE_PVM_ENABLE=1` during installation, the installer points it to `vmlinux-pvm`. `CUBE_PVM_ENABLE` is an installer toggle: on upgrades, `CUBE_PVM_ENABLE=0|1 ./install.sh` or the key appearing in the bundle `.env` always wins (even for `0`, the default), while a full `cp env.example .env` resets it to `0`.
 
 The guest image no longer depends on a local zip file. By default it is generated locally from `deploy/guest-image/Dockerfile` during the one-click release package build. Common override parameters:
 
@@ -59,11 +83,11 @@ export ONE_CLICK_GUEST_IMAGE_TAR=/abs/path/to/cube-guest-image-amd64.tar.gz
 
 ## Building the Release Package
 
-It is recommended to copy the environment template first:
+It is recommended to copy the build environment template first:
 
 ```bash
 cd deploy/one-click
-cp env.example .env
+cp build.env.example build.env
 ```
 
 Run the following from the repository root on the host machine (recommended):
@@ -72,10 +96,19 @@ Run the following from the repository root on the host machine (recommended):
 ./deploy/one-click/build-release-bundle-builder.sh
 ```
 
+To embed a default `envd` binary into the packaged `cubemastercli`, prepare the binary on the build host and pass `ENVD_LOCAL_PATH` to the recommended builder entry point:
+
+```bash
+ENVD_LOCAL_PATH=/abs/path/to/envd \
+./deploy/one-click/build-release-bundle-builder.sh
+```
+
+When this variable is set, the host wrapper copies the file into `deploy/one-click/.work/envd`; the builder container then builds `cubemastercli` with that file embedded. If `ENVD_LOCAL_PATH` is omitted, the packaged `cubemastercli` does not include a default `envd`, and template builds that opt in to envd injection must pass `--envd-path` at runtime.
+
 This entry point will:
 
-- Compile `cubemaster`, `cubemastercli`, `cubelet`, `cubecli`, `cube-api`, `network-agent`, `cube-agent`, `containerd-shim-cube-rs`, and `cube-runtime` inside a container using the root-level builder image.
-- Run `go mod download` for `CubeMaster` and `Cubelet` inside the builder. The first build will fetch Go modules online; subsequent builds reuse the module cache under the builder's HOME directory.
+- Compile `cubemaster`, `cubemastercli`, `templatecenter`, `cubelet`, `cubecli`, `cube-api`, `cube-agent`, `containerd-shim-cube-rs`, and `cube-runtime` inside a container using the root-level builder image. The network runtime is embedded in `cubelet` and no standalone network runtime binary is built.
+- Run `go mod download` for `CubeMaster`, `CubeTemplateCenter`, and `Cubelet` inside the builder. The first build will fetch Go modules online; subsequent builds reuse the module cache under the builder's HOME directory.
 - Place the pre-built artifacts in `deploy/one-click/.work/prebuilt/`.
 - Return to the host machine and call `build-release-bundle.sh` to build the WebUI static assets, continue with guest image generation, and finish final packaging.
 
@@ -98,7 +131,7 @@ export ONE_CLICK_WEB_DIST_DIR=/abs/path/to/web/dist
 - `go mod download` is executed the first time `CubeMaster` and `Cubelet` are built.
 - The build machine must be able to reach the relevant module sources. If you are behind a private network, configure `GOPROXY`, `GOPRIVATE`, and private repository credentials in advance.
 - The recommended entry point persists the builder HOME to a host-side cache directory, so subsequent builds on the same machine typically do not require a full re-download.
-- `cubelog` is still referenced as a local module via `../cubelog` and is not downloaded from a remote source.
+- `cubelog` is still referenced as a local module via `../pkgs/CubeLog` and is not downloaded from a remote source.
 
 On success, the following file will be generated:
 
@@ -112,7 +145,8 @@ The release package contains:
 - `release-manifest.json`
 - `CubeAPI/bin/cube-api`
 - `containerd-shim-cube-rs`, `cube-runtime`
-- Locally built `cube-image/cube-guest-image-cpu.img`
+- Locally built `cube-image/cube-guest-image-cpu.img` (with `cube-init` as `/sbin/init`)
+- Independent `cube-agent/cube-agent.ext4` (+ `cube-agent/version`)
 - `cubeproxy/` directory and its build context
 - `support/` directory and its compose templates
 - `webui/` directory, its compose template, nginx configuration, and built `web/dist` assets
@@ -137,13 +171,13 @@ One-click does not create an extra global `configs/` layer on the target machine
   - `cubelet_conf.default_timeout_insec`: cluster default sandbox idle TTL when the client omits `timeout`; unset or `<= 0` means **no cluster-wide idle timeout** (shipped default `-1`). See [lifecycle — Operational Notes](../../docs/guide/lifecycle.md#cluster-default-idle-timeout-default_timeout_insec).
 - `Cubelet/config/` → `Cubelet/config/`
 - `Cubelet/dynamicconf/` → `Cubelet/dynamicconf/`
-- `configs/single-node/network-agent.yaml` → `network-agent/network-agent.yaml`
+- `CUBE_L7_MARK_{HTTP,HTTPS,MASK}` (env) → `/etc/cubeegress/l7-marks.conf` — the L7 egress skb->mark values shared by Cubelet's embedded network runtime eBPF dataplane (which stamps `skb->mark`) and the `cube-proxy-iptables-init` TPROXY rules (which match it). Both read the same file, and both validate the values (`HTTP != HTTPS`, bits confined to the mask). See `env.example` for the shipped defaults and how to override them.
 - `CubeAPI/bin/cube-api` → `/usr/local/services/cubetoolbox/CubeAPI/bin/cube-api`
 - `support/` → `/usr/local/services/cubetoolbox/support/`
 - `cubeproxy/` → `/usr/local/services/cubetoolbox/cubeproxy/`
 - `webui/` → `/usr/local/services/cubetoolbox/webui/`
 
-`Cubelet` uses the existing `dynamicconf/conf.yaml` from the repository as-is. At runtime, `network-agent` preferentially reads the network plugin configuration from `Cubelet/config/config.toml` via `--cubelet-config` to stay consistent with `Cubelet`'s network parameters. `cube-api` reads environment variables directly from `.one-click.env` on startup, listening on `0.0.0.0:3000` by default and forwarding to the local `cubemaster`. MySQL/Redis are always deployed to `/usr/local/services/cubetoolbox/support` and run in Docker containers managed by dedicated systemd services on the target machine. `cube proxy` is always deployed to `/usr/local/services/cubetoolbox/cubeproxy`, built locally from the bundled build context, and managed by systemd. WebUI is deployed to `/usr/local/services/cubetoolbox/webui`, listens on `12088` by default, serves the packaged `webui/dist` directory through a standard nginx container, and proxies `/cubeapi` to CubeAPI through Docker `host-gateway` under systemd management.
+`Cubelet` uses the existing `dynamicconf/conf.yaml` from the repository as-is, and its embedded network runtime reads the network plugin configuration from `Cubelet/config/config.toml` directly. `cube-api` and `cubeops` read environment variables from `.one-click.env` on startup. CubeOps warehouse knobs are `CUBE_OPS_WAREHOUSE_*` (timeouts, GitHub/CNB allow-lists and tokens) plus `CUBE_OPS_S3_*`; by default the warehouse reuses the volume MinIO/S3 connection with a dedicated `cube-ops` bucket, so no extra S3 setup is needed. There is no CubeOps YAML file in the one-click layout. `cube-api` listens on `0.0.0.0:3000` by default and forwards to the local `cubemaster`. MySQL/Redis are always deployed to `/usr/local/services/cubetoolbox/support` and run in Docker containers managed by dedicated systemd services on the target machine. `cube proxy` is always deployed to `/usr/local/services/cubetoolbox/cubeproxy`, built locally from the bundled build context, and managed by systemd. WebUI is deployed to `/usr/local/services/cubetoolbox/webui`, listens on `12088` by default, serves the packaged `webui/dist` directory through a standard nginx container, and proxies `/cubeapi` to CubeAPI through Docker `host-gateway` under systemd management.
 
 ## Target Machine Installation
 
@@ -186,12 +220,80 @@ Before installation, you can explicitly set the current node's internal IP in `.
 
 If `CUBE_SANDBOX_NODE_IP` is explicitly set, the installation script will use that value directly; otherwise, the auto-detected node IP is persisted in the runtime environment and used to render `cube proxy` / DNS addresses.
 
+### CubeS3lvol stop/upgrade semantics
+
+CubeS3lvol (s3lvol) is a `Wants=` member of the `cube-sandbox-*` role target. It
+is deliberately **not** `PartOf=` it (see the unit): stopping a role target does
+not stop s3lvol, because a stop here is a full teardown and an upgrade must not
+inherit one.
+
+- **Stopping** (`down.sh`): `down.sh` stops the role target and then stops
+  s3lvol explicitly. That goes through `cube-s3lvol-stop.sh`'s **conditional
+  unload** — when the target process is alive it runs the full `rcow_stop.sh`
+  (disconnect initiators -> flush/unload lvstore -> stop the target); when the
+  target has already crashed it only clears target-side residue and **never
+  disconnects the NVMf initiators**. `down.sh` only stops services, it does
+  **not delete any data** (`/data/cubelet/rcow/wal_bdev.img` and the bstore
+  metadata are kept); the next start recovers via attach/replay.
+- **Upgrading** (`install.sh --mode=upgrade`): nothing to configure and nothing
+  to remember between releases. The component is installed into a **versioned
+  directory** (`CubeS3lvol-<version>/`) with the bare name `CubeS3lvol` as a
+  symlink to it; the version just replaced is kept beside it and older ones are
+  pruned.
+  - **The first upgrade of an install from before this**, or of a target too old
+    to describe its own on-disk formats, or one whose scripts predate the rename
+    to `rcow_upgrade.sh`: the target is **stopped and started** — an
+    interruption, for that one upgrade only. `install.sh` says why.
+  - **Every upgrade after that** is done **in place**: the target is
+    checkpointed online, killed outright, and the replacement rebuilds the same
+    NQN/(subsys, nsid)/UUID grid, so the host reconnects to the same
+    `/dev/nvmeXnY` and a sandbox's I/O only pauses (about 8s). The initiator is
+    never disconnected and the lvstore never unloaded. Anything the checkpoint
+    could not push is still in the WAL and the replacement replays it, so the
+    pre-kill flush is skipped by default (`RCOW_HOT_FLUSH_MS=0`). This runs
+    `cube-s3lvol-hot-upgrade.sh` **before** the rest of the install stops
+    anything, because the prepare and the layout snapshot both need the running
+    target and the S3 endpoint.
+  - A swap that does not come back with the layout intact is **rolled back** to
+    the previous version; `install.sh` still finishes the rest and then exits
+    non-zero. The node is complete but on the old s3lvol.
+  - `wal_bdev.img` is **never overwritten** (created only on first install; its
+    size fixes the journal/WAL layout), and the `RCOW_*` settings in
+    `.one-click.env` are merged and kept across the upgrade.
+- **If a stop is refused** — a live target the stop script will not touch — the
+  unit ends stopped while the target keeps running and serving. Nothing was
+  disconnected and the lvstore is still loaded, and the marker is kept, so the
+  next upgrade picks the same target up and stops it in place: with no unit
+  running there is none to be asked, and the upgrade drives that stop itself.
+  `rcow_stop.sh` by hand is the **planned** stop instead — it disconnects the
+  initiator and unloads the lvstore — so it is only for when that outage is what
+  is wanted. The one refusal that asks for operator work is a marker naming a
+  target this host cannot confirm: the stop script says so, and that marker has
+  to be resolved before anything will start.
+- **Enable/disable**: preferred `ONE_CLICK_ENABLE_S3LVOL=0|1 ./install.sh`
+  (honored on upgrade as well). Or put only that key in the bundle `.env`
+  and re-run `install.sh`. Do not `cp env.example .env` as a full copy
+  before upgrade — that resets this switch to `0`. Hand-editing
+  `.one-click.env` is no longer required. `systemctl enable/disable
+  cube-sandbox-s3lvol.service` still works as a direct systemd toggle.
+  `CUBE_PVM_ENABLE` follows the same rule: appearing in `.env` or the
+  process environment always counts as an explicit choice (so a full
+  `cp env.example .env` before an upgrade also resets it to `0`).
+- **S3 backend**: when enabled, `install.sh` writes `/data/cubelet/s3.cfg`
+  from `CUBE_S3_*` (bundled MinIO fill, or the operator's external store).
+  s3lvol uses its own bucket (`CUBE_S3LVOL_BUCKET`, default `cube-s3lvol`)
+  so it never shares prefixes with the volume plugin's `cube-volumes`.
+  The supervisor idempotently creates that bucket with a stdlib SigV4
+  tool — no awscli. A hand-written `s3.cfg` without the one-click sentinel
+  is left alone. There is **no fallback** from the old `/data/cubelet/cos.cfg`;
+  rename it and switch to the new field names.
+
 ### Digital Assistant Environment Variables
 
-The Digital Assistant (AgentHub) uses MySQL through CubeAPI to persist assistant instances, snapshots, templates, and operation history. In one-click deployments, `DATABASE_URL` is generated automatically from `CUBE_SANDBOX_MYSQL_HOST`, `CUBE_SANDBOX_MYSQL_PORT`, `CUBE_SANDBOX_MYSQL_USER`, `CUBE_SANDBOX_MYSQL_PASSWORD`, and `CUBE_SANDBOX_MYSQL_DB` when it is not set explicitly:
+The Digital Assistant (AgentHub) uses MySQL through CubeOps to persist assistant instances, snapshots, templates, and operation history. In one-click deployments, `DATABASE_URL` is derived from `CUBE_SANDBOX_MYSQL_HOST`, `CUBE_SANDBOX_MYSQL_PORT`, `CUBE_SANDBOX_MYSQL_USER`, `CUBE_SANDBOX_MYSQL_PASSWORD`, and `CUBE_SANDBOX_MYSQL_DB` when it is not set explicitly — written urlencoded into `.one-click.env`, with the start scripts' fallback exporting the split fields for CubeOps to map directly:
 
 ```bash
-# Optional; generated by one-click when omitted.
+# Optional; derived from CUBE_SANDBOX_MYSQL_* when omitted.
 DATABASE_URL=mysql://cube:cube_pass@127.0.0.1:3306/cube_mvp
 ```
 
@@ -214,6 +316,19 @@ ONE_CLICK_DEPLOY_ROLE=compute
 ONE_CLICK_CONTROL_PLANE_IP=10.0.0.11
 ```
 
+If the control node runs bundled MinIO (or any S3 backend), copy `CUBE_S3_*` from
+that node's runtime env file so the volume plugin reaches the same store:
+
+```bash
+# Run on the control node; paste the output into the compute node's .env
+grep '^CUBE_S3_' /usr/local/services/cubetoolbox/.one-click.env
+```
+
+Compute nodes never deploy MinIO; they only consume `CUBE_S3_*`. These values are
+optional but strongly recommended: if missing, the installer prints a prominent
+warning and continues; the S3 volume plugin stays disabled until configured. Allow
+TCP 9000 from compute to the control node when using bundled MinIO.
+
 If you need to explicitly specify the compute node IP, or if the default NIC on the target machine is not `eth0`, also set:
 
 ```bash
@@ -228,17 +343,17 @@ sudo ./install-compute.sh
 
 In compute node mode, the installer will:
 
-- Install `Cubelet`, `network-agent`, `cube-shim`, `cube-image`, `cube-kernel-scf`, `cube-egress`, the required scripts, and `docker`.
-- Start `network-agent` and `cubelet`, and bring up `cube-egress` via `cube-sandbox-compute.target` (the transparent egress MITM proxy, run as a docker container, which enforces per-sandbox egress policy).
+- Install `Cubelet` with the embedded network runtime, `cube-shim`, `cube-image`, `cube-kernel-scf`, `cube-egress`, the required scripts, and `docker`.
+- Start `cubelet`, and bring up `cube-egress` via `cube-sandbox-compute.target` (the transparent egress MITM proxy, run as a docker container, which enforces per-sandbox egress policy).
 - Before `cube-egress` starts, pull the MITM root CA (cert + key) from the control node's `/cube/ca/<file>` endpoint so it matches the CA baked into templates — templates then trust the leaf certs the compute-node `cube-egress` signs.
-- Point `Cubelet`'s `meta_server_endpoint` to `ONE_CLICK_CONTROL_PLANE_IP:8089`.
-- Automatically register the node via the control node's `/internal/meta` API.
+- Point `Cubelet`'s `meta_server_endpoint` to `ONE_CLICK_CONTROL_PLANE_IP:3010` (CubeOps node-agent).
+- Automatically register the node via the control node's `/internal/v1/node-agent` API.
 
 Notes:
 
 - All compute nodes must have `Cubelet` listening on the same gRPC port as configured on the control node (default `9999`).
 - `CUBE_SANDBOX_NODE_IP` is used both as the one-click configuration value and as the `Cubelet` node registration IP.
-- The control node must be able to reach port `9999/tcp` on all compute nodes; compute nodes must be able to reach port `8089/tcp` on the control node.
+- The control node must be able to reach port `9999/tcp` on all compute nodes; compute nodes must be able to reach port `8089/tcp` on the control node (and `9000/tcp` when using bundled MinIO as the S3 volume backend).
 
 MySQL/Redis dependencies are deployed by default to:
 
@@ -250,20 +365,31 @@ During installation, runtime files are prepared in this directory and the follow
 
 - `mysql:8.0`
 - `redis:7-alpine`
+- `minio` (S3-compatible volume backend; explicit via `CUBE_SANDBOX_MINIO_ENABLED`, default on)
 
-### Using an external MySQL / Redis
+### Using an external MySQL / PostgreSQL / Redis
 
-To point CubeSandbox at an existing MySQL/Redis server instead of the bundled
-local containers, set the following in `.env` before running `install.sh`
-(see `env.example`):
+To point CubeSandbox at an existing MySQL, PostgreSQL, or Redis server instead
+of the bundled local containers, set the following in `.env` before running
+`install.sh` (see `env.example`). `CUBE_DATABASE_DRIVER` mirrors Helm
+`database.driver`: `mysql` (default) or `postgres` (always external).
 
 ```bash
-# External MySQL (any subset of the credential fields may be overridden)
+# External MySQL (default driver; any subset of the credential fields may be overridden)
+# CUBE_DATABASE_DRIVER=mysql
 CUBE_EXTERNAL_MYSQL_HOST=10.0.0.20
 CUBE_EXTERNAL_MYSQL_PORT=3306
 CUBE_EXTERNAL_MYSQL_USER=cube
 CUBE_EXTERNAL_MYSQL_PASSWORD=cube_pass
 CUBE_EXTERNAL_MYSQL_DB=cube_mvp
+
+# External PostgreSQL (one-click never ships a local PostgreSQL)
+# CUBE_DATABASE_DRIVER=postgres
+# CUBE_EXTERNAL_POSTGRES_HOST=10.0.0.20
+# CUBE_EXTERNAL_POSTGRES_PORT=5432
+# CUBE_EXTERNAL_POSTGRES_USER=cube
+# CUBE_EXTERNAL_POSTGRES_PASSWORD=cube_pass
+# CUBE_EXTERNAL_POSTGRES_DB=cube_mvp
 
 # External Redis
 CUBE_EXTERNAL_REDIS_HOST=10.0.0.21
@@ -271,15 +397,101 @@ CUBE_EXTERNAL_REDIS_PORT=6379
 CUBE_EXTERNAL_REDIS_PASSWORD=ceuhvu123
 ```
 
-When `CUBE_EXTERNAL_MYSQL_HOST` (and/or `CUBE_EXTERNAL_REDIS_HOST`) is set, `install.sh`:
+When `CUBE_EXTERNAL_MYSQL_HOST`, `CUBE_EXTERNAL_POSTGRES_HOST` (with
+`CUBE_DATABASE_DRIVER=postgres`), and/or `CUBE_EXTERNAL_REDIS_HOST` is set,
+`install.sh`:
 
-- patches `CubeMaster/conf.yaml` with the external MySQL/Redis endpoint;
-- writes `DATABASE_URL` (CubeAPI) and `CUBE_PROXY_REDIS_*` (cube proxy) to `.one-click.env` so every service consumes the external endpoint;
-- masks the corresponding `cube-sandbox-mysql.service` / `cube-sandbox-redis.service` so the local container is never started; and
-- makes `quickcheck.sh` and `up-support.sh` skip lifecycle management of the now-external dependency. (`down-support.sh` has no external-dep awareness and still issues a `docker compose down`, but this is a harmless no-op because the local containers were never started for the external dependency.)
+- patches `instance_db_config` (`driver`, address, user, password, database) in
+  both `CubeMaster/conf.yaml` and `CubeTemplateCenter/conf.yaml`;
+- writes `DATABASE_URL` (`mysql://` or `postgresql://`) and `CUBE_PROXY_REDIS_*`
+  to `.one-click.env` so every service consumes the external endpoint;
+- masks the corresponding `cube-sandbox-mysql.service` / `cube-sandbox-redis.service`
+  so the local container is never started; and
+- makes `quickcheck.sh` and `up-support.sh` skip lifecycle management of the
+  now-external dependency. (`down-support.sh` has no external-dep awareness and
+  still issues a `docker compose down`, but this is a harmless no-op because the
+  local containers were never started for the external dependency.)
 
-The external MySQL must already grant the configured user access to the target
-database. CubeMaster runs its own embedded schema migrations on first start.
+The external database must already grant the configured user access to the
+target database. CubeMaster and CubeTemplateCenter both open that database and
+run embedded schema migrations on first start.
+
+### Bundled MinIO vs the S3 volume plugin
+
+`CUBE_SANDBOX_MINIO_*` only deploys the MinIO container. The S3 volume plugin
+always reads `CUBE_S3_*` and writes `volume-s3.conf` from those values.
+
+The bundled MinIO occupies two host ports (both overridable via environment
+variables):
+
+| Port | In container | Host mapping | Bind address |
+| ---- | ------------ | ------------ | ------------ |
+| S3 API | `9000` | `CUBE_SANDBOX_MINIO_API_PORT` (default `9000`) | `CUBE_SANDBOX_MINIO_API_BIND`, default `CUBE_SANDBOX_NODE_IP` (falls back to `127.0.0.1` when no node IP is detected) |
+| Web console | `9001` | `CUBE_SANDBOX_MINIO_CONSOLE_PORT` (default `9001`) | always `127.0.0.1`, localhost only |
+
+The S3 API is published on the node IP by default so compute-node Cubelets can
+reach it directly. To keep S3 local-only, set
+`CUBE_SANDBOX_MINIO_API_BIND=127.0.0.1` — at the cost of compute nodes losing
+access to the bundled MinIO (use an external S3 store instead). The console
+port is always bound to `127.0.0.1` and is never exposed.
+
+On a control node with `CUBE_SANDBOX_MINIO_ENABLED=1` (default), `install.sh`
+starts MinIO, generates a 24-character random password if you left it empty,
+then **fills `CUBE_S3_*`** from that MinIO (`http://<node-ip>:9000`, the MinIO
+user/password, path-style s3fs options) and persists both families in
+`.one-click.env`. Do not set `CUBE_S3_ENDPOINT` yourself while MinIO is
+enabled. A later upgrade may reload that filled local endpoint from
+`.one-click.env`; that is expected and allowed. Only a different,
+operator-supplied external store requires `CUBE_SANDBOX_MINIO_ENABLED=0`.
+
+Other MinIO deployment parameters: default user `cubeminio`
+(`CUBE_SANDBOX_MINIO_ROOT_USER`; the password must be at least 8 characters or
+MinIO refuses to start), bucket `cube-volumes` (`CUBE_SANDBOX_MINIO_BUCKET`),
+data volume `cube-sandbox-minio-data` (`CUBE_SANDBOX_MINIO_VOLUME`, mounted at
+`/data`), container name `cube-sandbox-minio` (`CUBE_SANDBOX_MINIO_CONTAINER`),
+and image `CUBE_SANDBOX_MINIO_IMAGE` (default selected by `MIRROR=cn|int`).
+MinIO runs under `cube-sandbox-minio.service`; after startup, readiness is
+verified via `curl http://<node-ip>:9000/minio/health/live` (a `200` response
+means it is healthy).
+
+Template artifacts and the CubeOps warehouse can use `CUBE_ARTIFACT_STORE_BACKEND=fs`
+and `CUBE_OPS_STORE_BACKEND=fs` instead of MinIO (S3 volumes still need MinIO
+or external S3).
+
+To use an existing S3-compatible store instead, set
+`CUBE_SANDBOX_MINIO_ENABLED=0` and `CUBE_S3_*` before `install.sh`:
+
+```bash
+CUBE_SANDBOX_MINIO_ENABLED=0
+CUBE_S3_ENDPOINT=https://s3.example.com
+CUBE_S3_ACCESS_KEY_ID=...
+CUBE_S3_SECRET_ACCESS_KEY=...
+CUBE_S3_BUCKET=cube-volumes
+# CUBE_S3_REGION=us-east-1
+# CUBE_S3_S3FS_EXTRA_OPTS=-ouse_path_request_style
+```
+
+Compute nodes never run MinIO. Copy the filled `CUBE_S3_*` values from the
+control node's runtime env file into the compute `.env`:
+
+```bash
+# Run on the control node; paste the output into the compute node's .env
+grep '^CUBE_S3_' /usr/local/services/cubetoolbox/.one-click.env
+```
+
+These values are optional but strongly recommended — if missing, the installer
+warns and continues; the S3 volume plugin stays disabled until configured. Allow
+TCP 9000 from compute to the control node if using bundled MinIO:
+
+```bash
+ONE_CLICK_DEPLOY_ROLE=compute
+ONE_CLICK_CONTROL_PLANE_IP=10.0.0.11
+CUBE_S3_ENDPOINT=http://10.0.0.11:9000
+CUBE_S3_ACCESS_KEY_ID=cubeminio
+CUBE_S3_SECRET_ACCESS_KEY=<from control .one-click.env>
+CUBE_S3_BUCKET=cube-volumes
+CUBE_S3_S3FS_EXTRA_OPTS=-ouse_path_request_style
+```
 
 `cube proxy` and its DNS resolution are mandatory capabilities in one-click. The following two values in `.env` must remain `1`:
 
@@ -293,6 +505,8 @@ Other common parameters:
 ```bash
 CUBE_PROXY_HTTPS_PORT=443
 CUBE_PROXY_HTTP_PORT=80
+CUBE_PROXY_GRPC_PORT=9090
+CUBE_EGRESS_ADMIN_PORT=9091
 # Deprecated: CUBE_PROXY_HOST_PORT is ignored; configure CUBE_PROXY_HTTP_PORT instead.
 CUBE_PROXY_CERT_DIR=/usr/local/services/cubetoolbox/cubeproxy/certs
 CUBE_PROXY_DNS_ANSWER_IP="${CUBE_SANDBOX_NODE_IP}"
@@ -313,10 +527,10 @@ During installation, the following steps are performed:
 - `cube-sandbox-*.service|target|timer` unit files are installed under `/etc/systemd/system/`, and both host processes and Docker containers are managed uniformly by systemd.
 - MySQL, Redis, cube proxy, WebUI, and CoreDNS still run in Docker, but their lifecycle is managed directly by dedicated systemd services instead of relying on runtime `docker compose up -d`.
 - If `resolvectl` is available, one-click creates a dedicated dummy link (default `cube-dns0`) with a local address, binds CoreDNS to `169.254.254.53` on that link by default, and routes `cube.app` through the link without affecting the host's default public DNS path. If `resolvectl` is unavailable on the target machine, the installer falls back to `NetworkManager + dnsmasq`: it still creates the same dummy link, asks `dnsmasq` to additionally listen on `169.254.254.53`, takes `/etc/resolv.conf` ownership away from NetworkManager (`rc-manager=unmanaged`) and rewrites it to point at the same non-loopback IP. This keeps the host resolver symmetrical with the `systemd-resolved` path and avoids the Docker daemon's silent fallback to public DNS (`8.8.8.8`) that happens when `/etc/resolv.conf` contains only loopback nameservers — without it, every container on the host (including `docker build`'s `apk update` step) ends up using DNS servers that internal machines cannot reach. On hosts where NetworkManager initializes its `dnsmasq` plugin but never spawns the child process (for example bonded interfaces managed via `ifcfg` + `assume`), set `CUBE_PROXY_DNSMASQ_MODE=standalone` so the DNS scripts launch and own `dnsmasq` directly instead of relying on the NetworkManager plugin; the client-facing resolver layout (dummy link, listen addresses, entry IP) is otherwise identical.
-- Host processes `network-agent`, `cubemaster`, `cube-api`, and `cubelet` are started through systemd, and `quickcheck.sh` verifies both unit state and service health.
+- Host processes `cubemaster`, `cube-api`, and `cubelet` are started through systemd, and `quickcheck.sh` verifies both unit state and service health.
 - A standard WebUI nginx container is started under `/usr/local/services/cubetoolbox/webui/`. It mounts `webui/dist` as read-only static content, publishes `WEB_UI_HOST_PORT` (`12088` by default), maps `host.docker.internal` to Docker `host-gateway`, and verifies `/health` through the nginx reverse proxy (served by CubeOps).
 
-Stopping one-click will simultaneously stop MySQL/Redis under `/usr/local/services/cubetoolbox/support`, WebUI, `cube proxy` / `CoreDNS`, and the host processes `network-agent` / `cubemaster` / `cube-api` / `cubelet`, and will roll back the host DNS routing configuration for `cube.app`.
+Stopping one-click will simultaneously stop MySQL/Redis under `/usr/local/services/cubetoolbox/support`, WebUI, `cube proxy` / `CoreDNS`, and the host processes `cubemaster` / `cube-api` / `cubelet`, and will roll back the host DNS routing configuration for `cube.app`.
 
 After deployment, to point the E2B official SDK to the one-click node, set the following on the client side:
 
@@ -333,7 +547,7 @@ export E2B_API_KEY=e2b_000000
 
 Required commands:
 
-- `docker` (cube-egress runs as a docker container; the installer installs it automatically — this is a hard prerequisite, so in offline/air-gapped environments where automatic installation isn't possible, install Docker beforehand)
+- `docker` (cube-egress runs as a docker container; the installer installs it automatically — this is a hard prerequisite, so in offline/air-gapped environments where automatic installation isn't possible, install Docker beforehand). Snap Docker is rejected: it cannot read `/usr/local/services` (`sudo snap remove docker`, then install docker-ce).
 - `tar`
 - `ss`
 - `bash`
@@ -348,6 +562,8 @@ Conditional commands:
 - If `ONE_CLICK_ENABLE_TENCENT_DOCKER_MIRROR=1` is enabled and `/etc/docker/daemon.json` already exists, `python3` is required.
 - If the packaged `Cubelet/config/config.toml` enables `storage_backend = "cubecow"`, one-click also checks:
   `mkfs.ext4`, `mount`, `umount`, `losetup`
+- If `ONE_CLICK_ENABLE_S3LVOL=1` and the package ships `CubeS3lvol/bin/s3lvol_tgt`, one-click also checks:
+  `nvme` (nvme-cli), `python3`, `truncate`, remaining `s3lvol_tgt` shared libraries (`ldd`; OpenSSL is static), and (x86_64) `avx2` in `/proc/cpuinfo`. Release `s3lvol_tgt` is built for Haswell/AVX2, not the packager's native CPU. `install.sh` installs `nvme-cli` via the system package manager when `nvme` is missing. `python3` must be able to run `CubeS3lvol/scripts/rpc.py --help` (Python 3.8 is enough; the packaged launcher supplies the 3.9 `argparse` bits SPDK's client needs).
 
 Recommended packages to satisfy the cubecow command set:
 
@@ -366,11 +582,22 @@ sudo dnf install -y e2fsprogs util-linux || \
 sudo yum install -y e2fsprogs util-linux
 ```
 
+Additional packages for `ONE_CLICK_ENABLE_S3LVOL=1` (libraries only; `nvme-cli` is installed by `install.sh`):
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install -y python3 libaio1 libnuma1 uuid-runtime
+
+# OpenCloudOS / RHEL / CentOS
+sudo dnf install -y python3 libaio libnuma libuuid || \
+sudo yum install -y python3 libaio libnuma libuuid
+```
+
 ### Control Role (`install.sh`, default)
 
 Required commands:
 
-- `docker`
+- `docker` (snap Docker is rejected; install docker-ce / docker.io)
 - `tar`
 - `ss`
 - `bash`
@@ -393,6 +620,8 @@ Conditional commands:
 - If `ONE_CLICK_ENABLE_TENCENT_DOCKER_MIRROR=1` is enabled and `/etc/docker/daemon.json` already exists, `python3` is required.
 - If the packaged `Cubelet/config/config.toml` enables `storage_backend = "cubecow"`, one-click also checks:
   `mkfs.ext4`, `mount`, `umount`, `losetup`
+- If `ONE_CLICK_ENABLE_S3LVOL=1` and the package ships `CubeS3lvol/bin/s3lvol_tgt`, one-click also checks:
+  `nvme` (nvme-cli), `python3`, `truncate`, remaining `s3lvol_tgt` shared libraries (`ldd`; OpenSSL is static), and (x86_64) `avx2` in `/proc/cpuinfo`. Release `s3lvol_tgt` is built for Haswell/AVX2, not the packager's native CPU. `install.sh` installs `nvme-cli` via the system package manager when `nvme` is missing. `python3` must be able to run `CubeS3lvol/scripts/rpc.py --help` (Python 3.8 is enough; the packaged launcher supplies the 3.9 `argparse` bits SPDK's client needs).
 
 Recommended packages to satisfy the cubecow command set:
 
@@ -411,6 +640,17 @@ sudo dnf install -y e2fsprogs util-linux || \
 sudo yum install -y e2fsprogs util-linux
 ```
 
+Additional packages for `ONE_CLICK_ENABLE_S3LVOL=1` (libraries only; `nvme-cli` is installed by `install.sh`):
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install -y python3 libaio1 libnuma1 uuid-runtime
+
+# OpenCloudOS / RHEL / CentOS
+sudo dnf install -y python3 libaio libnuma libuuid || \
+sudo yum install -y python3 libaio libnuma libuuid
+```
+
 ## Prerequisites
 
 > **Security**: All core services bind `0.0.0.0` by default. Before deploying on
@@ -422,12 +662,13 @@ sudo yum install -y e2fsprogs util-linux
 - The target machine preferentially uses `systemd-resolved` / `resolvectl` for split DNS of `cube.app`. The current implementation creates a dedicated dummy link (default `cube-dns0`), assigns it a local `/32` address, binds CoreDNS to `169.254.254.53` on that link by default, and attaches that address plus `~cube.app` to the link. If that capability is unavailable, the installation script will fall back to `NetworkManager + dnsmasq`: the same dummy link is created and `dnsmasq` is configured (via `listen-address` / `bind-interfaces`) to listen on both `127.0.0.1` and `169.254.254.53`. `/etc/resolv.conf` is then written by the installer (NetworkManager runs with `rc-manager=unmanaged`) to point at `169.254.254.53`, so host applications and Docker containers see the same non-loopback resolver. When NetworkManager loads its `dnsmasq` plugin but never spawns the child (for example bonded interfaces managed via `ifcfg` + `assume`), set `CUBE_PROXY_DNSMASQ_MODE=standalone` in `.one-click.env` so the DNS scripts start and manage `dnsmasq` directly.
 - The target machine pulls `mysql:8.0` and `redis:7-alpine` from the internet by default.
 - The `mkcert` binary is bundled in the release package (`support/bin/mkcert`). If `mkcert` is not pre-installed on the system, it is automatically copied from the package to `/usr/local/bin/mkcert` — no internet download required.
+- The S3 volume plugin (`{CubeMaster,Cubelet}/plugin/cube-volume-s3`) is a static Go binary with a built-in S3 client, compiled at pack time from `examples/volume/s3`. Control nodes need no S3 command line tool; nodes that mount volumes still need `s3fs`. Ship a prebuilt binary with `ONE_CLICK_VOLUME_S3_BIN`.
 - TLS certificates and private keys for `cube proxy` are stored on the host under `CUBE_PROXY_CERT_DIR` and mounted read-only into the container via `docker compose`. After updating certificates, simply restart `cube-proxy` or reload nginx inside the container — no image rebuild required.
 - The recommended entry point `build-release-bundle-builder.sh` requires the host machine to have `docker`, `make`, `tar`, `python3`, `truncate`, `ldd`, `mkfs.ext4`, and similar tools.
 - The recommended entry point only runs component compilation inside the builder; guest image generation and final packaging are still performed on the host machine.
 - If invoking the low-level entry point `build-release-bundle.sh` directly, the build machine must also have local toolchains such as `go`, `cargo`, and `make` installed, depending on the build mode.
 - If using the low-level entry point directly or running the recommended entry point for the first time, the build machine must be able to download Go modules from the internet. Configure a usable `GOPROXY` in advance for restricted network environments.
-- If the VM path is enabled, the target machine must still satisfy the runtime permission requirements for `network-agent`, tap interfaces, routing, etc.
+- If the VM path is enabled, the target machine must still satisfy the runtime permission requirements for the Cubelet embedded network runtime, tap interfaces, routing, etc.
 
 ## Known Limitations
 
@@ -435,6 +676,7 @@ sudo yum install -y e2fsprogs util-linux
 - If the `deploy/guest-image/Dockerfile` build fails, or the build machine's `mkfs.ext4` does not support the `-d` flag, guest image generation will fail immediately.
 - `cube-snapshot/spec.json` is not a mandatory artifact in the current first release of one-click. If absent, the related plugin degrades to a warning rather than blocking the basic startup.
 - The default `NetworkManager + dnsmasq` fallback relies on NetworkManager to spawn the `dnsmasq` child. On hosts where NetworkManager initializes the plugin but never spawns it (for example bonded interfaces managed via `ifcfg` + `assume`), set `CUBE_PROXY_DNSMASQ_MODE=standalone` so the DNS scripts launch and manage `dnsmasq` themselves. Standalone mode does not require a restartable `NetworkManager`, but on hosts with no resolver manager at all you must ensure nothing else overwrites `/etc/resolv.conf` afterwards. In this mode `dnsmasq` runs as a bare child that systemd does not supervise, so if it later crashes nothing restarts it automatically; recover with `systemctl restart cube-sandbox-dns`.
+- **Snap Docker is not supported.** Ubuntu Server's installer (Subiquity) offers Docker as a "Featured Snap" during OS setup; users who check that option — or later run `snap install docker` — end up with a sandboxed Docker daemon that cannot access paths outside its AppArmor confinement (e.g. `/usr/local/services`). The install scripts detect this automatically and abort with remediation steps. Fix: `sudo snap remove docker`, then install docker-ce per <https://docs.docker.com/engine/install/ubuntu/>.
 
 ## DNS Troubleshooting
 
@@ -531,7 +773,7 @@ export TENCENTCLOUD_TKE_NODE_COUNT=2              # TKE worker nodes (default 2)
 export TENCENTCLOUD_COMPUTE_INSTANCE_TYPE=SA9.MEDIUM8
 export TENCENTCLOUD_USE_TCR=false                 # default: public pre-built images
 export TENCENTCLOUD_USE_CFS=false                 # default: no CFS, cubemaster single replica
-export TENCENTCLOUD_CUBE_IMAGE_TAG=v0.6.0
+export TENCENTCLOUD_CUBE_IMAGE_TAG=v0.7.2
 ```
 
 For non-interactive / CI runs, also set these (without a TTY the interactive

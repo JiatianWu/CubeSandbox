@@ -305,6 +305,25 @@ finally:
 `allow_internet_access=False` 或 `deny_out=["0.0.0.0/0"]`。公网 target 必须
 来自 `SDK_E2E_TCP_TARGET_*` 等配置，不得在用例中硬编码为唯一环境假设。
 
+能力位（除注明外为 Cube 专用）：
+
+| Capability | 覆盖 |
+| --- | --- |
+| `network_allow_deny` / `network_public_access` | IP allow/deny、`allow_internet_access`、restrict public traffic |
+| `network_dns_allow` | 域名 `allow_out` + DNS 学习、`*.` 通配 |
+| `network_always_denied` | 默认拒绝 link-local / 私网 CIDR |
+| `network_l7_egress` | CubeEgress inject / first-match / deny / TLS MITM / SNI·host |
+| `network_mask_request_host` | `mask_request_host` 改写 |
+| `network_template_merge` | 模板网络配置与 create-time network 合并 |
+
+L7 echo 使用公共服务 **httpbun.com**（可用 `SDK_E2E_L7_ECHO_HOST` 覆盖），
+用例需标 `requires_internet`。`rules` 用 wire 形态 dict 放进
+`sandbox_create_options`；inject secret 只用测试占位值。
+
+域名 / L7 用例依赖 guest 内可用的 DNS。若镜像默认 nameserver 在实验环境
+不可达，请用 `dns=[...]` 重建模板，或对模块内建模板设置
+`SDK_E2E_GUEST_DNS`（如 `test_template_network_merge.py`）。
+
 ### 6.6 Concurrency 与多实例
 
 需要第二个实例时，使用 `managed_control_sandbox`，使 peer 的清理语义与主
@@ -321,6 +340,20 @@ def test_isolation(sdk_sandbox, sdk_backend, sdk_e2e_config):
 
 真正并发的用例还应设置可控并发数、超时和资源上限，并确保异常路径回收所有
 future/peer sandbox。
+
+### 6.7 Volume
+
+Volume Plugin 用例使用 `volume` marker，随 `--run-e2e` 执行（默认 driver
+`s3`）。无插件的环境设置 `SDK_E2E_VOLUME_PLUGIN=false` 即可跳过。先创建
+volume，再通过 `create_adapter(..., create_options=...)` 传入动态
+`volumeMounts`，不要在 `sandbox_create_options` 里写死 volume ID。默认安装
+已接好 S3 插件 + MinIO：
+https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/s3/README.md
+（`cubesandbox` >= 0.6.0）。
+
+```bash
+pytest --run-e2e -m volume --sdk-e2e-backends=cubesandbox
+```
 
 ## 7. 清理、保留和额外 adapter
 
@@ -351,7 +384,8 @@ pytest --run-e2e --sdk-e2e-trace -vv \
 
 1. pytest 的 setup/call/teardown phase；
 2. terminal trace 的最后一次失败操作；
-3. `SDK_E2E_REPORT_DIR/events.jsonl` 中同一 node ID 的事件；
+3. `SDK_E2E_REPORT_DIR` 下同一 node ID 的事件（串行为 `events.jsonl`，
+   xdist 并行时在 `events-gw*.jsonl` 之一）；
 4. sandbox `info().raw` 中的 state、endAt、metadata；
 5. 平台生命周期场景下的 CubeProxy heartbeat 与 lifecycle-manager 日志。
 

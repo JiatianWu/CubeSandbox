@@ -23,7 +23,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/utils"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	volumeplugin "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/volume/plugin"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -34,7 +34,6 @@ type Config struct {
 	AuthConf         *AuthConf             `yaml:"auth"`
 	Log              *log.Conf             `yaml:"log"`
 	CubeletConf      *CubeletConf          `yaml:"cubelet_conf"`
-	OssDBConfig      *DBConfig             `yaml:"ossdb_config"`
 	InstanceDBConfig *DBConfig             `yaml:"instance_db_config"`
 	RedisConf        *RedisConf            `yaml:"redis"`
 	ExtraConf        *ExtraConf            `yaml:"extra_conf"`
@@ -42,6 +41,12 @@ type Config struct {
 	ReqTemplateConf  *ReqTemplateConf      `yaml:"req_template_conf"`
 	HookWhitelist    *HookWhitelist        `yaml:"hook_whitelist"`
 	CubeEgressConf   *CubeEgressConf       `yaml:"cube_egress_conf"`
+	CubeProxyConf    *CubeProxyConf        `yaml:"cube_proxy_conf"`
+
+	// SoftDeletePurge configures the scheduled hard-purge of soft-deleted
+	// (tombstoned) database rows (issue #973). nil leaves the purger at its
+	// safe defaults (7-day retention, hourly, enabled). See CubeDB/tombstone.
+	SoftDeletePurge *SoftDeletePurgeConf `yaml:"soft_delete_purge"`
 
 	// VolumePlugins lists external Controller Hook Plugin configurations.
 	// Types: binary (fork CLI) or rpc (gRPC VolumeControllerService).
@@ -69,41 +74,69 @@ type CommonConf struct {
 	HttpPort               int           `yaml:"http_port"`
 	// HttpBind is the HTTP listen address. Empty means 0.0.0.0 (all
 	// interfaces); set to 127.0.0.1 to keep the API loopback-only.
-	HttpBind                        string            `yaml:"http_bind"`
-	WriteTimeout                    int               `yaml:"http_writetimeout"`
-	ReadTimeout                     int               `yaml:"http_readtimeout"`
-	IdleTimeout                     int               `yaml:"http_idletimeout"`
-	GraceFullStopTimeoutInSec       int               `yaml:"gracefull_stop_timeout_insec"`
-	SyncMetaDataInterval            time.Duration     `yaml:"sync_meta_data_interval"`
-	SyncMetricDataInterval          time.Duration     `yaml:"sync_metric_data_interval"`
-	CleanSandboxCacheInterval       time.Duration     `yaml:"clean_sandbox_cache_interval"`
-	EnabledListRunningSandboxCache  bool              `yaml:"enabled_list_running_sandbox_cache"`
-	AsyncTaskQueueSize              int               `yaml:"async_task_queue_size"`
-	AsyncTaskWorkerNum              int               `yaml:"async_task_worker_num"`
-	HeadlessServiceName             string            `yaml:"headless_service_name"`
-	DefaultHeadlessServiceNodesNum  int64             `yaml:"default_headless_service_nodes_num"`
-	ListFilterOutLables             map[string]string `yaml:"list_filter_out_lables"`
-	CollectMetricInterval           time.Duration     `yaml:"collect_metric_interval"`
-	ReportLocalCreateNum            bool              `yaml:"report_local_create_num"`
-	ReportStdevMetric               bool              `yaml:"report_stdev_metric"`
-	GwCacheExpiredTime              time.Duration     `yaml:"gw_cache_expired_time"`
-	GwCacheEnable                   bool              `yaml:"gw_cache_enable"`
-	ReportGWRedisGetMetric          bool              `yaml:"report_gw_redis_get_metric"`
-	EnableGetStatusFromCubelet      bool              `yaml:"enable_get_status_from_cubelet"`
-	DisableHardDelete               bool              `yaml:"disable_hard_delete"`
-	CollectSandboxMemoryWhitelist   []string          `yaml:"collect_sandbox_memory_whitelist"`
-	EnableAllCollectSandboxMemory   bool              `yaml:"enable_all_collect_sandbox_memory"`
-	FilterErrMsgErrorCode           map[int]bool      `yaml:"filter_err_msg_error_code"`
-	DescribeInstancesWhiteList      map[string]bool   `yaml:"describe_instances_white_list"`
-	DescribeTaskExpireTime          int               `yaml:"describe_task_expire_time"`
-	EnablePrivateIpQuery            bool              `yaml:"enable_private_ip_query"`
-	DbMaxRetryCount                 int               `yaml:"db_max_retry_count"`
-	DbRetryInterval                 time.Duration     `yaml:"db_retry_interval"`
-	EnableCheckComNetIDParam        bool              `yaml:"enable_check_com_net_id_param"`
-	EnableDescribeInstanceFromRedis bool              `yaml:"enable_describe_instance_from_redis"`
-	MaxNICQueue                     int               `yaml:"max_nic_queue"`
-	DisableCreateImageCluster       map[string]bool   `yaml:"disable_create_image_cluster"`
-	EnableAGSColdStartSwitch        bool              `yaml:"enable_ags_cold_start_switch"`
+	HttpBind                  string `yaml:"http_bind"`
+	WriteTimeout              int    `yaml:"http_writetimeout"`
+	ReadTimeout               int    `yaml:"http_readtimeout"`
+	IdleTimeout               int    `yaml:"http_idletimeout"`
+	GraceFullStopTimeoutInSec int    `yaml:"gracefull_stop_timeout_insec"`
+	// CubeOps node-management base URL.
+	CubeOpsAddr string `yaml:"cube_ops_addr"`
+	// CubeMaster's HTTP base URL, used by CubeTemplateCenter to report build
+	// results. Can be set here (persistent, per-deployment) or overridden by
+	// the CUBE_MASTER_ADDR environment variable (ad-hoc debugging). Env wins
+	// over yaml.
+	//
+	// CubeMaster also reads it (Config.MasterAddr()): it is the address every
+	// other component must use to reach this process, so it is the only
+	// trustworthy value when the incoming request's Host header is a
+	// wildcard/loopback (e.g. `curl http://0.0.0.0:8089`), which is
+	// unreachable from any other node.
+	MasterAddr string `yaml:"master_addr"`
+	// CubeOpsBootRetries: additional LoadNodes attempts (0 = single-shot).
+	// Bridges the systemd startup window.
+	CubeOpsBootRetries             int               `yaml:"cube_ops_boot_retries"`
+	CubeOpsBootBackoff             time.Duration     `yaml:"cube_ops_boot_backoff"`
+	SyncMetaDataInterval           time.Duration     `yaml:"sync_meta_data_interval"`
+	SyncMetricDataInterval         time.Duration     `yaml:"sync_metric_data_interval"`
+	CleanSandboxCacheInterval      time.Duration     `yaml:"clean_sandbox_cache_interval"`
+	EnabledListRunningSandboxCache bool              `yaml:"enabled_list_running_sandbox_cache"`
+	AsyncTaskQueueSize             int               `yaml:"async_task_queue_size"`
+	AsyncTaskWorkerNum             int               `yaml:"async_task_worker_num"`
+	HeadlessServiceName            string            `yaml:"headless_service_name"`
+	DefaultHeadlessServiceNodesNum int64             `yaml:"default_headless_service_nodes_num"`
+	ListFilterOutLables            map[string]string `yaml:"list_filter_out_lables"`
+	CollectMetricInterval          time.Duration     `yaml:"collect_metric_interval"`
+	ReportLocalCreateNum           bool              `yaml:"report_local_create_num"`
+	ReportStdevMetric              bool              `yaml:"report_stdev_metric"`
+	GwCacheExpiredTime             time.Duration     `yaml:"gw_cache_expired_time"`
+	GwCacheEnable                  bool              `yaml:"gw_cache_enable"`
+	ReportGWRedisGetMetric         bool              `yaml:"report_gw_redis_get_metric"`
+	EnableGetStatusFromCubelet     bool              `yaml:"enable_get_status_from_cubelet"`
+	DisableHardDelete              bool              `yaml:"disable_hard_delete"`
+
+	// TemplateCacheTTL is how long template metadata stays in the local cache
+	// before expiring. Default 6 hours, matching the historical behavior.
+	// Shorter values reduce the stale-read window in multi-replica deployments
+	// at the cost of more frequent DB queries.
+	TemplateCacheTTL time.Duration `yaml:"template_cache_ttl"`
+	// TemplateCenterAddrValue is CubeTemplateCenter's HTTP base URL from conf.yaml.
+	// Named with a Value suffix to avoid colliding with the TemplateCenterAddr()
+	// method on Config. Access via Config.TemplateCenterAddr() which handles the
+	// env > yaml priority.
+	TemplateCenterAddrValue         string          `yaml:"template_center_addr"`
+	CollectSandboxMemoryWhitelist   []string        `yaml:"collect_sandbox_memory_whitelist"`
+	EnableAllCollectSandboxMemory   bool            `yaml:"enable_all_collect_sandbox_memory"`
+	FilterErrMsgErrorCode           map[int]bool    `yaml:"filter_err_msg_error_code"`
+	DescribeInstancesWhiteList      map[string]bool `yaml:"describe_instances_white_list"`
+	DescribeTaskExpireTime          int             `yaml:"describe_task_expire_time"`
+	EnablePrivateIpQuery            bool            `yaml:"enable_private_ip_query"`
+	DbMaxRetryCount                 int             `yaml:"db_max_retry_count"`
+	DbRetryInterval                 time.Duration   `yaml:"db_retry_interval"`
+	EnableCheckComNetIDParam        bool            `yaml:"enable_check_com_net_id_param"`
+	EnableDescribeInstanceFromRedis bool            `yaml:"enable_describe_instance_from_redis"`
+	MaxNICQueue                     int             `yaml:"max_nic_queue"`
+	DisableCreateImageCluster       map[string]bool `yaml:"disable_create_image_cluster"`
+	EnableAGSColdStartSwitch        bool            `yaml:"enable_ags_cold_start_switch"`
 }
 
 type AuthConf struct {
@@ -153,6 +186,24 @@ type ExtraConf struct {
 	AllowedHostMountPrefixes []string `yaml:"allowed_host_mount_prefixes"`
 }
 
+// CubeProxyConf controls how CubeMaster invalidates CubeProxy local routing
+// caches after Resume rewrites Redis SandboxIP / port mappings.
+type CubeProxyConf struct {
+	// AdminPort is the per-node CubeProxy admin listen port used when the
+	// Redis registry is empty (default 8082).
+	AdminPort int `yaml:"admin_port"`
+	// AdminToken is sent as X-Cube-Admin-Token when non-empty (must match
+	// CubeProxy $cube_admin_token).
+	AdminToken string `yaml:"admin_token"`
+	// AdminURLs optionally lists static admin base URLs (e.g. http://ip:8082).
+	// When set, InvalidateBackendCache broadcasts to these instead of reading
+	// the Redis CubeProxy registry.
+	AdminURLs []string `yaml:"admin_urls"`
+	// HeartbeatTTLMs is how fresh a registry heartbeat must be to treat a
+	// replica as live (default 15000).
+	HeartbeatTTLMs int64 `yaml:"heartbeat_ttl_ms"`
+}
+
 type RedisConf struct {
 	Password    string `yaml:"password"`
 	MaxActive   int    `yaml:"max_active"`
@@ -162,6 +213,17 @@ type RedisConf struct {
 
 	Nodes    string `yaml:"nodes"`
 	MaxRetry int    `yaml:"max_retry"`
+
+	// MasterName enables Redis Sentinel mode when non-empty. SentinelNodes
+	// must list one or more sentinel endpoints (host:port, comma-separated).
+	MasterName string `yaml:"master_name"`
+
+	// SentinelNodes lists sentinel endpoints used when MasterName is set.
+	SentinelNodes string `yaml:"sentinel_nodes"`
+
+	// SentinelPassword authenticates to sentinel instances. Empty means no
+	// AUTH against sentinel (master Password is still used for the Redis master).
+	SentinelPassword string `yaml:"sentinel_password"`
 
 	// NodeMetricTTLSec is the safety TTL (seconds) for node-metric keys so an
 	// offline node's entry auto-expires; refreshed on every heartbeat write.
@@ -211,12 +273,11 @@ type SchedulerConf struct {
 	// 0). A pointer is used so an unset value can default to false while still
 	// allowing operators to explicitly enable it. Defaults to false.
 	IgnoreRedisAllocation *bool `yaml:"ignore_redis_allocation"`
-	// OvercommitRatio is the global CPU/Mem overcommit ratio applied to the
-	// node-reported quota during scheduling. Defaults to CPU=3, Mem=2.
-	OvercommitRatio *OvercommitRatioConf `yaml:"overcommit_ratio"`
-	// OvercommitRatioByType overrides OvercommitRatio for specific instance
-	// types and takes precedence over the global ratio.
-	OvercommitRatioByType map[string]OvercommitRatioConf `yaml:"overcommit_ratio_conf"`
+	// Deprecated: overcommit_ratio is no longer used by CubeMaster.
+	// These fields are kept only so leftover YAML is parsed without error;
+	// the values are ignored at runtime.
+	DeprecatedOvercommitRatio       *deprecatedOvercommitRatioConf           `yaml:"overcommit_ratio"`
+	DeprecatedOvercommitRatioByType map[string]deprecatedOvercommitRatioConf `yaml:"overcommit_ratio_conf"`
 }
 
 var defaultNodeAffinitySelectorAllowedKeys = []string{
@@ -255,55 +316,16 @@ func IsReservedLabelKey(k string) bool {
 	return false
 }
 
-// OvercommitRatioConf describes the CPU/Mem overcommit multipliers applied to
-// a node's reported quota when computing schedulable capacity.
-type OvercommitRatioConf struct {
+type deprecatedOvercommitRatioConf struct {
 	CPURatio float64 `yaml:"cpu_ratio"`
 	MemRatio float64 `yaml:"mem_ratio"`
 }
 
-const (
-	defaultCPUOvercommitRatio = 3.0
-	defaultMemOvercommitRatio = 2.0
-)
-
-// GetEffectiveOvercommitRatio returns the overcommit ratio for the given
-// instance type, falling back to the global ratio and then to the built-in
-// defaults (CPU=3, Mem=2).
-func (s *SchedulerConf) GetEffectiveOvercommitRatio(instanceType string) OvercommitRatioConf {
-	if s.OvercommitRatioByType != nil {
-		if v, ok := s.OvercommitRatioByType[instanceType]; ok {
-			return v.sanitized()
-		}
-	}
-	if s.OvercommitRatio != nil {
-		return s.OvercommitRatio.sanitized()
-	}
-	return OvercommitRatioConf{CPURatio: defaultCPUOvercommitRatio, MemRatio: defaultMemOvercommitRatio}
-}
-
-// sanitized guarantees non-positive, NaN, or infinite ratios fall back to the
-// defaults so a malformed config never shrinks a node's schedulable capacity to
-// zero or produces a garbage (NaN/Inf) capacity when multiplied with the quota.
-func (c OvercommitRatioConf) sanitized() OvercommitRatioConf {
-	out := c
-	if !isValidRatio(out.CPURatio) {
-		out.CPURatio = defaultCPUOvercommitRatio
-	}
-	if !isValidRatio(out.MemRatio) {
-		out.MemRatio = defaultMemOvercommitRatio
-	}
-	return out
-}
-
-// isValidRatio reports whether r is a usable overcommit multiplier: it must be
-// a finite, positive number. NaN and ±Inf (e.g. ".nan"/".inf" in YAML) are
-// rejected so they never propagate into capacity arithmetic.
-func isValidRatio(r float64) bool {
-	if math.IsNaN(r) || math.IsInf(r, 0) {
+func (s *SchedulerConf) hasDeprecatedOvercommitConfig() bool {
+	if s == nil {
 		return false
 	}
-	return r > 0
+	return s.DeprecatedOvercommitRatio != nil || len(s.DeprecatedOvercommitRatioByType) > 0
 }
 
 // ShouldIgnoreRedisAllocation reports whether the scheduler must ignore the
@@ -313,40 +335,6 @@ func (s *SchedulerConf) ShouldIgnoreRedisAllocation() bool {
 		return false
 	}
 	return *s.IgnoreRedisAllocation
-}
-
-// EffectiveQuotaCpu returns the schedulable CPU capacity (milli-cores) for a
-// node after applying the configured overcommit ratio to its reported quota.
-func (s *SchedulerConf) EffectiveQuotaCpu(instanceType string, quotaCpu int64) int64 {
-	ratio := s.GetEffectiveOvercommitRatio(instanceType)
-	return floatToInt64Clamped(float64(quotaCpu) * ratio.CPURatio)
-}
-
-// EffectiveQuotaMem returns the schedulable memory capacity (MB) for a node
-// after applying the configured overcommit ratio to its reported quota.
-func (s *SchedulerConf) EffectiveQuotaMem(instanceType string, quotaMem int64) int64 {
-	ratio := s.GetEffectiveOvercommitRatio(instanceType)
-	return floatToInt64Clamped(float64(quotaMem) * ratio.MemRatio)
-}
-
-// floatToInt64Clamped safely converts a float64 to int64. Converting an
-// out-of-range or non-finite float64 to int64 is implementation-defined in Go
-// and yields a garbage value, so NaN maps to 0 and values beyond the int64
-// range (including ±Inf) are clamped to math.MaxInt64 / math.MinInt64. This
-// guards capacity computation against quota * ratio overflowing int64.
-func floatToInt64Clamped(f float64) int64 {
-	if math.IsNaN(f) {
-		return 0
-	}
-	// float64(math.MaxInt64) rounds up to 2^63, so use >= to treat the
-	// boundary and any larger value (incl. +Inf) as overflow.
-	if f >= float64(math.MaxInt64) {
-		return math.MaxInt64
-	}
-	if f <= float64(math.MinInt64) {
-		return math.MinInt64
-	}
-	return int64(f)
 }
 
 // EffectiveAllocated returns the allocated usage the scheduler should account
@@ -559,6 +547,7 @@ type CubeletConf struct {
 	Grpc                    *GrpcConf `yaml:"grpc"`
 	CommonTimeoutInsec      int       `yaml:"common_timeout_insec"`
 	CreateImageTimeoutInSec int       `yaml:"create_image_timeout_insec"`
+	AppSnapshotTimeoutInSec int       `yaml:"app_snapshot_timeout_insec"`
 	// Server default idle TTL when the client omits timeout. See docs/guide/lifecycle.md.
 	DefaultTimeoutInsec int `yaml:"default_timeout_insec"`
 	// Create RPC / scheduling deadline; decoupled from idle TTL.
@@ -631,6 +620,29 @@ type CubeEgressConf struct {
 	Required bool `yaml:"required"`
 }
 
+// SoftDeletePurgeConf configures the scheduled hard-purge of soft-deleted rows.
+// All fields are optional; zero/nil values fall back to safe defaults enforced
+// by CubeDB/tombstone.Config.Sanitized (7-day retention, hourly interval). The
+// purger is DISABLED when the block or `enable` is absent — the purge is
+// irreversible, so it must be opted into explicitly. It only touches the
+// verified tombstone tables; see docs/guide/soft-delete-purge.md.
+type SoftDeletePurgeConf struct {
+	// Enable gates the purger. nil/missing -> DISABLED (default-off): the purge is
+	// irreversible, so operators must opt in explicitly (review: an upgrade must
+	// not silently hard-delete tombstones that were previously retained forever).
+	Enable *bool `yaml:"enable"`
+	// DryRun selects candidate rows and logs counts but issues no DELETE --
+	// use for a safe first rollout against a large existing backlog.
+	DryRun bool `yaml:"dry_run"`
+	// Retention: rows with deleted_at older than now-Retention are purged.
+	// <=0 -> 7-day default; values in (0, 1h) are clamped UP to the 1h minimum
+	// (avoids the cutoff>=now foot-gun that would purge seconds-old tombstones).
+	Retention time.Duration `yaml:"retention"`
+	// Interval between purge passes. <=0 -> 1h default; values in (0, 1m) are
+	// clamped UP to the 1m minimum.
+	Interval time.Duration `yaml:"interval"`
+}
+
 // DefaultCubeEgressCAPath is the canonical install path. Used when
 // CubeEgressConf is unset or its CAPath is empty AND Required is true
 // (meaning: an operator opted into the strict mode but forgot to
@@ -649,10 +661,6 @@ type HookWhitelist struct {
 }
 
 func GetDbConfig() *DBConfig {
-	return cfg.OssDBConfig
-}
-
-func GetInstanceConfig() *DBConfig {
 	return cfg.InstanceDBConfig
 }
 
@@ -793,8 +801,17 @@ func preComHandleConf(config *Config) error {
 		config.Common.IdleTimeout = 360
 	}
 
+	if config.Common.CubeOpsBootRetries == 0 {
+		// 1s base + 5 retries → ~31s wait window covers a slow CubeOps start.
+		config.Common.CubeOpsBootRetries = 5
+	}
+	if config.Common.CubeOpsBootBackoff == time.Duration(0) {
+		config.Common.CubeOpsBootBackoff = 1 * time.Second
+	}
+
 	if config.Common.SyncMetaDataInterval == time.Duration(0) {
-		config.Common.SyncMetaDataInterval = 30 * time.Second
+		// Node changes must converge within ~1s for fast scheduling reaction.
+		config.Common.SyncMetaDataInterval = 1 * time.Second
 	}
 
 	if config.Common.SyncMetricDataInterval == time.Duration(0) {
@@ -850,8 +867,21 @@ func preComHandleConf(config *Config) error {
 		config.Common.DbRetryInterval = 5 * time.Millisecond
 	}
 
+	if config.CubeProxyConf == nil {
+		config.CubeProxyConf = &CubeProxyConf{}
+	}
+	if config.CubeProxyConf.AdminPort == 0 {
+		config.CubeProxyConf.AdminPort = 8082
+	}
+	if config.CubeProxyConf.HeartbeatTTLMs == 0 {
+		config.CubeProxyConf.HeartbeatTTLMs = 15000
+	}
+
 	if config.Common.MaxNICQueue == 0 {
 		config.Common.MaxNICQueue = 4
+	}
+	if config.Common.TemplateCacheTTL == 0 {
+		config.Common.TemplateCacheTTL = 360 * time.Minute
 	}
 	return nil
 }
@@ -871,6 +901,10 @@ func preHandleCubeletConf(config *Config) error {
 	}
 	if config.CubeletConf.CreateImageTimeoutInSec == 0 {
 		config.CubeletConf.CreateImageTimeoutInSec = 300
+	}
+
+	if config.CubeletConf.AppSnapshotTimeoutInSec <= 0 {
+		config.CubeletConf.AppSnapshotTimeoutInSec = 300
 	}
 
 	if config.CubeletConf.BufferQueueMinJob == 0 {
@@ -909,7 +943,7 @@ func preHandleCubeletConf(config *Config) error {
 	}
 	// DefaultTimeoutInsec is left untouched — see docs/guide/lifecycle.md.
 	if config.CubeletConf.CreateTimeoutInsec <= 0 {
-		config.CubeletConf.CreateTimeoutInsec = 300
+		config.CubeletConf.CreateTimeoutInsec = 600
 	}
 	if config.CubeletConf.MaxRetries == 0 {
 		config.CubeletConf.MaxRetries = 5
@@ -965,22 +999,8 @@ func preHandleScheduler(config *Config) error {
 		ignore := false
 		config.Scheduler.IgnoreRedisAllocation = &ignore
 	}
-	// Default overcommit ratio: CPU=3, Mem=2. sanitized() guards against
-	// non-positive, NaN, or infinite values supplied by operators.
-	if config.Scheduler.OvercommitRatio == nil {
-		config.Scheduler.OvercommitRatio = &OvercommitRatioConf{
-			CPURatio: defaultCPUOvercommitRatio,
-			MemRatio: defaultMemOvercommitRatio,
-		}
-	} else {
-		sanitized := config.Scheduler.OvercommitRatio.sanitized()
-		config.Scheduler.OvercommitRatio = &sanitized
-	}
-	// Sanitize per-instance-type overrides at init time as well so malformed
-	// (non-positive/NaN/Inf) ratios are normalized once up front rather than
-	// relying solely on the lazy sanitize in GetEffectiveOvercommitRatio.
-	for k, v := range config.Scheduler.OvercommitRatioByType {
-		config.Scheduler.OvercommitRatioByType[k] = v.sanitized()
+	if config.Scheduler.hasDeprecatedOvercommitConfig() {
+		CubeLog.Warnf("scheduler.overcommit_ratio / overcommit_ratio_conf are deprecated and ignored; CubeMaster no longer applies overcommit to node-reported quota")
 	}
 
 	if config.Scheduler.NodeMaxMvmNum == 0 {
@@ -1168,6 +1188,54 @@ func validate(cfg *Config) error {
 //go:noinline
 func GetConfig() *Config {
 	return cfg
+}
+
+// EnvMasterAddr is the deployment-wide "how to reach CubeMaster" address.
+// Read on every call so it can be changed without reloading conf.yaml.
+const EnvMasterAddr = "CUBE_MASTER_ADDR"
+
+// MasterAddr returns CubeMaster's own externally-reachable HTTP base URL with
+// no trailing slash, or "" when unset.
+//
+// CubeMaster needs it for one specific job: the artifact download base URL it
+// hands to CubeTemplateCenter (and stores in
+// rootfs_artifacts.master_node_ip) must be an address every Cubelet can
+// actually reach. Deriving it from the incoming request's Host header is
+// wrong whenever the caller used a wildcard/loopback address (`curl
+// http://0.0.0.0:8089`, `curl http://localhost:8089`): that value is
+// meaningless to any other node, so Cubelet's artifact download 404s/fails
+// while the build itself looks perfectly healthy.
+func (c *Config) MasterAddr() string {
+	if addr := strings.TrimSpace(os.Getenv(EnvMasterAddr)); addr != "" {
+		return strings.TrimRight(addr, "/")
+	}
+	if c != nil && c.Common != nil {
+		return strings.TrimRight(strings.TrimSpace(c.Common.MasterAddr), "/")
+	}
+	return ""
+}
+
+// EnvTemplateCenterAddr is how CubeMaster finds CubeTemplateCenter. It mirrors
+// CUBE_MASTER_ADDR, the variable every other component uses to find CubeMaster:
+// one name per target component, shared by whoever needs to reach it, so a
+// deployment sets each address exactly once. An address is a deployment fact,
+// not a process tunable, which is why it is an environment variable and not a
+// conf.yaml key.
+const EnvTemplateCenterAddr = "CUBE_TEMPLATE_CENTER_ADDR"
+
+// TemplateCenterAddr returns CubeTemplateCenter's base URL with no trailing
+// slash, or "" when unset. Read from the environment on every call so it can
+// be changed without editing (or even loading) conf.yaml.
+func (c *Config) TemplateCenterAddr() string {
+	// Priority: env > yaml. Env is for ad-hoc debugging (override without
+	// editing conf.yaml); yaml is the persistent deployment value.
+	if addr := strings.TrimSpace(os.Getenv(EnvTemplateCenterAddr)); addr != "" {
+		return strings.TrimRight(addr, "/")
+	}
+	if c.Common != nil {
+		return strings.TrimRight(strings.TrimSpace(c.Common.TemplateCenterAddrValue), "/")
+	}
+	return ""
 }
 
 var defaultAllowedHostMountPrefixes = []string{"/data/shared/"}

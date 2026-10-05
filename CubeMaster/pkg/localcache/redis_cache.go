@@ -23,7 +23,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/utils"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/wrapredis"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 type RedisNodeInfo struct {
@@ -278,10 +278,13 @@ func (l *local) loopUpdateMetric(ctx context.Context) {
 				defer func() {
 					checkDeadline = time.Now().Add(config.GetConfig().Common.SyncMetricDataInterval)
 				}()
-				ctx = context.WithValue(ctx, CubeLog.KeyRequestID, uuid.New().String())
+				// Keep the loop's base context immutable. Reassigning ctx here would
+				// create an unbounded valueCtx chain (one layer per metric tick),
+				// making every later ctx.Value/Done lookup increasingly expensive.
+				metricCtx := context.WithValue(ctx, CubeLog.KeyRequestID, uuid.New().String())
 				elems := l.cache.Items()
 				for k := range elems {
-					if tmpNode, found, err := l.getNodeMetricWithFallback(ctx, k); found && err == nil {
+					if tmpNode, found, err := l.getNodeMetricWithFallback(metricCtx, k); found && err == nil {
 						if err := l.updateNodeMetric(tmpNode); err != nil {
 
 							CubeLog.WithContext(context.Background()).Fatalf("updateMetric fail:%v", err)

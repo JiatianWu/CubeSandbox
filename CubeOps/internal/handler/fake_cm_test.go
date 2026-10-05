@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tencentcloud/CubeSandbox/CubeOps/internal/cubemaster"
 )
 
 func init() { gin.SetMode(gin.TestMode) }
@@ -20,9 +21,6 @@ func init() { gin.SetMode(gin.TestMode) }
 // field controls one method; nil fields return an error so tests fail loud
 // if a handler calls a method the test didn't set up.
 type fakeCM struct {
-	getNodes                    func(ctx context.Context) (json.RawMessage, error)
-	clusterVersions             func(ctx context.Context) (json.RawMessage, error)
-	getNode                     func(ctx context.Context, nodeID string) (json.RawMessage, error)
 	listSandboxes               func(ctx context.Context) (json.RawMessage, error)
 	getSandbox                  func(ctx context.Context, sandboxID, instanceType string) (json.RawMessage, error)
 	createSandbox               func(ctx context.Context, body interface{}) (json.RawMessage, error)
@@ -47,24 +45,6 @@ type fakeCM struct {
 	adoptTemplateCompatBaseline func(ctx context.Context, body interface{}) (json.RawMessage, error)
 }
 
-func (f *fakeCM) GetNodes(ctx context.Context) (json.RawMessage, error) {
-	if f.getNodes == nil {
-		return nil, errFakeNotConfigured
-	}
-	return f.getNodes(ctx)
-}
-func (f *fakeCM) ClusterVersions(ctx context.Context) (json.RawMessage, error) {
-	if f.clusterVersions == nil {
-		return nil, errFakeNotConfigured
-	}
-	return f.clusterVersions(ctx)
-}
-func (f *fakeCM) GetNode(ctx context.Context, nodeID string) (json.RawMessage, error) {
-	if f.getNode == nil {
-		return nil, errFakeNotConfigured
-	}
-	return f.getNode(ctx, nodeID)
-}
 func (f *fakeCM) ListSandboxes(ctx context.Context) (json.RawMessage, error) {
 	if f.listSandboxes == nil {
 		return nil, errFakeNotConfigured
@@ -78,60 +58,70 @@ func (f *fakeCM) GetSandbox(ctx context.Context, sandboxID, instanceType string)
 	return f.getSandbox(ctx, sandboxID, instanceType)
 }
 func (f *fakeCM) CreateSandbox(ctx context.Context, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.createSandbox == nil {
 		return nil, errFakeNotConfigured
 	}
 	return f.createSandbox(ctx, body)
 }
 func (f *fakeCM) DeleteSandbox(ctx context.Context, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.deleteSandbox == nil {
 		return nil, errFakeNotConfigured
 	}
 	return f.deleteSandbox(ctx, body)
 }
 func (f *fakeCM) UpdateSandbox(ctx context.Context, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.updateSandbox == nil {
 		return nil, errFakeNotConfigured
 	}
 	return f.updateSandbox(ctx, body)
 }
 func (f *fakeCM) ConnectSandboxWithBody(ctx context.Context, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.connectSandboxWithBody == nil {
 		return nil, errFakeNotConfigured
 	}
 	return f.connectSandboxWithBody(ctx, body)
 }
 func (f *fakeCM) SetSandboxTimeout(ctx context.Context, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.setSandboxTimeout == nil {
 		return nil, errFakeNotConfigured
 	}
 	return f.setSandboxTimeout(ctx, body)
 }
 func (f *fakeCM) RefreshSandbox(ctx context.Context, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.refreshSandbox == nil {
 		return nil, errFakeNotConfigured
 	}
 	return f.refreshSandbox(ctx, body)
 }
 func (f *fakeCM) GetSandboxLogs(ctx context.Context, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.getSandboxLogs == nil {
 		return nil, errFakeNotConfigured
 	}
 	return f.getSandboxLogs(ctx, body)
 }
 func (f *fakeCM) ListSandboxesWithBody(ctx context.Context, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.listSandboxesWithBody == nil {
 		return nil, errFakeNotConfigured
 	}
 	return f.listSandboxesWithBody(ctx, body)
 }
 func (f *fakeCM) CreateSnapshot(ctx context.Context, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.createSnapshot == nil {
 		return nil, errFakeNotConfigured
 	}
 	return f.createSnapshot(ctx, body)
 }
 func (f *fakeCM) ListSnapshots(ctx context.Context, params map[string]string) (json.RawMessage, error) {
+	cubemaster.EnsureRequestIDQuery(ctx, params)
 	if f.listSnapshots == nil {
 		return nil, errFakeNotConfigured
 	}
@@ -144,6 +134,7 @@ func (f *fakeCM) DeleteSnapshot(ctx context.Context, snapshotID string) (json.Ra
 	return f.deleteSnapshot(ctx, snapshotID)
 }
 func (f *fakeCM) RollbackSandbox(ctx context.Context, sandboxID string, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.rollbackSandbox == nil {
 		return nil, errFakeNotConfigured
 	}
@@ -156,18 +147,21 @@ func (f *fakeCM) ListTemplates(ctx context.Context, templateID string, includeRe
 	return f.listTemplates(ctx, templateID, includeRequest)
 }
 func (f *fakeCM) CreateTemplateFromImage(ctx context.Context, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.createTemplateFromImage == nil {
 		return nil, errFakeNotConfigured
 	}
 	return f.createTemplateFromImage(ctx, body)
 }
 func (f *fakeCM) RedoTemplate(ctx context.Context, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.redoTemplate == nil {
 		return nil, errFakeNotConfigured
 	}
 	return f.redoTemplate(ctx, body)
 }
 func (f *fakeCM) DeleteTemplate(ctx context.Context, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.deleteTemplate == nil {
 		return nil, errFakeNotConfigured
 	}
@@ -180,6 +174,7 @@ func (f *fakeCM) GetTemplateBuildStatus(ctx context.Context, buildID string) (js
 	return f.getTemplateBuildStatus(ctx, buildID)
 }
 func (f *fakeCM) StartTemplateBuild(ctx context.Context, buildID string, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.startTemplateBuild == nil {
 		return nil, errFakeNotConfigured
 	}
@@ -192,6 +187,7 @@ func (f *fakeCM) GetTemplateCompat(ctx context.Context) (json.RawMessage, error)
 	return f.getTemplateCompat(ctx)
 }
 func (f *fakeCM) AdoptTemplateCompatBaseline(ctx context.Context, body interface{}) (json.RawMessage, error) {
+	cubemaster.EnsureRequestID(ctx, body)
 	if f.adoptTemplateCompatBaseline == nil {
 		return nil, errFakeNotConfigured
 	}

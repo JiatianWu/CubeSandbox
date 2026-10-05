@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-// Package lifecycle is the sidecar-local mirror of
+// Package lifecycle is the CLM-local mirror of
 // CubeMaster/pkg/lifecycle. The two MUST stay byte-compatible: CubeMaster is
-// the single writer, the sidecar is a pure consumer.
+// the single writer, CLM is a pure consumer.
 //
 // We do not import the CubeMaster module directly because it would drag in
 // MySQL, gRPC, scheduler, and a host of other heavy dependencies that have no
-// place in the sidecar. The schema is small enough that copying it (with a
-// pointer to the canonical definition) is cheaper than the cross-module wire.
+// place in Cube Lifecycle Manager. The schema is small enough that copying it
+// (with a pointer to the canonical definition) is cheaper than the
+// cross-module wire.
 //
 // Source of truth:
 //
@@ -25,14 +26,33 @@ const (
 	// EventStreamKey is the append-only stream of create/delete events.
 	EventStreamKey = "cube:v1:shared:sandbox:lifecycle:events"
 
-	// EventStreamMaxLen caps the stream so an offline sidecar cannot drive
+	// EventStreamMaxLen caps the stream so an offline CLM replica cannot drive
 	// unbounded Redis growth.
 	EventStreamMaxLen = 100000
+
+	// EventChannel carries best-effort state-change wakeup hints. Redis
+	// state keys remain the source of truth.
+	EventChannel = "cube:v1:shared:sandbox:lifecycle:notify"
+
+	// LeaderLeaseKey elects the single CLM replica allowed to run destructive
+	// maintenance work. All lease transactions touch only this key so they
+	// remain compatible with Redis Cluster slot constraints.
+	LeaderLeaseKey = "cube:v1:shared:lock:lifecycle-manager:leader"
 )
 
-// StateKey returns the per-sandbox pause/resume coordination key. Values are
-// "running" | "pausing" | "paused" | "resuming". The sidecar uses SETNX with
-// TTL to coordinate concurrent pause/resume across replicas.
+// StateKilled is a state-key marker for a sandbox killed by the sweeper. It is
+// intentionally not part of the {paused, running} terminal set emitted on the
+// events stream.
+const StateKilled = "killed"
+
+// StateNotify is a best-effort wakeup hint. Consumers must read the state key
+// after receiving it instead of trusting the payload as current truth.
+type StateNotify struct {
+	SandboxID string `json:"sandbox_id"`
+}
+
+// StateKey returns the per-sandbox coordination key. Values include running,
+// pausing, paused, resuming, killing, and killed.
 func StateKey(sandboxID string) string {
 	return "cube:v1:shared:sandbox:lifecycle:state:" + sandboxID
 }

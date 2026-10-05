@@ -7,7 +7,7 @@ This guide walks you through building a Cube Sandbox release bundle from source 
 After deployment, you will have a fully functional Cube Sandbox instance with:
 
 - E2B-compatible REST API on port `3000`
-- CubeMaster, Cubelet, network-agent, and CubeShim running as host processes
+- CubeMaster, Cubelet, and CubeShim running as host processes; the network runtime is embedded in Cubelet
 - MySQL and Redis managed via Docker Compose
 - CubeProxy with TLS (mkcert) and CoreDNS for `cube.app` domain routing
 
@@ -48,6 +48,7 @@ The release bundle is built **natively** for the build machine's architecture �
 
 - Internet access is required to pull `mysql:8.0` and `redis:7-alpine` Docker images.
 - `mkcert` binary is bundled inside the release package and installed automatically when not already present on the target machine.
+- The S3 volume plugin is a static Go binary with a built-in S3 client, compiled at pack time from `examples/volume/s3`. Control nodes need no S3 command line tool; nodes that mount volumes still need `s3fs`. Ship a prebuilt binary with `ONE_CLICK_VOLUME_S3_BIN`.
 - CubeProxy image build uses Alpine and PyPI mirrors (configurable).
 
 ## Step 1: Build the Release Bundle
@@ -56,7 +57,26 @@ These steps are performed on the **build machine**.
 
 ### 1.1 Prepare the Kernel
 
-Obtain a compiled `vmlinux` kernel file (either compile it yourself or use a prebuilt one) and place it in the designated directory:
+Get a compiled `vmlinux` kernel file into the designated directory. Two options:
+
+**Option A — download a prebuilt kernel (recommended)**
+
+Guest kernels are published on dedicated `kernel-release-*` Releases, so you don't have to compile one yourself:
+
+```bash
+# Standard (bare-metal/KVM) guest kernel — pick the target architecture
+wget -O deploy/one-click/assets/kernel-artifacts/vmlinux \
+  "https://github.com/TencentCloud/CubeSandbox/releases/download/kernel-release-260812-1/vmlinux-amd64"
+# (use vmlinux-arm64 on aarch64)
+
+# If the target host deploys with PVM, also fetch the PVM guest kernel
+wget -O deploy/one-click/assets/kernel-artifacts/vmlinux-pvm \
+  "https://github.com/TencentCloud/CubeSandbox/releases/download/kernel-release-260812-1/vmlinux-pvm-amd64"
+```
+
+The tag above is an example — see [Downloads & Releases](./downloads.md) for the latest tag, the CNB mirror, and the full asset list.
+
+**Option B — compile your own `vmlinux`**
 
 ```bash
 cp /path/to/vmlinux deploy/one-click/assets/kernel-artifacts/
@@ -66,17 +86,18 @@ The default expected filename is `vmlinux`. You can override the path via the `O
 
 ### 1.2 Run the Build
 
-From the repository root:
+Copy the build environment template if you need overrides, then run from the repository root:
 
 ```bash
-cd cube-sandbox
+cd CubeSandbox
+cp deploy/one-click/build.env.example deploy/one-click/build.env
 ./deploy/one-click/build-release-bundle-builder.sh
 ```
 
 This script will:
 
 1. Build or reuse the `cube-sandbox-builder` Docker image
-2. Compile all components inside the builder container (CubeMaster, Cubelet, cube-api, network-agent, cube-agent, CubeShim, cube-runtime)
+2. Compile all components inside the builder container (CubeMaster, Cubelet, cube-api, cube-agent, CubeShim, cube-runtime)
 3. Build the guest VM image on the host
 4. Package everything into a release tarball
 
@@ -92,11 +113,12 @@ The `<version>` is derived from the current Git commit ID.
 
 The bundle contains:
 
-- All compiled binaries (cubemaster, cubelet, cube-api, network-agent, containerd-shim-cube-rs, cube-runtime)
+- All compiled binaries (cubemaster, cubelet, cube-api, containerd-shim-cube-rs, cube-runtime)
 - Guest VM image (`cube-guest-image-cpu.img`)
 - Kernel package (`cube-kernel-scf.zip`)
 - CubeProxy and CoreDNS Docker Compose templates
 - MySQL/Redis Docker Compose templates
+- S3 volume plugin binary (`{CubeMaster,Cubelet}/plugin/cube-volume-s3`) for Volume create/destroy and attach/detach
 - Installation scripts (`install.sh`, `install-compute.sh`, `down.sh`, `smoke.sh`)
 - Environment template (`env.example`)
 
@@ -143,7 +165,7 @@ The install script will:
 6. Start MySQL and Redis via Docker Compose
 7. Build and start the CubeProxy container
 8. Start CoreDNS and configure host DNS routing for `cube.app`
-9. Start host processes: network-agent, cubemaster, cube-api, cubelet
+9. Start host processes: cubemaster, cube-api, cubelet
 10. Run a health check (if `ONE_CLICK_RUN_QUICKCHECK=1`)
 
 After installation, the installer symlinks `cubemastercli` and `cubecli` into `/usr/local/bin`.
@@ -231,11 +253,14 @@ For more examples, see the example scripts under `CubeAPI/examples/` in the repo
 sudo ./down.sh
 ```
 
-This stops all host processes (cubelet, cubemaster, cube-api, network-agent), Docker containers (CubeProxy, CoreDNS, MySQL, Redis), and rolls back the `cube.app` DNS routing configuration.
+This stops all host processes (cubelet, cubemaster, cube-api), Docker containers (CubeProxy, CoreDNS, MySQL, Redis), and rolls back the `cube.app` DNS routing configuration.
 
-### Reinstall
+### Upgrade or reinstall
 
-To reinstall over an existing deployment, simply run `install.sh` again. The script automatically stops the existing deployment before installing.
+On a machine that already has CubeSandbox, running `install.sh` again defaults
+to a **config-preserving upgrade** (it keeps `/usr/local/services/cubetoolbox/.one-click.env`).
+On a TTY the installer asks `[Y/n]`; non-interactive runs upgrade without prompting.
+To wipe the existing configuration and fully reinstall, pass `--mode=install`.
 
 ### View Logs
 
@@ -252,9 +277,11 @@ To reinstall over an existing deployment, simply run `install.sh` again. The scr
 
 ## Configuration Reference
 
-All configuration is managed through the `.env` file. Below is the full parameter reference.
+Install-time configuration is managed through the `.env` file copied from `env.example`. Build-time options live in `build.env` (copied from `build.env.example`) on the build machine.
 
 ### Build-time Options
+
+Copy `deploy/one-click/build.env.example` to `deploy/one-click/build.env` and set overrides there (or export them in the shell).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -262,8 +289,8 @@ All configuration is managed through the `.env` file. Below is the full paramete
 | `ONE_CLICK_CUBEMASTER_BUILD_MODE` | `local` | Build mode for CubeMaster (`local` = compile from source) |
 | `ONE_CLICK_CUBELET_BUILD_MODE` | `local` | Build mode for Cubelet |
 | `ONE_CLICK_CUBE_API_BUILD_MODE` | `local` | Build mode for cube-api |
-| `ONE_CLICK_NETWORK_AGENT_BUILD_MODE` | `local` | Build mode for network-agent |
 | `ONE_CLICK_CUBE_AGENT_BUILD_MODE` | `local` | Build mode for cube-agent |
+| `ONE_CLICK_CUBE_INIT_BUILD_MODE` | `local` | Build mode for cube-init |
 | `ONE_CLICK_CUBE_SHIM_BUILD_MODE` | `local` | Build mode for CubeShim |
 | `ONE_CLICK_CUBE_KERNEL_VMLINUX` | `assets/kernel-artifacts/vmlinux` | Path to the vmlinux kernel file |
 
@@ -273,13 +300,27 @@ You can also point to prebuilt binaries to skip compilation:
 |----------|-------------|
 | `ONE_CLICK_CUBEMASTER_BIN` | Path to prebuilt cubemaster binary |
 | `ONE_CLICK_CUBEMASTERCLI_BIN` | Path to prebuilt cubemastercli binary |
+| `ONE_CLICK_TEMPLATECENTER_BIN` | Path to prebuilt templatecenter binary |
 | `ONE_CLICK_CUBELET_BIN` | Path to prebuilt cubelet binary |
 | `ONE_CLICK_CUBECLI_BIN` | Path to prebuilt cubecli binary |
 | `ONE_CLICK_CUBE_API_BIN` | Path to prebuilt cube-api binary |
-| `ONE_CLICK_NETWORK_AGENT_BIN` | Path to prebuilt network-agent binary |
-| `ONE_CLICK_CUBE_AGENT_BIN` | Path to prebuilt cube-agent binary |
+| `ONE_CLICK_CUBE_AGENT_BIN` | Path to prebuilt cube-agent binary (packaged into cube-agent.ext4) |
+| `ONE_CLICK_CUBE_INIT_BIN` | Path to prebuilt cube-init binary (injected as guest `/sbin/init`) |
+
 | `ONE_CLICK_CUBESHIM_BIN` | Path to prebuilt containerd-shim-cube-rs binary |
 | `ONE_CLICK_CUBE_RUNTIME_BIN` | Path to prebuilt cube-runtime binary |
+| `ONE_CLICK_MKCERT_BIN` | Override path to mkcert binary at build time (default: bundled `assets/bin/mkcert`) |
+| `ONE_CLICK_VOLUME_S3_BUILD_MODE` | Build mode for the S3 volume plugin (default `local`) |
+| `ONE_CLICK_VOLUME_S3_BIN` | Override path to a prebuilt `cube-volume-s3`; skips the pack-time build |
+
+Build-performance knobs (all optional):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ONE_CLICK_BUILD_JOBS` | auto | Max concurrent component build tracks. Auto = min of CPU count and available-memory/3GiB (available memory respects the cgroup limit when building in a container). Set `1` for a fully serial build, or a large value to uncap. |
+| `ONE_CLICK_DISABLE_PIGZ` | empty | Set to `1` to force portable single-threaded `gzip` for tarballs instead of `pigz` (parallel gzip), e.g. when a consistent single-tool compressor is preferred over pigz's parallel block framing. |
+| `ONE_CLICK_SEQUENTIAL_WEB_BUILD` | empty | Set to `1` to build the WebUI synchronously instead of overlapping it with the guest-image build. |
+| `CUBE_BUILD_TIME` | HEAD commit date (UTC) | Build timestamp embedded in binaries and recorded as `built_at` in `release-manifest.json` / `VERSION.txt`. Defaults to the HEAD commit date so repeated builds on the same commit are byte-identical and reuse incremental caches; override with a literal timestamp (e.g. `2026-01-01T00:00:00Z`) for a wall-clock value. |
 
 ### Target Machine Options
 
@@ -287,7 +328,7 @@ You can also point to prebuilt binaries to skip compilation:
 |----------|---------|-------------|
 | `ONE_CLICK_DEPLOY_ROLE` | `control` | Deployment role: `control` for single-node (default). For compute-only nodes, see [Multi-Node Cluster Deployment](./multi-node-deploy.md) |
 | `ONE_CLICK_CONTROL_PLANE_IP` | empty | Compute-node mode only. See [Multi-Node Cluster Deployment](./multi-node-deploy.md#step-2-configure-environment-variables) |
-| `ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR` | empty | Compute-node mode only. See [Multi-Node Cluster Deployment](./multi-node-deploy.md#step-2-configure-environment-variables) |
+| `ONE_CLICK_CONTROL_PLANE_CUBEOPS_ADDR` | empty | Compute-node mode only. Cubelet registers against CubeOps on port 3010. See [Multi-Node Cluster Deployment](./multi-node-deploy.md#step-2-configure-environment-variables) |
 | `CUBE_SANDBOX_NODE_IP` | auto-detected from `eth0` | Node's primary network interface IP. Auto-detected if unset; set explicitly if your interface differs. |
 | `CUBE_SANDBOX_NETWORK_CIDR` | `192.168.0.0/18` | cubevs local network CIDR for sandbox IP allocation. IPv4 CIDR format (e.g., `10.100.0.0/18`), mask range /16–/24. Conflicts with host interfaces, routes, or resolver nameservers abort installation during preflight. Uses the fixed default when unset. |
 | `CUBE_SANDBOX_NETWORK_CIDR_SKIP_CONFLICT_CHECK` | `0` | Set to `1` to skip CIDR conflict detection for the default or custom sandbox CIDR (not recommended). |
@@ -316,17 +357,17 @@ You can also point to prebuilt binaries to skip compilation:
 | `CUBE_PROXY_ENABLE` | `1` | Enable CubeProxy (must be `1` for one-click) |
 | `CUBE_PROXY_HTTPS_PORT` | `443` | CubeProxy HTTPS listen port |
 | `CUBE_PROXY_HTTP_PORT` | `80` | CubeProxy HTTP listen port; the systemd post-start TCP listener check follows this port |
+| `CUBE_PROXY_GRPC_PORT` | `9090` | CubeProxy plaintext gRPC (HTTP/2) listen port |
+| `CUBE_EGRESS_ADMIN_PORT` | `9091` | CubeEgress loopback admin API port (policy push); install.sh also patches Cubelet `cube_egress_admin_url` |
 | `CUBE_PROXY_DNS_ENABLE` | `1` | Enable CoreDNS (must be `1` for one-click) |
 | `CUBE_PROXY_DNS_ANSWER_IP` | `${CUBE_SANDBOX_NODE_IP}` | IP returned by CoreDNS for `cube.app` |
 | `CUBE_PROXY_COREDNS_BIND_ADDR` | `127.0.0.54` | CoreDNS bind address |
-| `ONE_CLICK_MKCERT_BIN` | `assets/bin/mkcert` (bundled) | Override path to mkcert binary at build time |
 
 ### Process Addresses
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CUBEMASTER_ADDR` | `127.0.0.1:8089` | CubeMaster listen address |
-| `NETWORK_AGENT_HEALTH_ADDR` | `127.0.0.1:19090` | network-agent health endpoint |
 | `CUBE_API_BIND` | `0.0.0.0:3000` | cube-api listen address |
 | `CUBE_API_HEALTH_ADDR` | `127.0.0.1:3000` | cube-api health check address |
 | `CUBE_API_SANDBOX_DOMAIN` | `cube.app` | Sandbox domain for CubeProxy routing |
@@ -354,9 +395,6 @@ After installation, the deployment is located at `/usr/local/services/cubetoolbo
 │   ├── bin/cubecli                   # CLI tool
 │   ├── config/                       # Cubelet configuration
 │   └── dynamicconf/                  # Dynamic configuration
-├── network-agent/
-│   ├── bin/network-agent             # Network orchestration service
-│   └── network-agent.yaml            # Configuration
 ├── cube-shim/bin/
 │   ├── containerd-shim-cube-rs       # containerd shim
 │   └── cube-runtime                  # Runtime binary

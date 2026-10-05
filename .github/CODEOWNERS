@@ -10,11 +10,13 @@
 # Network: network configuration, tap devices, connectivity
 /CubeNet/ @chenhengqi @zhouxianping
 /CubeEgress/ @chenhengqi @zhouxianping
-/network-agent/ @chenhengqi @zhouxianping
+/Cubelet/network/ @chenhengqi @zhouxianping
 
 # Cubelet / CubeMaster: overall system/orchestration flow
 /Cubelet/ @fslongjin @ls-ggg @chenhengqi
 /CubeMaster/ @fslongjin @ls-ggg @chenhengqi
+# CubeTemplateCenter: template build pipeline split out of CubeMaster
+/CubeTemplateCenter/ @fslongjin @ls-ggg @chenhengqi
 
 # Shim: containerd shim
 /CubeShim/ @ls-ggg
@@ -40,6 +42,9 @@
 # Deployment: one-click / k8s
 /deploy/one-click/ @fslongjin
 
+# CubeS3lvol: S3/COS-backed block storage (s3lvol)
+/CubeS3lvol/ @changpe1
+
 # Terraform deployment
 /deploy/one-click/terraform/ @lkml-likexu @tinklone
 
@@ -48,3 +53,8 @@
 /examples/ @tinklone
 
 /cubecow @lisongqian
+/pkgs/CubeLog/ @fslongjin
+/pkgs/cubedb/ @fslongjin
+/pkgs/blobstore/ @fslongjin
+# Shared proto module (wire contracts for CubeMaster / Cubelet / examples)
+/pkgs/proto/ @fslongjin @ls-ggg @chenhengqi

@@ -14,9 +14,6 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/tencentcloud/CubeSandbox/CubeDB/dao"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
-	cubeboximages "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/images/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	dbmodels "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db/models"
@@ -26,6 +23,9 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/selctx"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
+	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	cubeboximages "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/images/v1"
 	"gorm.io/gorm"
 	"k8s.io/apimachinery/pkg/api/resource"
 
@@ -73,9 +73,21 @@ func checkAndGetReqResource(req *types.CreateCubeSandboxReq) (*selctx.RequestRes
 				res.EnforceSnapshotStorage = true
 			}
 		}
+		if strings.EqualFold(strings.TrimSpace(req.Annotations[constants.CubeAnnotationSnapshotAllowNonLocal]), "true") {
+			res.AllowNonLocalTemplate = true
+			res.EnforceSnapshotStorage = false
+			if len(req.DistributionScope) > 0 && len(res.TemplateNodeScope) == 0 {
+				res.TemplateNodeScope = append([]string(nil), req.DistributionScope...)
+			}
+		}
 	}
 
 	return res, nil
+}
+
+// RequestResources exposes checkAndGetReqResource for restore placement.
+func RequestResources(req *types.CreateCubeSandboxReq) (*selctx.RequestResource, error) {
+	return checkAndGetReqResource(req)
 }
 
 func checkParam(req *types.CreateCubeSandboxReq) error {
@@ -87,12 +99,55 @@ func checkParam(req *types.CreateCubeSandboxReq) error {
 		return ret.Err(errorcode.ErrorCode_MasterParamsError, "containers param is nil")
 	}
 
-	if req.CubeNetworkConfig != nil && req.CubeNetworkConfig.MaskRequestHost != nil {
-		if err := validateMaskRequestHost(*req.CubeNetworkConfig.MaskRequestHost); err != nil {
+	return validateCubeNetworkConfig(req.CubeNetworkConfig)
+}
+
+// validateCubeNetworkConfig runs the server-side egress policy checks shared by
+// sandbox creation and in-place network updates, so the update path cannot
+// accept a policy that creation would have rejected.
+func validateCubeNetworkConfig(cfg *types.CubeNetworkConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.MaskRequestHost != nil {
+		if err := validateMaskRequestHost(*cfg.MaskRequestHost); err != nil {
 			return ret.Err(errorcode.ErrorCode_MasterParamsError, err.Error())
 		}
 	}
+	for i, rule := range cfg.Rules {
+		if rule == nil {
+			continue
+		}
+		if err := validateEgressRuleMatch(rule.Match, i); err != nil {
+			return ret.Err(errorcode.ErrorCode_MasterParamsError, err.Error())
+		}
+	}
+	return nil
+}
 
+// validateEgressRuleMatch enforces the port/scheme contract on one egress
+// rule match, mirroring the SDK client-side check and the CubeEgress Lua
+// validation: a set Port must be in [1, 65535] and must be paired with
+// Scheme, and a set Scheme must be http or https (case-insensitive —
+// downstream normalizes to lowercase).
+func validateEgressRuleMatch(match *types.EgressRuleMatch, index int) error {
+	if match == nil {
+		return nil
+	}
+	if match.Port != nil {
+		if *match.Port < 1 || *match.Port > 65535 {
+			return fmt.Errorf("network.rules[%d].match.port must be in [1, 65535], got %d", index, *match.Port)
+		}
+		if match.Scheme == nil {
+			return fmt.Errorf("network.rules[%d].match.port requires match.scheme to be set", index)
+		}
+	}
+	if match.Scheme != nil {
+		scheme := strings.ToLower(strings.TrimSpace(*match.Scheme))
+		if scheme != "http" && scheme != "https" {
+			return fmt.Errorf("network.rules[%d].match.scheme must be 'http' or 'https', got %q", index, *match.Scheme)
+		}
+	}
 	return nil
 }
 
@@ -163,14 +218,14 @@ func getReqResource(req *types.CreateCubeSandboxReq) (cpu, mem resource.Quantity
 			err = ret.Err(errorcode.ErrorCode_MasterParamsError, "request Resources nil")
 			break
 		}
-		ctncpuQuantity, err := resource.ParseQuantity(ctr.Resources.Cpu)
-		if err != nil {
-			err = fmt.Errorf("parse container %q cpu limit: %w", ctr.Name, err)
+		ctncpuQuantity, cpuErr := resource.ParseQuantity(ctr.Resources.Cpu)
+		if cpuErr != nil {
+			err = fmt.Errorf("parse container %q cpu limit: %w", ctr.Name, cpuErr)
 			break
 		}
-		ctnmemQuantity, err := resource.ParseQuantity(ctr.Resources.Mem)
-		if err != nil {
-			err = fmt.Errorf("parse container %q mem limit: %w", ctr.Name, err)
+		ctnmemQuantity, memErr := resource.ParseQuantity(ctr.Resources.Mem)
+		if memErr != nil {
+			err = fmt.Errorf("parse container %q mem limit: %w", ctr.Name, memErr)
 			break
 		}
 		cpu.Add(ctncpuQuantity)
@@ -214,8 +269,8 @@ func ConstructCubeletReq(ctx context.Context, req *types.CreateCubeSandboxReq) (
 	if err := checkParam(req); err != nil {
 		return nil, err
 	}
-	log.G(ctx).Infof("[hostdir] ConstructCubeletReq: annotations=%v volumes_before_inject=%d",
-		req.Annotations, len(req.Volumes))
+	log.G(ctx).Infof("[hostdir] ConstructCubeletReq: annotation_count=%d volumes_before_inject=%d",
+		len(req.Annotations), len(req.Volumes))
 
 	// Normalize the sandbox idle timeout into a concrete value.
 	timeoutSeconds, err := resolveTimeoutSeconds(req.Timeout, config.GetConfig().CubeletConf.DefaultTimeoutInsec)
@@ -226,13 +281,17 @@ func ConstructCubeletReq(ctx context.Context, req *types.CreateCubeSandboxReq) (
 
 	out := &cubebox.RunCubeSandboxRequest{
 		RequestID:         req.RequestID,
-		Labels:            req.Labels,
+		Labels:            stripUserCubeMasterLabels(req.Labels),
 		InstanceType:      req.InstanceType,
 		NetworkType:       req.NetworkType,
 		Annotations:       make(map[string]string),
 		RuntimeHandler:    req.RuntimeHandler,
 		Namespace:         req.Namespace,
 		CubeNetworkConfig: mapCubeNetworkConfig(req.CubeNetworkConfig),
+	}
+	if b, ok, err := constants.OptionalSnapshotBackend(req.Backend); err == nil && ok {
+		out.Backend = b
+		out.Annotations[constants.CubeAnnotationStorageBackend] = b
 	}
 	log.G(ctx).Infof(
 		"ConstructCubeletReq: instance_type=%s network_type=%s cube_network_config=%s",
@@ -255,12 +314,23 @@ func ConstructCubeletReq(ctx context.Context, req *types.CreateCubeSandboxReq) (
 		return nil, ret.Err(errorcode.ErrorCode_MasterParamsError, err.Error())
 	}
 
+	injectEnvdSidecar(ctx, req, out)
+
 	if err = checkAndGetVolumes(req, out); err != nil {
 		return nil, ret.Err(errorcode.ErrorCode_MasterParamsError, err.Error())
 	}
+	if sourceMetadata, ok := req.Annotations[AnnotationPluginVolumeSources]; ok {
+		out.Annotations[AnnotationPluginVolumeSources] = sourceMetadata
+	} else {
+		delete(out.Annotations, AnnotationPluginVolumeSources)
+	}
 	// Sync any annotations added by checkAndGetVolumes (e.g. plugin-volume-sources)
-	// into the outgoing RunCubeSandboxRequest.
+	// into the outgoing RunCubeSandboxRequest. Do not re-add keys
+	// checkAndGetAnnotation already dropped (pause / restore-base).
 	for k, v := range req.Annotations {
+		if rejectUserCubeMasterAnnotation(k) {
+			continue
+		}
 		if _, exists := out.Annotations[k]; !exists {
 			out.Annotations[k] = v
 		}
@@ -315,13 +385,18 @@ func mapEgressRuleMatch(in *types.EgressRuleMatch) *cubebox.EgressRuleMatch {
 	if in == nil {
 		return nil
 	}
-	return &cubebox.EgressRuleMatch{
+	out := &cubebox.EgressRuleMatch{
 		Sni:    in.SNI,
 		Host:   in.Host,
 		Method: append([]string(nil), in.Method...),
 		Path:   in.Path,
 		Scheme: in.Scheme,
 	}
+	if in.Port != nil {
+		p := int32(*in.Port)
+		out.Port = &p
+	}
+	return out
 }
 
 func mapEgressRuleAction(in *types.EgressRuleAction) *cubebox.EgressRuleAction {
@@ -359,6 +434,15 @@ func formatConstructCubeNetworkConfig(in *cubebox.CubeNetworkConfig) string {
 	return fmt.Sprintf("allow_internet_access=%s allow_out=%v deny_out=%v rules=%d", allowInternetAccess, in.GetAllowOut(), in.GetDenyOut(), len(in.GetRules()))
 }
 
+func appendExposedPortIfMissing(out *cubebox.RunCubeSandboxRequest, port int64) {
+	for _, existing := range out.ExposedPorts {
+		if existing == port {
+			return
+		}
+	}
+	out.ExposedPorts = append(out.ExposedPorts, port)
+}
+
 func getExposedPorts(req *types.CreateCubeSandboxReq, out *cubebox.RunCubeSandboxRequest) error {
 
 	if config.GetConfig().CubeletConf.EnableExposedPort {
@@ -376,7 +460,7 @@ func getExposedPorts(req *types.CreateCubeSandboxReq, out *cubebox.RunCubeSandbo
 			if err != nil {
 				return ret.Errorf(errorcode.ErrorCode_MasterParamsError, "com.exposed_ports:%s,invalid:%v", p, err.Error())
 			}
-			out.ExposedPorts = append(out.ExposedPorts, v)
+			appendExposedPortIfMissing(out, v)
 		}
 		if len(out.GetExposedPorts()) <= 0 {
 			return ret.Errorf(errorcode.ErrorCode_MasterParamsError, "com.exposed_ports is empty")
@@ -711,6 +795,10 @@ func checkAndGetVolumes(req *types.CreateCubeSandboxReq, out *cubebox.RunCubeSan
 			}
 		}
 	}
+	// plugin-volume-sources contains runtime driver/private_data resolved from
+	// t_cube_volume. Never reuse a value inherited from a snapshot or an
+	// earlier construction pass; rebuild it from current VolumeRecord rows.
+	delete(req.Annotations, AnnotationPluginVolumeSources)
 
 	if req.Volumes != nil {
 		for _, e := range req.Volumes {
@@ -718,9 +806,15 @@ func checkAndGetVolumes(req *types.CreateCubeSandboxReq, out *cubebox.RunCubeSan
 				return fmt.Errorf("volume name must not be empty")
 			}
 
-			// Identify plugin volumes by name appearing in plugin-volume-mounts
-			// annotation, or by having a nil VolumeSource.
-			if e.VolumeSource == nil || pluginVolumeNames[e.Name] {
+			// Identify plugin volumes by annotation, nil source (the CubeAPI
+			// representation), or the native PluginVolume source.
+			explicitPlugin := e.VolumeSource != nil && e.VolumeSource.PluginVolume != nil
+			if explicitPlugin {
+				if volumeID := strings.TrimSpace(e.VolumeSource.PluginVolume.Options["volume_id"]); volumeID != "" && volumeID != e.Name {
+					return fmt.Errorf("volume [%s]: plugin volume_id %q must match volume name", e.Name, volumeID)
+				}
+			}
+			if e.VolumeSource == nil || explicitPlugin || pluginVolumeNames[e.Name] {
 				record, err := resolveVolumeRecord(e.Name)
 				if err != nil {
 					return fmt.Errorf("volume [%s]: %w", e.Name, err)
@@ -834,6 +928,9 @@ func checkAndGetAnnotation(req *types.CreateCubeSandboxReq, out *cubebox.RunCube
 
 		if strings.HasPrefix(k, constants.CubeAnnotationsPrefix) ||
 			strings.HasPrefix(k, constants.CubeAnnotationsCloadPrefix) {
+			if rejectUserCubeMasterAnnotation(k) {
+				continue
+			}
 			out.Annotations[k] = v
 		}
 	}
@@ -871,6 +968,38 @@ func setCreateTimeEnvVarsAnnotation(out map[string]string, envVars map[string]st
 	}
 	out[constants.CubeAnnotationCreateTimeEnvVars] = string(payload)
 	return nil
+}
+
+// rejectUserCubeMasterAnnotation drops Create annotations (and the same
+// keys on Labels) that only Master or Cubelet may stamp. Forwarding them
+// lets a client pin cube.master.pause.snapshot.id on a running sandbox
+// and make CleanupTemplate no-op for another tenant's pause catalog.
+func rejectUserCubeMasterAnnotation(key string) bool {
+	switch strings.TrimSpace(key) {
+	case constants.CubeAnnotationPauseSnapshotID,
+		constants.CubeAnnotationLaunchMemorySnapshotID,
+		constants.CubeAnnotationRuntimeRestoreSnapshotID,
+		constants.CubeAnnotationRuntimeRestoreSnapshotAttachedAt:
+		return true
+	default:
+		return false
+	}
+}
+
+// stripUserCubeMasterLabels copies user Labels without the platform keys
+// rejectUserCubeMasterAnnotation already drops from Annotations.
+func stripUserCubeMasterLabels(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		if rejectUserCubeMasterAnnotation(k) {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 func getBlkQosAnnotation(req *types.CreateCubeSandboxReq) string {
@@ -1088,7 +1217,6 @@ func pluginVolumeWireVolume(name string) *cubebox.Volume {
 //
 // private_data is omitted from the JSON object when empty.
 func appendPluginVolumeSourceAnnotation(req *types.CreateCubeSandboxReq, name, driver, privateData string) error {
-	const key = "plugin-volume-sources"
 	type entry struct {
 		Name        string `json:"name"`
 		Driver      string `json:"driver"`
@@ -1098,16 +1226,31 @@ func appendPluginVolumeSourceAnnotation(req *types.CreateCubeSandboxReq, name, d
 		req.Annotations = make(map[string]string)
 	}
 	var entries []entry
-	if raw := req.Annotations[key]; raw != "" {
+	if raw := req.Annotations[AnnotationPluginVolumeSources]; raw != "" {
 		if err := json.Unmarshal([]byte(raw), &entries); err != nil {
 			return err
 		}
 	}
-	entries = append(entries, entry{Name: name, Driver: driver, PrivateData: privateData})
-	b, err := json.Marshal(entries)
+	next := entry{Name: name, Driver: driver, PrivateData: privateData}
+	found := false
+	out := entries[:0]
+	for _, existing := range entries {
+		if existing.Name != name {
+			out = append(out, existing)
+			continue
+		}
+		if !found {
+			out = append(out, next)
+			found = true
+		}
+	}
+	if !found {
+		out = append(out, next)
+	}
+	b, err := json.Marshal(out)
 	if err != nil {
 		return err
 	}
-	req.Annotations[key] = string(b)
+	req.Annotations[AnnotationPluginVolumeSources] = string(b)
 	return nil
 }

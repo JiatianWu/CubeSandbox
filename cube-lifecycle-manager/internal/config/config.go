@@ -7,6 +7,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -21,14 +22,22 @@ type Config struct {
 	RedisAddr     string
 	RedisPassword string
 	RedisDB       int
+	// Sentinel mode: when RedisMasterName is set, RedisSentinelAddrs must be
+	// non-empty and go-redis FailoverClient is used instead of a fixed Addr.
+	RedisMasterName    string
+	RedisSentinelAddrs []string
+	// RedisSentinelPassword authenticates to sentinel instances. Leave empty
+	// when Sentinel has no requirepass; it is not the master password
+	// (RedisPassword still authenticates to the Redis master).
+	RedisSentinelPassword string
 
 	// CubeProxy admin endpoints to push to and pull from. Multiple endpoints
-	// are supported even though the recommended deployment is one sidecar
+	// are supported even though the recommended deployment is one CLM
 	// per CubeProxy: future operators may consolidate.
 	CubeProxyAdminURLs []string
 	CubeAdminToken     string // optional shared secret; sent as X-Cube-Admin-Token
 
-	// CubeMaster internal HTTP for pause/resume. Sidecar calls
+	// CubeMaster internal HTTP for pause/resume. CLM calls
 	// POST <CubeMasterURL>/cube/sandbox/update with action=pause|resume.
 	CubeMasterURL string
 
@@ -42,24 +51,25 @@ type Config struct {
 	DefaultIdleTimeout time.Duration
 
 	// Loop intervals.
-	StreamReadBlock   time.Duration // XREADGROUP BLOCK arg
+	StreamReadBlock   time.Duration // XREAD BLOCK arg
 	LastActivePoll    time.Duration // GET /admin/last_active cadence
 	IdleSweepInterval time.Duration // sweeper cadence
-	// BootstrapWarmup: after sidecar restart, wait this long before pausing
+	// BootstrapWarmup: after CLM restart, wait this long before pausing
 	// any sandbox that was loaded via HGETALL bootstrap. Lets the
 	// last_active poller backfill activity timestamps first. New sandboxes
 	// that arrive AFTER startup are not affected by this delay.
 	BootstrapWarmup time.Duration
 
 	// Pause/resume locks (SETNX TTL). Long enough to outlive a slow
-	// CubeMaster RPC, short enough that a crashed sidecar releases the lock.
+	// CubeMaster RPC, short enough that a crashed CLM replica releases the lock.
 	StateLockTTL time.Duration
 
-	// Consumer group identity. Group name is fixed; consumer name defaults
-	// to the host's name so multiple sidecars in a cluster get independent
-	// pending-entries lists.
+	// ConsumerGroup is retained for one release for configuration/logging
+	// compatibility; broadcast XREAD no longer uses a consumer group.
 	ConsumerGroup string
-	ConsumerName  string // empty → derived from os.Hostname()
+	// ConsumerName defaults to the hostname and is now used as the leader
+	// election identity prefix.
+	ConsumerName string // empty → derived from os.Hostname()
 
 	// HTTP client timeouts (for outbound calls to CubeMaster + CubeProxy).
 	HTTPTimeout time.Duration
@@ -76,6 +86,20 @@ type Config struct {
 	HeartbeatTTL time.Duration
 	// DiscoveryRefresh: cadence of the Redis heartbeat scan.
 	DiscoveryRefresh time.Duration
+
+	// EventBusEnabled toggles Pub/Sub wakeup hints for cross-replica resume
+	// waiters. When false, state writes stay on the legacy Redis Set/Del
+	// path and resumer.waitForRunning uses its 100ms polling ticker.
+	// Set CUBE_LCM_EVENTBUS_ENABLED=false as a kill switch.
+	EventBusEnabled bool
+
+	// Leader election gates singleton maintenance work (idle sweep/kill and
+	// CubeProxy registry pruning). Warm standbys still consume lifecycle
+	// events, poll activity, and serve resume requests.
+	LeaderElectionEnabled bool
+	LeaderLeaseTTL        time.Duration
+	LeaderRenewInterval   time.Duration
+	LeaderRetryInterval   time.Duration
 }
 
 // Default returns a config populated with safe defaults; callers then override
@@ -103,6 +127,13 @@ func Default() *Config {
 		UseStaticFleet:   false,
 		HeartbeatTTL:     15 * time.Second,
 		DiscoveryRefresh: 3 * time.Second,
+		EventBusEnabled:  true,
+		// Disabled by default so non-Kubernetes single-instance deployments
+		// retain their current behavior. Kubernetes explicitly enables it.
+		LeaderElectionEnabled: false,
+		LeaderLeaseTTL:        10 * time.Second,
+		LeaderRenewInterval:   3 * time.Second,
+		LeaderRetryInterval:   time.Second,
 	}
 }
 
@@ -130,6 +161,15 @@ func Load() (*Config, error) {
 		} else {
 			c.RedisDB = n
 		}
+	}
+	if v := os.Getenv("CUBE_LCM_REDIS_MASTER_NAME"); v != "" {
+		c.RedisMasterName = v
+	}
+	if v := os.Getenv("CUBE_LCM_REDIS_SENTINEL_NODES"); v != "" {
+		c.RedisSentinelAddrs = parseSentinelAddrs(v)
+	}
+	if v := os.Getenv("CUBE_LCM_REDIS_SENTINEL_PASSWORD"); v != "" {
+		c.RedisSentinelPassword = v
 	}
 	if v := os.Getenv("CUBE_LCM_PROXY_ADMIN_URLS"); v != "" {
 		c.CubeProxyAdminURLs = splitAndTrim(v)
@@ -204,7 +244,43 @@ func Load() (*Config, error) {
 			c.DiscoveryRefresh = d
 		}
 	}
-
+	if v := os.Getenv("CUBE_LCM_EVENTBUS_ENABLED"); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			addErr("CUBE_LCM_EVENTBUS_ENABLED", err)
+		} else {
+			c.EventBusEnabled = enabled
+		}
+	}
+	if v := os.Getenv("CUBE_LCM_LEADER_ELECTION_ENABLED"); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			addErr("CUBE_LCM_LEADER_ELECTION_ENABLED", err)
+		} else {
+			c.LeaderElectionEnabled = enabled
+		}
+	}
+	if v := os.Getenv("CUBE_LCM_LEADER_LEASE_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err != nil {
+			addErr("CUBE_LCM_LEADER_LEASE_TTL", err)
+		} else {
+			c.LeaderLeaseTTL = d
+		}
+	}
+	if v := os.Getenv("CUBE_LCM_LEADER_RENEW_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err != nil {
+			addErr("CUBE_LCM_LEADER_RENEW_INTERVAL", err)
+		} else {
+			c.LeaderRenewInterval = d
+		}
+	}
+	if v := os.Getenv("CUBE_LCM_LEADER_RETRY_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err != nil {
+			addErr("CUBE_LCM_LEADER_RETRY_INTERVAL", err)
+		} else {
+			c.LeaderRetryInterval = d
+		}
+	}
 	if c.ConsumerName == "" {
 		host, err := os.Hostname()
 		if err != nil {
@@ -221,10 +297,14 @@ func Load() (*Config, error) {
 }
 
 // Validate returns an error if the config has any field combination that the
-// sidecar can't proceed with.
+// CLM can't proceed with.
 func (c *Config) Validate() error {
-	if c.RedisAddr == "" {
-		return errors.New("redis addr is empty")
+	if c.RedisMasterName != "" {
+		if len(c.RedisSentinelAddrs) == 0 {
+			return errors.New("CUBE_LCM_REDIS_SENTINEL_NODES is empty when CUBE_LCM_REDIS_MASTER_NAME is set")
+		}
+	} else if c.RedisAddr == "" {
+		return errors.New("CUBE_LCM_REDIS_ADDR is empty")
 	}
 	if len(c.CubeProxyAdminURLs) == 0 {
 		return errors.New("cube proxy admin urls is empty")
@@ -244,6 +324,24 @@ func (c *Config) Validate() error {
 	if c.LastActivePoll <= 0 {
 		return errors.New("last active poll must be > 0")
 	}
+	if c.HTTPTimeout <= 0 {
+		return errors.New("http timeout must be > 0")
+	}
+	if c.StateLockTTL <= c.HTTPTimeout {
+		return errors.New("state lock ttl must be greater than the HTTP timeout")
+	}
+	if c.LeaderLeaseTTL <= 0 {
+		return errors.New("leader lease ttl must be > 0")
+	}
+	if c.LeaderRenewInterval <= 0 {
+		return errors.New("leader renew interval must be > 0")
+	}
+	if c.LeaderRenewInterval*2 >= c.LeaderLeaseTTL {
+		return errors.New("leader renew interval must be less than half the lease ttl")
+	}
+	if c.LeaderRetryInterval <= 0 || c.LeaderRetryInterval >= c.LeaderLeaseTTL {
+		return errors.New("leader retry interval must be > 0 and less than the lease ttl")
+	}
 	return nil
 }
 
@@ -255,6 +353,23 @@ func splitAndTrim(s string) []string {
 		if p != "" {
 			out = append(out, p)
 		}
+	}
+	return out
+}
+
+// parseSentinelAddrs mirrors CubeMaster parseRedisAddrs / CubeProxy
+// split_host_port: bare host or bare [ipv6] defaults to Sentinel port 26379.
+func parseSentinelAddrs(s string) []string {
+	parts := splitAndTrim(s)
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if !strings.Contains(part, ":") {
+			part = net.JoinHostPort(part, "26379")
+		} else if strings.HasPrefix(part, "[") && strings.HasSuffix(part, "]") {
+			host := strings.TrimSuffix(strings.TrimPrefix(part, "["), "]")
+			part = net.JoinHostPort(host, "26379")
+		}
+		out = append(out, part)
 	}
 	return out
 }

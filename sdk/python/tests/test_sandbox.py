@@ -20,9 +20,9 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from cubesandbox import CommandResult, Template
+from cubesandbox import NEVER_TIMEOUT, CommandResult, Template
 from cubesandbox._template import TemplateInfo
-from cubesandbox._commands import Commands, _collect_process_events
+from cubesandbox._commands import Commands
 from cubesandbox._config import Config
 from cubesandbox._exceptions import (
     ApiError,
@@ -77,6 +77,23 @@ def mock_response(body=None, status: int = 200):
 def make_sandbox(**data_overrides) -> Sandbox:
     d = {**SANDBOX_DATA, **data_overrides}
     return Sandbox(d, config=make_config())
+
+
+def _recording_client(transport: httpx.MockTransport, seen: dict) -> httpx.Client:
+    """An httpx client that records the timeout each request was given.
+
+    MockTransport answers synchronously and enforces no timeouts at all, so the
+    value a caller passes is only observable by recording it here.
+    """
+    client = httpx.Client(transport=transport)
+    stream = client.stream
+
+    def recording_stream(*args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return stream(*args, **kwargs)
+
+    client.stream = recording_stream
+    return client
 
 
 def connect_envelope(flags: int, payload: str) -> bytes:
@@ -167,6 +184,19 @@ class TestCreate:
             Sandbox.create(metadata=meta, config=make_config())
         body = m.call_args.kwargs["json"]
         assert body["metadata"] == meta
+
+    def test_create_sends_distribution_scope(self):
+        scope = ["node-a", "10.0.0.12"]
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(distribution_scope=scope, config=make_config())
+        body = m.call_args.kwargs["json"]
+        assert body["distributionScope"] == scope
+
+    def test_create_default_distribution_scope_omitted(self):
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(config=make_config())
+        body = m.call_args.kwargs["json"]
+        assert "distributionScope" not in body
 
     def test_create_template_not_found(self):
         with patch("requests.Session.post",
@@ -691,6 +721,12 @@ class TestConnect:
         body = m.call_args.kwargs["json"]
         assert "timeout" not in body
 
+    @pytest.mark.parametrize("timeout", [-1, 120])
+    def test_connect_sends_explicit_timeout(self, timeout):
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA)) as m:
+            Sandbox.connect(SANDBOX_ID, timeout, config=make_config())
+        assert m.call_args.kwargs["json"]["timeout"] == timeout
+
 
 # ── GET /sandboxes ────────────────────────────────────────────────────────────
 
@@ -700,6 +736,22 @@ class TestListSandboxesV1:
         with patch("requests.Session.get", return_value=mock_response(data)):
             result = Sandbox.list(config=make_config())
         assert result == data
+
+    def test_list_includes_volume_mounts(self):
+        data = [{
+            **SANDBOX_DATA,
+            "volumeMounts": [{
+                "name": "hostdir-0",
+                "path": "/mnt/data",
+                "readOnly": True,
+            }],
+        }]
+        with patch("requests.Session.get", return_value=mock_response(data)):
+            result = Sandbox.list(config=make_config())
+
+        assert len(result) == 1
+        assert result[0]["volumeMounts"][0]["path"] == "/mnt/data"
+        assert result[0]["volumeMounts"][0]["readOnly"] is True
 
     def test_list_empty(self):
         with patch("requests.Session.get", return_value=mock_response([])):
@@ -726,6 +778,23 @@ class TestListSandboxesV2:
         with patch("requests.Session.get", return_value=mock_response(data)):
             result = Sandbox.list_v2(config=make_config())
         assert result == data
+
+    def test_list_v2_includes_volume_mounts(self):
+        data = [{
+            **SANDBOX_DATA,
+            "volumeMounts": [{
+                "name": "hostdir-0",
+                "path": "/mnt/ro",
+                "readOnly": True,
+            }],
+        }]
+        with patch("requests.Session.get", return_value=mock_response(data)):
+            result = Sandbox.list_v2(config=make_config())
+
+        mount = result[0]["volumeMounts"][0]
+        assert mount["path"] == "/mnt/ro"
+        assert mount["readOnly"] is True
+        assert "hostPath" not in mount
 
     def test_list_v2_calls_correct_endpoint(self):
         with patch("requests.Session.get", return_value=mock_response([])) as m:
@@ -762,6 +831,7 @@ FULL_INFO_DATA = {
     "endAt": "2026-05-14T01:00:00Z",
     "envdVersion": "0.0.1",
     "cpuCount": 2,
+    "cpuMilli": 2000,
     "memoryMB": 512,
     "diskSizeMB": 1024,
     "metadata": {"team": "core"},
@@ -807,6 +877,7 @@ class TestGetInfo:
         assert info.template_id == "tpl-test"
         assert info.sandbox_domain == DOMAIN
         assert info.cpu_count == 2
+        assert info.cpu_milli == 2000
         assert info.memory_mb == 512
         assert info.disk_size_mb == 1024
         assert info.envd_version == "0.0.1"
@@ -890,8 +961,29 @@ class TestGetInfo:
         assert info.started_at is None
         assert info.end_at is None
         assert info.cpu_count is None
+        assert info.cpu_milli is None
         assert info.metadata == {}
         assert info.state is None
+
+    def test_get_info_includes_volume_mounts(self):
+        sb = make_sandbox()
+        info = {
+            **SANDBOX_DATA,
+            "volumeMounts": [{
+                "name": "hostdir-0",
+                "path": "/mnt/data",
+                "readOnly": True,
+            }],
+        }
+        with patch.object(sb._session, "get", return_value=mock_response(info)):
+            result = sb.get_info()
+
+        mounts = result["volumeMounts"]
+        assert len(mounts) == 1
+        assert mounts[0]["name"] == "hostdir-0"
+        assert mounts[0]["path"] == "/mnt/data"
+        assert mounts[0]["readOnly"] is True
+        assert "hostPath" not in mounts[0]
 
     def test_get_info_not_found(self):
         sb = make_sandbox()
@@ -1311,10 +1403,7 @@ class TestCommands:
             return httpx.Response(200, stream=httpx.ByteStream(body))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             result = sb.commands.run("echo hello", cwd="/work", env={"A": "B"})
 
         assert result.stdout == "hello\nworld\n"
@@ -1330,6 +1419,83 @@ class TestCommands:
         assert seen["payload"]["process"]["cwd"] == "/work"
         assert seen["payload"]["process"]["envs"] == {"A": "B"}
         assert seen["payload"]["process"]["args"] == ["-l", "-c", "echo hello"]
+
+    def test_run_defaults_cwd_to_empty(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["payload"] = decode_connect_payload(request.content)
+            body = b"".join(
+                [
+                    connect_envelope(0, '{"event":{"end":{"exitCode":0,"exited":true}}}'),
+                    connect_envelope(0x02, "{}"),
+                ]
+            )
+            return httpx.Response(200, stream=httpx.ByteStream(body))
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            result = sb.commands.run("pwd", user="nobody")
+
+        assert result.exit_code == 0
+        assert seen["payload"]["process"]["cwd"] == ""
+
+    # envd reads Connect-Timeout-Ms as a hard wall-clock deadline, so a
+    # non-positive one has already passed and the request is never answered.
+    # Both values below arrive in ordinary use: 0 is how the e2b SDK spells
+    # "no deadline", and NEVER_TIMEOUT is how this one does.
+    #
+    # The client-side deadline is asserted as well as the header. httpx reads
+    # the same number, and only None disables it there -- 0 times out every
+    # socket operation at once and -1 is rejected -- so forwarding the raw
+    # value would trade the hang for an immediate failure. MockTransport
+    # enforces no timeouts at all, which is why what was passed is inspected
+    # rather than its effect.
+    @pytest.mark.parametrize("timeout", [0, NEVER_TIMEOUT])
+    def test_run_omits_non_positive_timeout_header(self, timeout):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["headers"] = request.headers
+            body = b"".join(
+                [
+                    connect_envelope(0, '{"event":{"end":{"exitCode":0,"exited":true}}}'),
+                    connect_envelope(0x02, "{}"),
+                ]
+            )
+            return httpx.Response(200, stream=httpx.ByteStream(body))
+
+        client = _recording_client(httpx.MockTransport(handler), seen)
+        with patch.object(sb, "_build_data_client", return_value=client):
+            result = sb.commands.run("echo hi", timeout=timeout)
+
+        assert result.exit_code == 0
+        assert "connect-timeout-ms" not in seen["headers"]
+        assert seen["timeout"] is None
+
+    def test_run_sends_positive_timeout_header(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["headers"] = request.headers
+            body = b"".join(
+                [
+                    connect_envelope(0, '{"event":{"end":{"exitCode":0,"exited":true}}}'),
+                    connect_envelope(0x02, "{}"),
+                ]
+            )
+            return httpx.Response(200, stream=httpx.ByteStream(body))
+
+        client = _recording_client(httpx.MockTransport(handler), seen)
+        with patch.object(sb, "_build_data_client", return_value=client):
+            result = sb.commands.run("echo hi", timeout=30)
+
+        assert result.exit_code == 0
+        assert seen["headers"]["connect-timeout-ms"] == "30000"
+        assert seen["timeout"] == 30
 
     def test_run_stderr_event(self):
         sb = make_sandbox()
@@ -1347,10 +1513,7 @@ class TestCommands:
             return httpx.Response(200, stream=httpx.ByteStream(body))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             result = sb.commands.run("echo warn >&2")
 
         assert result.stdout == ""
@@ -1371,10 +1534,7 @@ class TestCommands:
             return httpx.Response(200, stream=httpx.ByteStream(body))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             result = sb.commands.run("false")
         assert result.exit_code == 1
 
@@ -1392,10 +1552,7 @@ class TestCommands:
             return httpx.Response(200, stream=httpx.ByteStream(body))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             result = sb.commands.run("false")
         assert result.exit_code == 7
 
@@ -1416,37 +1573,9 @@ class TestCommands:
             return httpx.Response(200, stream=httpx.ByteStream(body))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             result = sb.commands.run("kill")
         assert result.exit_code == 137
-
-    def test_collect_process_events_prefers_status_when_exit_code_unset(self):
-        class End:
-            exit_code = 0
-            status = "exit status 7"
-            exited = True
-            error = ""
-
-            def HasField(self, name):
-                return False
-
-        class Event:
-            end = End()
-
-            def HasField(self, name):
-                return name == "end"
-
-        class Response:
-            event = Event()
-
-            def HasField(self, name):
-                return name == "event"
-
-        result = _collect_process_events([Response()])
-        assert result.exit_code == 7
 
     def test_run_timeout_forwarded(self):
         sb = make_sandbox()
@@ -1464,10 +1593,7 @@ class TestCommands:
             return httpx.Response(200, stream=httpx.ByteStream(body))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             sb.commands.run("sleep 1", timeout=5.0)
         assert seen["headers"]["connect-timeout-ms"] == "5000"
 
@@ -1478,10 +1604,7 @@ class TestCommands:
             return httpx.Response(400, json={"message": "sandbox is not ready"})
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             with pytest.raises(RuntimeError, match="HTTP 400: sandbox is not ready"):
                 sb.commands.run("echo hello")
 
@@ -1633,6 +1756,22 @@ class TestFilesystem:
             entries = sb.files.list("/empty")
         assert entries == []
 
+    def test_list_includes_user_when_provided(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["authorization"] = request.headers.get("authorization")
+            return httpx.Response(200, json={"entries": []})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            sb.files.list("/tmp", user="nobody")
+
+        assert seen["body"] == {"path": "/tmp"}
+        assert seen["authorization"] == "Basic bm9ib2R5Og=="
+
     def test_stat_success(self):
         sb = make_sandbox()
         seen = {}
@@ -1651,6 +1790,25 @@ class TestFilesystem:
         assert entry["name"] == "hello.txt"
         assert entry["size"] == "30"
 
+    def test_stat_includes_user_when_provided(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["authorization"] = request.headers.get("authorization")
+            return httpx.Response(200, json={
+                "entry": {"name": "hello.txt", "type": "FILE_TYPE_FILE", "path": "/tmp/hello.txt", "size": "30"}
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            entry = sb.files.stat("/tmp/hello.txt", user="nobody")
+
+        assert seen["body"] == {"path": "/tmp/hello.txt"}
+        assert seen["authorization"] == "Basic bm9ib2R5Og=="
+        assert entry["name"] == "hello.txt"
+
     def test_exists_returns_true(self):
         sb = make_sandbox()
 
@@ -1662,6 +1820,24 @@ class TestFilesystem:
         client = httpx.Client(transport=httpx.MockTransport(handler))
         with patch.object(sb, "_build_data_client", return_value=client):
             assert sb.files.exists("/tmp/f.txt") is True
+
+    def test_exists_includes_user_when_provided(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["authorization"] = request.headers.get("authorization")
+            return httpx.Response(200, json={
+                "entry": {"name": "f.txt", "type": "FILE_TYPE_FILE", "path": "/tmp/f.txt"}
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            assert sb.files.exists("/tmp/f.txt", user="nobody") is True
+
+        assert seen["body"] == {"path": "/tmp/f.txt"}
+        assert seen["authorization"] == "Basic bm9ib2R5Og=="
 
     def test_exists_returns_false_on_404(self):
         sb = make_sandbox()
@@ -1690,6 +1866,22 @@ class TestFilesystem:
         assert seen["path"] == "/filesystem.Filesystem/Remove"
         assert seen["body"] == {"path": "/tmp/old.txt"}
 
+    def test_remove_includes_user_when_provided(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["authorization"] = request.headers.get("authorization")
+            return httpx.Response(200, json={})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            sb.files.remove("/tmp/old.txt", user="nobody")
+
+        assert seen["body"] == {"path": "/tmp/old.txt"}
+        assert seen["authorization"] == "Basic bm9ib2R5Og=="
+
     def test_rename_success(self):
         sb = make_sandbox()
         seen = {}
@@ -1707,6 +1899,25 @@ class TestFilesystem:
         assert seen["body"] == {"source": "/tmp/old.txt", "destination": "/tmp/new.txt"}
         assert entry["name"] == "new.txt"
 
+    def test_rename_includes_user_when_provided(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["authorization"] = request.headers.get("authorization")
+            return httpx.Response(200, json={
+                "entry": {"name": "new.txt", "type": "FILE_TYPE_FILE", "path": "/tmp/new.txt"}
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            entry = sb.files.rename("/tmp/old.txt", "/tmp/new.txt", user="nobody")
+
+        assert seen["body"] == {"source": "/tmp/old.txt", "destination": "/tmp/new.txt"}
+        assert seen["authorization"] == "Basic bm9ib2R5Og=="
+        assert entry["name"] == "new.txt"
+
     def test_make_dir_success(self):
         sb = make_sandbox()
         seen = {}
@@ -1722,6 +1933,25 @@ class TestFilesystem:
         with patch.object(sb, "_build_data_client", return_value=client):
             entry = sb.files.make_dir("/tmp/newdir")
         assert seen["body"] == {"path": "/tmp/newdir"}
+        assert entry["type"] == "FILE_TYPE_DIRECTORY"
+
+    def test_make_dir_includes_user_when_provided(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["authorization"] = request.headers.get("authorization")
+            return httpx.Response(200, json={
+                "entry": {"name": "newdir", "type": "FILE_TYPE_DIRECTORY", "path": "/tmp/newdir"}
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            entry = sb.files.make_dir("/tmp/newdir", user="nobody")
+
+        assert seen["body"] == {"path": "/tmp/newdir"}
+        assert seen["authorization"] == "Basic bm9ib2R5Og=="
         assert entry["type"] == "FILE_TYPE_DIRECTORY"
 
     def test_write_files_success(self):
@@ -2512,6 +2742,43 @@ class TestTemplateAPI:
         assert info.name == ""
         assert info.network_type == "tap"
         assert info.allow_internet_access is True
+
+    def test_template_info_from_dict_name_fallback_from_aliases(self):
+        info = TemplateInfo.from_dict({
+            "templateID": "tpl-alias",
+            "aliases": ["my-alias"],
+        })
+        assert info.name == "my-alias"
+
+    def test_build_forwards_name_into_payload(self):
+        body = {"jobID": "job-name", "templateID": "tpl-name", "status": "accepted"}
+        with patch("requests.Session.post", return_value=mock_response(body)) as post:
+            Template.build(image="python:3.11-slim", name="my-alias", config=make_config())
+        sent = post.call_args.kwargs["json"]
+        assert sent["name"] == "my-alias"
+        assert sent["image"] == "python:3.11-slim"
+
+    def test_build_omits_name_when_none(self):
+        body = {"jobID": "j", "templateID": "t", "status": "accepted"}
+        with patch("requests.Session.post", return_value=mock_response(body)) as post:
+            Template.build(image="python:3.11-slim", config=make_config())
+        assert "name" not in post.call_args.kwargs["json"]
+
+    def test_set_alias_forwards_put_with_alias(self):
+        body = {"templateID": "tpl-1", "aliases": ["my-alias"], "status": "READY"}
+        with patch("requests.Session.put", return_value=mock_response(body)) as put:
+            info = Template.set_alias("tpl-1", "my-alias", config=make_config())
+        assert put.call_args.args[0].endswith("/templates/tpl-1/alias")
+        assert put.call_args.kwargs["json"] == {"alias": "my-alias"}
+        assert info.template_id == "tpl-1"
+        assert info.name == "my-alias"
+
+    def test_set_alias_clear_sends_empty_string(self):
+        body = {"templateID": "tpl-1", "aliases": [], "status": "READY"}
+        with patch("requests.Session.put", return_value=mock_response(body)) as put:
+            info = Template.set_alias("tpl-1", None, config=make_config())
+        assert put.call_args.kwargs["json"] == {"alias": ""}
+        assert info.name == ""
 
     def test_template_get_parses_network_fields(self):
         body = {

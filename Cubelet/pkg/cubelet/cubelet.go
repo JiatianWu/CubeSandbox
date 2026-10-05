@@ -20,7 +20,6 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubelet/versioninfo"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/masterclient"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/networkagentclient"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/recov"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	corev1 "k8s.io/api/core/v1"
@@ -46,6 +45,9 @@ type KubeletConfig struct {
 	DisableCreateNode bool `toml:"disable_create_node,omitempty"`
 
 	NodeStatusUpdateFrequency tomlext.Duration `toml:"node_status_update_frequency,omitempty"`
+
+	CubeOpsAddr    string           `toml:"cubeops_addr,omitempty"`
+	CubeOpsTimeout tomlext.Duration `toml:"cubeops_timeout,omitempty"`
 }
 
 func DefaultCubeletConfig() *KubeletConfig {
@@ -54,6 +56,7 @@ func DefaultCubeletConfig() *KubeletConfig {
 		ResyncInterval:            10 * time.Hour,
 		DisableCreateNode:         false,
 		NodeStatusUpdateFrequency: tomlext.FromStdTime(10 * time.Second),
+		CubeOpsTimeout:            tomlext.FromStdTime(10 * time.Minute),
 	}
 }
 
@@ -110,12 +113,16 @@ type Cubelet struct {
 
 	rtManager runtemplate.RunTemplateManager
 
-	networkAgentClient networkagentclient.Client
-	lastNodeSnapshot   *cubeletnodemeta.Node
+	lastNodeSnapshot *cubeletnodemeta.Node
 
 	versionCollector *versioninfo.Collector
 
 	closeCh chan struct{}
+}
+
+// StopChannel is closed when Cubelet shuts down.
+func (kl *Cubelet) StopChannel() <-chan struct{} {
+	return kl.closeCh
 }
 
 func NewCubelet(
@@ -124,7 +131,6 @@ func NewCubelet(
 	controllerMap map[string]controller.CubeMetaController,
 	criImage *cubeimages.CubeImageService,
 	rtManager runtemplate.RunTemplateManager,
-	networkAgentClient networkagentclient.Client,
 ) (*Cubelet, error) {
 	var (
 		ctx        = context.Background()
@@ -156,10 +162,9 @@ func NewCubelet(
 		nodeStatusUpdateFrequency: tomlext.ToStdTime(mconfig.NodeStatusUpdateFrequency),
 		nodeStatusReportFrequency: tomlext.ToStdTime(mconfig.NodeStatusUpdateFrequency),
 
-		criImage:           criImage,
-		rtManager:          rtManager,
-		controllerMap:      controllerMap,
-		networkAgentClient: networkAgentClient,
+		criImage:      criImage,
+		rtManager:     rtManager,
+		controllerMap: controllerMap,
 
 		NodeLabels: nodeLabels,
 

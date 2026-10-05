@@ -36,7 +36,6 @@ import (
 	"github.com/containerd/log"
 	"github.com/moby/sys/mountinfo"
 	"github.com/sirupsen/logrus"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/network"
 	dynamConf "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/config"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	_ "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/nsenter"
@@ -44,8 +43,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/version"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/services/server"
 	srvconfig "github.com/tencentcloud/CubeSandbox/Cubelet/services/server/config"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
-	cubelog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 	"github.com/urfave/cli/v2"
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/net/context"
@@ -59,7 +57,6 @@ const (
 	CubeMntNsDirPath      = "/usr/local/services/cubetoolbox/cubeletmnt"
 	CubeMntNsFilePath     = "/usr/local/services/cubetoolbox/cubeletmnt/mnt"
 	CubeMainProcMutexLock = "/run/cubelock.db"
-	networkPluginKey      = "io.cubelet.internal.v1.network"
 )
 
 func main() {
@@ -265,18 +262,18 @@ func App() *cli.App {
 		},
 		&cli.StringFlag{
 			Name:  "logpath",
-			Value: "/data/log/Cubelet",
+			Value: srvconfig.DefaultCubeLogPath,
 			Usage: "cubelog log directory",
 		},
 		&cli.IntFlag{
 			Name:  "log-roll-num",
-			Value: 10,
+			Value: srvconfig.DefaultCubeLogFileNum,
 			Usage: "cubelog files roll number",
 		},
-		&cli.IntFlag{
+		&cli.StringFlag{
 			Name:  "log-roll-size",
-			Value: 500,
-			Usage: "cubelog files roll size(MB)",
+			Value: string(srvconfig.DefaultCubeLogFileSize),
+			Usage: "cubelog files roll size (500m, 1g; unitless integer is MiB)",
 		},
 		&cli.IntFlag{
 			Name:  "state-tmpfs-size",
@@ -327,20 +324,17 @@ func App() *cli.App {
 		if err := applyFlags(context, config); err != nil {
 			return err
 		}
-		ensureRequiredPlugins(config)
-
-		if networkCfg, ok, err := loadNetworkPluginBootstrapConfig(config); err != nil {
+		if err := config.CubeLog.ApplyDefaults(); err != nil {
 			return err
-		} else if ok {
-			dynamConf.SetNetworkAgentOverride(networkCfg.EnableNetworkAgent, networkCfg.NetworkAgentEndpoint)
 		}
+		ensureRequiredPlugins(config)
 
 		_, err = dynamConf.Init(config.DynamicConfigPath, context.Bool("no-dynamic-path"))
 		if err != nil {
 			return err
 		}
 
-		initCubeLog(context, "Cubelet", context.String("logpath"))
+		initCubeLog("Cubelet", config.CubeLog)
 
 		if err := server.CreateTopLevelDirectories(config); err != nil {
 			return err
@@ -512,7 +506,7 @@ func App() *cli.App {
 		if logLevel == "" {
 			logLevel = context.String("log-level")
 		}
-		cubelog.SetLevel(cubelog.StringToLevel(strings.ToUpper(logLevel)))
+		CubeLog.SetLevel(CubeLog.StringToLevel(strings.ToUpper(logLevel)))
 		containerdlog.SetLevel(strings.ToLower(logLevel))
 		<-done
 		return nil
@@ -544,20 +538,6 @@ func criticalCubeletPluginURIs() []string {
 		string(constants.WorkflowPlugin) + "." + constants.WorkflowID.ID(),
 		string(constants.CubeboxServicePlugin) + "." + constants.CubeboxServiceID.ID(),
 	}
-}
-
-func loadNetworkPluginBootstrapConfig(cfg *srvconfig.Config) (*network.Config, bool, error) {
-	if cfg == nil || cfg.Plugins == nil {
-		return nil, false, nil
-	}
-	if _, ok := cfg.Plugins[networkPluginKey]; !ok {
-		return nil, false, nil
-	}
-	networkCfg := &network.Config{}
-	if _, err := cfg.Decode(gocontext.Background(), networkPluginKey, networkCfg); err != nil {
-		return nil, false, fmt.Errorf("decode %s plugin config: %w", networkPluginKey, err)
-	}
-	return networkCfg, true, nil
 }
 
 func serve(ctx gocontext.Context, l net.Listener, serveFunc func(net.Listener) error) {
@@ -601,6 +581,16 @@ func applyFlags(context *cli.Context, config *srvconfig.Config) error {
 		if s := context.String(v.name); s != "" {
 			*v.d = s
 		}
+	}
+
+	if context.IsSet("logpath") {
+		config.CubeLog.Path = context.String("logpath")
+	}
+	if context.IsSet("log-roll-num") {
+		config.CubeLog.FileNum = context.Int("log-roll-num")
+	}
+	if context.IsSet("log-roll-size") {
+		config.CubeLog.FileSize = srvconfig.CubeLogFileSize(context.String("log-roll-size"))
 	}
 	return nil
 }

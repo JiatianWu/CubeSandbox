@@ -17,7 +17,7 @@
   <a href="https://github.com/tencentcloud/CubeSandbox/issues"><img src="https://img.shields.io/github/issues/tencentcloud/cubesandbox" alt="GitHub Issues" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-green" alt="Apache 2.0 License" /></a>
   <a href="./CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs Welcome" /></a>
-  <a href="https://pypi.org/project/cubesandbox/"><img src="https://img.shields.io/badge/PyPI-0.3.0-blue" alt="PyPI Version" /></a>
+  <a href="https://pypi.org/project/cubesandbox/"><img src="https://img.shields.io/pypi/v/cubesandbox?color=blue" alt="PyPI Version" /></a>
   <a href="https://landscape.cncf.io/?landscape=observability-and-analysis&group=ai-native&item=ai-native-infra--workload-runtime--cubesandbox"><img src="https://img.shields.io/badge/CNCF-Landscape-0C66E4" alt="CNCF Landscape" /></a>
 </p>
 
@@ -53,6 +53,19 @@ Cube Sandbox is a high-performance, out-of-the-box secure sandbox service built 
 ## 📰 News
 
 <table>
+  <tr>
+    <td align="right" valign="top" width="100">
+      <a href="./docs/changelog/v0.7.0.md">
+        <img src="https://img.shields.io/badge/v0.7.0-2026.08.28-20c997?style=flat-square" alt="v0.7.0" />
+      </a>
+    </td>
+    <td valign="top">
+      <strong>v0.7: Cross-node pause/resume, control plane &amp; ops separation, faster sandbox networking</strong><br/>
+      <b>Cross-node pause/resume</b> — with an S3 backend, suspend a sandbox on one node and resume it on another, or create sandboxes from snapshots (preview)<br/>
+      <b>Control plane &amp; operations separation</b> — node management moves into CubeOps with multi-replica deployment and the new cubeopscli<br/>
+      <a href="./docs/changelog/v0.7.0.md">Changelog →</a>
+    </td>
+  </tr>
   <tr>
     <td align="right" valign="top" width="100">
       <a href="./docs/changelog/v0.6.0.md">
@@ -400,12 +413,21 @@ We welcome contributions of all kinds—whether it's a bug report, feature sugge
 
 | Feature | Description |
 |---|---|
-| **Kubernetes-Native Deployment** | Evolve from Helm-based deployment toward CRD- and Operator-centric native management, with smooth upgrade capabilities |
-| **Cross-Node Pause & Resume** | Suspend a sandbox on one node and resume it on another with full memory and filesystem state preserved |
+| **Cross-Node Pause/Resume Performance** | Cut pause/resume latency and speed up snapshot transfer so cross-node resume approaches same-node speed |
 | **E2B API Compatibility** | Close remaining gaps with the E2B specification for full drop-in compatibility |
-| **Control Plane / Data Plane Separation** | Decouple the control plane from the data plane so control plane upgrades or failures never affect sandboxes already in flight |
 | **Sandbox Fault Recovery** | Automatic detection and recovery of crashed VMs, stuck shim processes, and network partitions with configurable recovery policies |
 | **Scheduling & Operations Enhancements** | Resource-aware placement, affinity rules, live rebalancing, and node drain with sandbox migration |
+| **S3 Performance and Cost Optimization** | Incremental uploads, better cache, and cheaper storage classes so S3 snapshot/volume I/O stays fast at lower cost |
+| **Filesystem-Only Snapshots** | Snapshot the writable filesystem without a memory dump for cheaper, faster clone/restore when a cold start from disk is enough |
+| **GPU Sandboxes** | Attach host GPUs to sandboxes so Agent and inference workloads can run CUDA inside the isolated VM, with GPU-aware scheduling |
+
+## Contributors
+
+Thanks to all contributors:
+
+<a href="https://github.com/tencentcloud/CubeSandbox/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=tencentcloud/CubeSandbox" alt="Contributors" />
+</a>
 
 ## License
 

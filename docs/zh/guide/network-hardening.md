@@ -18,13 +18,17 @@ Cube Sandbox 的控制面与管理类服务为了便于本地快速体验，部�
 | CubeAPI | `0.0.0.0` | 3000 | `.env` 中的 `CUBE_API_BIND` | 沙箱生命周期 API |
 | Cubelet gRPC | `0.0.0.0` | 9999 | `Cubelet/config/config.toml` 的 `tcp_address` | 节点管理 RPC，**无 TLS** |
 | Cubelet HTTP | `0.0.0.0` | 9998 | `Cubelet/config/config.toml` 的 `[http] address` | 调试 / metrics |
-| cube-proxy | `0.0.0.0` | 80 / 443 | `CUBE_PROXY_HTTP_PORT` / `CUBE_PROXY_HTTPS_PORT` | 设计上即面向公网 |
+| cube-proxy | `0.0.0.0` | 80 / 443 / 9090 | `CUBE_PROXY_HTTP_PORT` / `CUBE_PROXY_HTTPS_PORT` / `CUBE_PROXY_GRPC_PORT` | 设计上即面向公网 |
+| cube-egress admin | `127.0.0.1` | 9091 | `.env` 中的 `CUBE_EGRESS_ADMIN_PORT`（需与 Cubelet `cube_egress_admin_url` 保持一致） | 仅本机策略 API |
 | WebUI | `0.0.0.0` | 12088 | `.env` 中的 `WEB_UI_HOST_PORT`（仅端口） | 控制台 |
 | MySQL | `127.0.0.1` | 3306 | compose 模板中硬编码 | 已仅绑回环 |
 | Redis | `127.0.0.1` | 6379 | compose 模板中硬编码 | 已仅绑回环 |
+| MinIO API | 节点 IP | 9000 | `CUBE_SANDBOX_MINIO_API_BIND`（默认 `CUBE_SANDBOX_NODE_IP`） | 计算节点 Cubelet 需经 s3fs 挂 Volume，也要拉仓库 blob，不能只绑回环 |
+| MinIO 控制台 | `127.0.0.1` | 9001 | compose 模板中硬编码 | 已仅绑回环 |
 
-MySQL 与 Redis 已由内置 compose 模板绑定到回环地址，网络上不可达。需要重点关注
-的是表中默认为 `0.0.0.0` 的其余服务。
+MySQL、Redis 以及 MinIO 控制台已由内置 compose 模板绑定到回环地址。MinIO S3 API
+发布在节点 IP 上，供计算节点访问——请用防火墙将 TCP 9000 限制在内网。需要重点
+关注的是表中默认为 `0.0.0.0` 的其余服务。
 
 ## 各服务绑定地址配置
 
@@ -115,6 +119,15 @@ CUBE_PROXY_HTTPS_PORT=443
 内置容器已通过 compose 模板绑定到 `127.0.0.1`，无需额外配置。若使用外部
 MySQL/Redis（`CUBE_EXTERNAL_MYSQL_HOST`），请在网络层做好访问控制。
 
+### MinIO
+
+MinIO 控制台绑定 `127.0.0.1:9001`，仅本机可访问。S3 API 发布在
+`CUBE_SANDBOX_MINIO_API_BIND`（默认 `CUBE_SANDBOX_NODE_IP`，端口 9000）——计算节点
+的 Cubelet 需要经 s3fs 挂 Volume，**也要用预签名 GET 拉组件仓库 blob**。绑到
+`127.0.0.1` 会让 S3 卷和组件下载一起挂掉，沙箱创建失败。请用防火墙将 TCP 9000
+限制在内网。若使用外部 S3 后端，设置 `CUBE_SANDBOX_MINIO_ENABLED=0` 即可不启动
+本地 MinIO。
+
 ## 加固方案
 
 根据你的环境，选择以下一种或两种方案。
@@ -172,6 +185,7 @@ sudo ufw allow from 10.0.0.0/24 to any port 12088 proto tcp  # WebUI
 sudo ufw allow 22/tcp     # SSH
 sudo ufw allow 80/tcp     # cube-proxy（如需公网）
 sudo ufw allow 443/tcp    # cube-proxy TLS
+sudo ufw allow 9090/tcp   # cube-proxy 明文 gRPC
 sudo ufw enable
 ```
 

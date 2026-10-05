@@ -2,21 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Volume bind / unbind and delete-while-bound (HTTP 409) cases.
 
-Prerequisites (manual; not provisioned by this suite):
-- Deploy and configure a Volume Plugin on CubeMaster (Controller) and Cubelet
-  (Node), e.g. COS binary/rpc under ``volume_plugins``, with credentials.
-  Guide: https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/cos/README.md
-- Platform Volume API available (CubeAPI / CubeMaster / Cubelet >= 0.6.0).
-- Python SDK ``cubesandbox`` >= 0.6.0 (Volume / volume_mounts support).
+Prerequisites:
+- Default install S3 Volume plugin + MinIO (CubeMaster / Cubelet ``volume_plugins``).
+  Guide: https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/s3/README.md
+- Platform Volume API and Python SDK ``cubesandbox`` >= 0.6.0.
 - A READY template (``CUBE_TEMPLATE_ID``) for sandbox create with mounts.
-- Opt-in: ``SDK_E2E_VOLUME_PLUGIN=true`` (and usually ``SDK_E2E_VOLUME_DRIVER``).
+- ``SDK_E2E_VOLUME_DRIVER`` defaults to ``s3``; set ``SDK_E2E_VOLUME_PLUGIN=false`` to skip.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from adapters import create_adapter
+from adapters import create_adapter_with_capacity_retry
 from framework.capabilities import VOLUME_PLUGIN
 from framework.cleanup import safe_kill
 from framework.volume import (
@@ -43,7 +41,7 @@ def test_volume_bind_delete_conflict_then_unbind(sdk_backend, sdk_e2e_config):
     with managed_volume(sdk_e2e_config) as (volume_id, api):
         adapter = None
         try:
-            adapter = create_adapter(
+            adapter = create_adapter_with_capacity_retry(
                 sdk_backend,
                 sdk_e2e_config,
                 metadata={

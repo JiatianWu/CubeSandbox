@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Tencent Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-# Build from repository root so sibling modules (e.g. CubeDB) are in context:
+# Build from repository root so local replace modules are in context:
 #   docker build -f CubeOps/Dockerfile -t cube-ops:latest .
 
 # ── Build stage ────────────────────────────────────────────────────────────
@@ -15,15 +15,23 @@ WORKDIR /build/CubeOps
 
 # Copy go.mod/go.sum first for better layer caching
 COPY CubeOps/go.mod CubeOps/go.sum ./
-COPY CubeDB /build/CubeDB
-COPY cubelog /build/cubelog
+COPY pkgs/cubedb /build/pkgs/cubedb
+COPY pkgs/CubeLog /build/pkgs/CubeLog
+COPY pkgs/blobstore /build/pkgs/blobstore
 RUN go mod download
 
 COPY CubeOps/ .
 
 ARG TARGETARCH
+ARG CUBE_VERSION=0.0.0-dev
+ARG CUBE_COMMIT=unknown
+ARG CUBE_BUILD_TIME=unknown
+
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
-    -ldflags="-s -w" \
+    -ldflags="-s -w \
+      -X 'github.com/tencentcloud/CubeSandbox/CubeOps/internal/version.Version=${CUBE_VERSION}' \
+      -X 'github.com/tencentcloud/CubeSandbox/CubeOps/internal/version.Commit=${CUBE_COMMIT}' \
+      -X 'github.com/tencentcloud/CubeSandbox/CubeOps/internal/version.BuildTime=${CUBE_BUILD_TIME}'" \
     -o /usr/local/bin/cubeops \
     ./cmd/cubeops
 

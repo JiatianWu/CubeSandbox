@@ -4,7 +4,7 @@ CubeSandbox 正在逐步兼容 e2b Volume，为沙箱提供跨生命周期的持
 
 > **版本要求**
 >
-> Volume 能力需要 **Cube 平台 ≥ 0.6.0**（CubeMaster、CubeAPI、Cubelet 均需升级），以及 **Python SDK `cubesandbox` ≥ 0.6.0**（提供 `Volume` 与 `Sandbox.create(volume_mounts=...)`）。低于上述版本的环境无 Volume API，请勿混用旧版 SDK 调用 `/volumes`。
+> Volume 能力需要 **Cube 平台 ≥ 0.6.0**（CubeMaster、CubeAPI、Cubelet 均需升级），以及 **Python SDK `cubesandbox` ≥ 0.6.0**（提供 `Volume` 与 `Sandbox.create(volume_mounts=...)`）。**Go SDK**（`sdk/go`）自仓库 master 起提供等价能力（`Client.CreateVolume` 等与 `CreateOptions.VolumeMounts`）。低于上述版本的环境无 Volume API，请勿混用旧版 SDK 调用 `/volumes`。
 
 > **当前进展**（API / SDK）
 >
@@ -14,9 +14,12 @@ CubeSandbox 正在逐步兼容 e2b Volume，为沙箱提供跨生命周期的持
 > | REST `POST /volumes` — 创建 Volume | ✅ 已支持 |
 > | REST `GET /volumes/{volumeID}` — 查询 Volume + token | ✅ 已支持 |
 > | REST `DELETE /volumes/{volumeID}` — 删除 Volume | ✅ 已支持（仍被挂载时返回 409） |
-> | SDK `Volume.create` / `connect` / `list` / `get_info` / `destroy` | ✅ 已支持（SDK ≥ 0.6.0） |
-> | SDK `Sandbox.create(volume_mounts={path: volume})` | ✅ 已支持（e2b dict 映射） |
+> | Python SDK `Volume.create` / `connect` / `list` / `get_info` / `destroy` | ✅ 已支持（SDK ≥ 0.6.0） |
+> | Python SDK `Sandbox.create(volume_mounts={path: volume})` | ✅ 已支持（e2b dict 映射） |
+> | Go SDK `Client.CreateVolume / ListVolumes / GetVolume / DeleteVolume` | ✅ 已支持 |
+> | Go SDK `CreateOptions.VolumeMounts`（含 `ReadOnly`） | ✅ 已支持 |
 > | 同一 Volume 被多个沙箱同时挂载 | ✅ 已支持 |
+> | 按沙箱只读挂载 | ✅ Cube SDK 扩展（Python `VolumeMount(..., read_only=True)`，Go `VolumeMount{ReadOnly: true}`）；官方 e2b SDK 自身没有只读挂载选项 |
 > | 创建时省略 `driver`（e2b 默认行为） | ✅ 已支持 |
 
 > **e2b API 与 SDK**
@@ -37,6 +40,8 @@ CubeSandbox 正在逐步兼容 e2b Volume，为沙箱提供跨生命周期的持
 
 参考实现：[COS 插件](https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/cos/README.zh.md)（one-click 会将 binary 插件放到 `CubeMaster/plugin/` 与 `Cubelet/plugin/`）。
 
+> **第三方插件请安装到 cubetoolbox 目录之外**，否则升级Cube的时候会被重置，详见 [注册与配置](#注册与配置) 与 [插件开发要点](#插件开发要点)。
+
 ### 配置 CubeMaster / Cubelet 并重启
 
 两侧 `volume_plugins` 使用相同的 `driver` 名，`binary_path` / `socket_path` 指向已部署的插件；修改后重启 CubeMaster 与 Cubelet 使配置生效。见 [注册与配置](#注册与配置)。
@@ -45,6 +50,12 @@ CubeSandbox 正在逐步兼容 e2b Volume，为沙箱提供跨生命周期的持
 
 ```bash
 pip install 'cubesandbox>=0.6.0'
+```
+
+Go 侧使用 `sdk/go` 模块：
+
+```bash
+go get github.com/tencentcloud/CubeSandbox/sdk/go
 ```
 
 须使用 **`cubesandbox`**，不可用官方 e2b Python SDK。配置 `CUBE_API_URL`、`CUBE_TEMPLATE_ID`，远程读写时还需 `CUBE_PROXY_NODE_IP`。见 [环境准备](#环境准备)。
@@ -360,7 +371,7 @@ sequenceDiagram
 
 ## SDK 用法
 
-以下示例基于 **Python SDK `cubesandbox` ≥ 0.6.0**。CubeAPI 提供 e2b 兼容的 `/volumes` REST 接口；应用侧推荐优先使用 SDK。
+以下示例基于 **Python SDK `cubesandbox` ≥ 0.6.0**，Go 示例见 [Go SDK 用法](#go-sdk-用法)。CubeAPI 提供 e2b 兼容的 `/volumes` REST 接口；应用侧推荐优先使用 SDK。
 
 ### e2b 兼容性说明
 
@@ -369,7 +380,9 @@ sequenceDiagram
 | CubeAPI `/volumes` REST | ✅ 是 | `POST/GET/DELETE /volumes`、`GET /volumes/{volumeID}` |
 | 官方 e2b Python SDK | ❌ 否 | 硬编码 e2b.cloud 后端；**勿**用于 CubeSandbox |
 | `cubesandbox` Python SDK | ✅ 是 | `Volume`、`Sandbox.create(volume_mounts={path: volume})`（e2b dict） |
+| `cubesandbox` Go SDK（`sdk/go`） | ✅ 是 | `Client.CreateVolume / ListVolumes / GetVolume / DeleteVolume`；挂载用显式结构体 `CreateOptions.VolumeMounts`（非 e2b dict） |
 | 创建时省略 `driver` | ✅ 是 | CubeMaster 取 `volume_plugins` **列表第一项** |
+| 按沙箱只读挂载 | ❌ 否 | 官方 e2b SDK 自身没有只读 Volume 挂载选项；Cube SDK 增加 `VolumeMount(volume, read_only=True)` 扩展 |
 
 完整 COS 插件体验见 [`examples/volume/cos/README.zh.md`](https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/cos/README.zh.md)。
 
@@ -437,9 +450,80 @@ Volume.destroy(vol.volume_id)  # 返回 True；卷不存在时返回 False（幂
 | `Volume.destroy(volume_id)` | e2b 兼容删除；成功返回 `True`，404 返回 `False`（幂等） |
 | `Volume.delete(...)` | `destroy` 的兼容别名（旧代码可用，推荐 `destroy`） |
 | `driver` | 可选；插件名；**e2b 兼容用法下省略**——SDK 不发送该字段，CubeMaster 取 `volume_plugins` **列表第一项** |
-| `volume_mounts` | e2b dict `{挂载路径: Volume \| volume_id \| name}` — key 为沙箱内路径，value 为 `Volume` 实例或 volume ID 字符串 |
+| `volume_mounts` | e2b dict `{挂载路径: Volume \| volume_id \| name}` — key 为沙箱内路径，value 为 `Volume` 实例或 volume ID 字符串；Cube SDK 还可将 value 包装为 `VolumeMount(..., read_only=True)` 以启用只读挂载 |
 
 `driver` 写入 `t_cube_volume`，沙箱创建时经 annotation 传给 Cubelet——CubeMaster 与 Cubelet 两侧 `volume_plugins[].name` 须与之一致。
+
+### Go SDK 用法
+
+Go SDK（`sdk/go`）提供与上文等价的完整生命周期，使用与 Python 相同的环境变量：
+
+```go
+import (
+	"context"
+	"errors"
+
+	cubesandbox "github.com/tencentcloud/CubeSandbox/sdk/go"
+)
+
+client := cubesandbox.NewClient(cubesandbox.NewConfigFromEnv())
+ctx := context.Background()
+
+// ① 创建 Volume（管理面）——Driver 省略时取 volume_plugins 第一项
+volume, err := client.CreateVolume(ctx, cubesandbox.CreateVolumeOptions{Name: "my-data"})
+
+// 列出 / 单查
+volumes, err := client.ListVolumes(ctx)              // 不含 token
+volume, err = client.GetVolume(ctx, volume.VolumeID) // 含 token
+
+// ② 创建沙箱并挂载（数据面：Attach）；ReadOnly 为 Cube 只读扩展
+sb, err := client.Create(ctx, cubesandbox.CreateOptions{
+	TemplateID: "base",
+	VolumeMounts: []cubesandbox.VolumeMount{
+		{Name: volume.VolumeID, Path: "/workspace"},
+		// {Name: volume.VolumeID, Path: "/dataset", ReadOnly: true}
+	},
+})
+
+// ③ 销毁沙箱（数据面：Detach，解绑）
+err = sb.Kill(ctx)
+
+// ④ 删除 Volume（管理面：Destroy）
+if err := client.DeleteVolume(ctx, volume.VolumeID); err != nil {
+	switch {
+	case errors.Is(err, cubesandbox.ErrVolumeInUse):
+		// 仍被挂载（HTTP 409）——先销毁使用该卷的沙箱
+	case errors.Is(err, cubesandbox.ErrVolumeNotFound):
+		// 已不存在——幂等清理可忽略
+	}
+}
+```
+
+与 Python SDK 的差异：挂载参数是显式的 `[]VolumeMount{Name, Path, ReadOnly}` 结构体（非 e2b dict 映射）；删除结果通过 `ErrVolumeInUse` / `ErrVolumeNotFound` 哨兵错误用 `errors.Is` 区分。name 规则、driver 省略行为、list 不返回 token 等语义与 Python 一致。更多示例见 [`sdk/go/README.md`](https://github.com/TencentCloud/CubeSandbox/blob/master/sdk/go/README.md)。
+
+### 按沙箱选择访问模式
+
+e2b 兼容的 mapping 仍是默认写法，并创建读写挂载。CubeSandbox 在 mapping 的 value 上增加了 `VolumeMount`，因此同一个持久 Volume 可以由不同沙箱分别选择读写或只读：
+
+```python
+from cubesandbox import Sandbox, Volume, VolumeMount
+
+dataset = Volume.create("shared-dataset")
+
+# 该沙箱可以更新 Volume。
+writer = Sandbox.create(
+    volume_mounts={"/dataset": dataset},
+)
+
+# 同一个 Volume 在该沙箱中禁止修改。
+reader = Sandbox.create(
+    volume_mounts={"/dataset": VolumeMount(dataset, read_only=True)},
+)
+```
+
+官方 e2b SDK 的 Volume 挂载接口自身没有只读选项，这不是 CubeSandbox 的兼容性限制。Cube SDK 和 REST 客户端可以显式使用 Cube 扩展 `volumeMounts[].readOnly: true`，原有 e2b 形式的请求不发送 `readOnly`，继续保持读写。
+
+只读是**单次沙箱挂载属性**，不是 Volume 自身的全局属性。reader 不能通过该挂载创建、修改、重命名或删除文件，但仍可能看到其他读写挂载产生的变化，因此它不是不可变快照。当前一个沙箱内仍只能挂载同一个 Volume 一次；同一沙箱重复挂载同一个 Volume 会继续被拒绝。
 
 ### 多沙箱共用同一 Volume
 
@@ -460,6 +544,19 @@ Volume.destroy(vol.volume_id)
 ```
 
 同一 Volume 可被多个沙箱同时挂载；一个沙箱写入的数据对其他沙箱可见。调用 `Volume.destroy()` 前须销毁**所有**挂载该 Volume 的沙箱（平台如何跟踪共享引用见 [RefCount](#refcount)）。
+
+### 快照、回滚、克隆与跨机恢复
+
+Snapshot 会保存稳定的 Volume ID、容器挂载路径和只读属性，但不会复制 Volume 数据，也不会持久化运行时 `private_data`。FromSnap 由 Master 查询当前 Volume 记录，并把 driver 元数据发送给目标 Cubelet 执行 `Attach`；Pause/Resume 会校验已记录的 Volume ID，并根据 pause package 重新 Attach；原地 Rollback 则保留沙箱现有的外部挂载。
+
+因此它采用 **external-reference（外部引用）**语义：
+
+- FromSnap 和回滚会恢复 VM/rootfs 状态，但挂载后的 Volume 展示当前数据。
+- 克隆继续共享同一个 Volume；读写挂载中的写入对源沙箱和其他克隆可见。
+- Plugin Volume 不会把原本支持跨机的 VM Snapshot 固定到源节点。对于 `remote_status=ready` 的 S3 VM Snapshot，目标 Cubelet 会在启动 VM 前尝试 Attach Volume。
+- 调度器当前只检查 VM 兼容性，不检查 Volume portability、topology、multi-attach 能力或目标节点 driver。Volume 不存在、目标节点未注册 driver 或 `Attach` 返回错误时，沙箱创建失败。运维方需要在每个候选节点配置相同 driver，并确保它们能够访问目标后端。
+
+Volume backend 与 VM Snapshot backend 相互独立。VM Snapshot 包必须使用 S3 backend 才能跨机；Plugin Volume 可以使用目标节点 driver 能够 Attach 的任意后端。raw host mount 与此不同，始终固定在源节点。
 
 ### 常见异常（SDK）
 
@@ -511,26 +608,28 @@ volume_plugins:
 
 **`volume_plugin_base_dir`：** 所有插件返回的 `host_path` **必须**落在该目录内（未配置时默认 `/data/cube-shared/volume`）。Cubelet 经 `volumeBaseDir`（rpc）/ `--volume-base-dir`（binary）传给插件；`host_path` 越界则 attach 被拒绝并回滚。
 
+> **`binary_path` / `socket_path` 位置：** 第三方插件请安装到 cubetoolbox 目录之外，否则升级 Cube 时会被重置。
+
 **`name` 必须唯一**：同一进程内不能有两条相同 `name` 的 `volume_plugins`。列表顺序决定省略 `driver` 时的默认插件。
 
 ---
 
 ## rpc 插件 pb 定义说明
 
-rpc 插件实现 [`volumeplugin.proto`](https://github.com/TencentCloud/CubeSandbox/blob/master/Cubelet/api/services/volumeplugin/v1/volumeplugin.proto) 中的 gRPC 服务。消息字段与上文 [Hook 定义](#hook-定义) 一致（proto 使用 `snake_case`）。
+rpc 插件实现 [`volumeplugin.proto`](https://github.com/TencentCloud/CubeSandbox/blob/master/pkgs/proto/services/volumeplugin/v1/volumeplugin.proto) 中的 gRPC 服务。消息字段与上文 [Hook 定义](#hook-定义) 一致（proto 使用 `snake_case`）。
 
 | 文件 | 说明 |
 |------|------|
-| [`volumeplugin.proto`](https://github.com/TencentCloud/CubeSandbox/blob/master/Cubelet/api/services/volumeplugin/v1/volumeplugin.proto) | 协议源文件 |
-| [`volumeplugin.pb.go`](https://github.com/TencentCloud/CubeSandbox/blob/master/Cubelet/api/services/volumeplugin/v1/volumeplugin.pb.go) | 已提交的 Go message |
-| [`volumeplugin_grpc.pb.go`](https://github.com/TencentCloud/CubeSandbox/blob/master/Cubelet/api/services/volumeplugin/v1/volumeplugin_grpc.pb.go) | 已提交的 gRPC stub |
+| [`volumeplugin.proto`](https://github.com/TencentCloud/CubeSandbox/blob/master/pkgs/proto/services/volumeplugin/v1/volumeplugin.proto) | 协议源文件 |
+| [`volumeplugin.pb.go`](https://github.com/TencentCloud/CubeSandbox/blob/master/pkgs/proto/services/volumeplugin/v1/volumeplugin.pb.go) | 已提交的 Go message |
+| [`volumeplugin_grpc.pb.go`](https://github.com/TencentCloud/CubeSandbox/blob/master/pkgs/proto/services/volumeplugin/v1/volumeplugin_grpc.pb.go) | 已提交的 gRPC stub |
 
 | Service | 调用方 | RPC |
 |---------|--------|-----|
 | `VolumeControllerService` | CubeMaster | `Create`、`Destroy` |
 | `VolumePluginService` | Cubelet | `Attach`、`Detach` |
 
-修改 proto 后重新生成：`cd Cubelet && make proto`。参考实现：[`examples/volume/cos/rpc/README.zh.md`](https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/cos/rpc/README.zh.md)。
+修改 proto 后重新生成：`cd pkgs/proto && make proto`。参考实现：[`examples/volume/cos/rpc/README.zh.md`](https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/cos/rpc/README.zh.md)。
 
 ---
 
@@ -546,6 +645,7 @@ rpc 插件实现 [`volumeplugin.proto`](https://github.com/TencentCloud/CubeSand
 | 4 | Detach 范围 | Node Detach 只拆除宿主机侧挂载（如 FUSE unmount）；不删除后端持久数据 |
 | 5 | 凭证 | 访问密钥、桶名、地域等由**插件自行管理**（配置文件、环境变量等）；框架不规定布局 |
 | 6 | CubeMaster / Cubelet 一致 | 两侧 `volume_plugins` 须注册**相同的 `driver` 名**；同一 Volume 的管理面 Hook（Create/Destroy）与数据面 Hook（Attach/Detach）须指向**同一套插件** |
+| 7 | 升级安全路径 | 第三方插件请安装到 cubetoolbox 目录之外，否则升级 Cube 时会被重置 |
 
 ---
 
@@ -559,8 +659,10 @@ rpc 插件实现 [`volumeplugin.proto`](https://github.com/TencentCloud/CubeSand
 | [`examples/volume/cos/binary/README.zh.md`](https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/cos/binary/README.zh.md) | binary 插件脚本细节 |
 | [`examples/volume/cos/rpc/README.zh.md`](https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/cos/rpc/README.zh.md) | rpc 插件构建与部署 |
 | [`examples/volume/cos/verify_volume.py`](https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/cos/verify_volume.py) | Python SDK 验证脚本 |
+| [`examples/volume/s3/README.zh.md`](https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/s3/README.zh.md) | 通用 S3 兼容后端完整体验（内置 S3 客户端的 Go 二进制 + s3fs；AWS S3、腾讯云 COS、MinIO、R2；支持 `arm64`） |
+| [`examples/volume/juicefs/README.zh.md`](https://github.com/TencentCloud/CubeSandbox/blob/master/examples/volume/juicefs/README.zh.md) | JuiceFS 完整体验（对象存储之上的 POSIX 文件系统；一个文件系统，每个卷 `--subdir`；多个沙箱可共享一个卷并立即看到彼此的写入） |
 
-COS 专属的 Hook 行为、对象布局、实现取舍与排障说明均在上述 example 文档中，本文不再重复。
+各后端专属的 Hook 行为、对象布局、实现取舍与排障说明均在上述 example 文档中，本文不再重复。
 
 ---
 
@@ -649,7 +751,7 @@ Volume 依赖 CubeMaster 与 Cubelet **双侧**均升级到支持 Volume 插件�
 | 跨节点 refcount | `CubeMaster/pkg/volume/refcount/refcount.go` | 解析 ext_info 事件并累加 `t_cube_volume.refcount` |
 | Volume DB 模型 | `CubeMaster/pkg/base/db/models/volume.go` | `VolumeRecord`（含 `refcount` 字段） |
 | Node 挂载逻辑 | `Cubelet/storage/pluginvolume.go` | bind-mount + virtiofs；上报 node 级 refcount 转变 |
-| 协议定义 | `Cubelet/api/services/volumeplugin/v1/volumeplugin.proto` | rpc 类型 proto |
-| Go 生成代码 | `Cubelet/api/services/volumeplugin/v1/volumeplugin*.pb.go` | 已提交的 message / rpc stub |
+| 协议定义 | `pkgs/proto/services/volumeplugin/v1/volumeplugin.proto` | rpc 类型 proto |
+| Go 生成代码 | `pkgs/proto/services/volumeplugin/v1/volumeplugin*.pb.go` | 已提交的 message / rpc stub |
 | COS 参考（binary） | `examples/volume/cos/binary/cube-volume-cos.sh` | binary 类型示例 |
 | COS 参考（rpc） | `examples/volume/cos/rpc/cmd/cube-volume-cos-rpc` | rpc 类型示例 |

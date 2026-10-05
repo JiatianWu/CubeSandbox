@@ -128,7 +128,7 @@ export class TemplateInfo {
     const aliases: string[] = data.aliases ?? [];
     return new TemplateInfo({
       templateId: data.templateID ?? data.template_id ?? "",
-      name: data.name || (aliases.length ? aliases[0] : "") || "",
+      name: aliases.length ? aliases[0] : "",
       instanceType: data.instanceType ?? data.instance_type ?? "",
       version: data.version ?? "",
       status: data.status ?? "",
@@ -154,6 +154,7 @@ export class TemplateInfo {
 /** Options for {@link Template.build}. */
 export interface TemplateBuildOptions {
   image?: string;
+  name?: string;
   dockerfile?: string;
   startCmd?: string;
   instanceType?: string;
@@ -229,6 +230,8 @@ export class Template {
 
     const cfg = resolveConfig(options.config);
     const payload: Record<string, unknown> = { image: options.image.trim() };
+    const name = options.name?.trim();
+    if (name) payload.name = name;
     if (options.instanceType !== undefined) payload.instanceType = options.instanceType;
     if (options.writableLayerSize !== undefined) {
       payload.writableLayerSize = options.writableLayerSize;
@@ -323,5 +326,22 @@ export class Template {
       method: "DELETE",
     });
     await checkTemplateResponse(resp);
+  }
+
+  /** PUT /templates/:id/alias — set, reassign, or clear the alias of an existing template.
+   *  `alias` null or empty string clears the alias. Returns the updated TemplateInfo. */
+  static async setAlias(
+    templateId: string,
+    alias: string | null,
+    options: { config?: Config | ConfigOptions } = {},
+  ): Promise<TemplateInfo> {
+    const cfg = resolveConfig(options.config);
+    const resp = await controlFetch(cfg, `${cfg.apiUrl}/templates/${templateId}/alias`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ alias: alias ?? "" }),
+    });
+    await checkTemplateResponse(resp);
+    return TemplateInfo.fromDict((await resp.json()) as Record<string, any>);
   }
 }

@@ -9,7 +9,7 @@ Network hardening for the cluster deployment is handled by **Tencent Cloud secur
 ::: tip When to use this
 This deployment uses cloud resources to **quickly stand up a highly-available CubeSandbox service**: all cloud resources default to pay-as-you-go billing (see [Billing Mode](#billing-mode) below) and can be released in one shot with `destroy.sh`. For long-term use, switch to **prepaid (monthly/yearly subscription)** resources for better cost savings (see [Billing Mode](#billing-mode)). If you only need a single-machine deployment for validation, see the earlier deployment guides: [PVM Deployment](./pvm-deploy.md) or [Bare-Metal Deployment](./bare-metal-deploy.md).
 
-**Note**: The default configuration is a **POC / functional validation** setup (2× `SA9.MEDIUM8` compute nodes, single-replica control plane, no CFS). It can host only a limited number of sandboxes. For production or load testing, adjust compute node and TKE worker specs and counts — see [Node Specifications & Capacity Planning](#node-specifications--capacity-planning) and [Default Deployment Mode](#default-deployment-mode).
+**Note**: The default configuration is a **POC / functional validation** setup (2× `SA9.MEDIUM8` compute nodes, mostly single-replica control plane, no CFS). It can host only a limited number of sandboxes. For production or load testing, adjust compute node and TKE worker specs and counts — see [Node Specifications & Capacity Planning](#node-specifications--capacity-planning) and [Default Deployment Mode](#default-deployment-mode).
 :::
 
 ## Architecture Overview
@@ -32,7 +32,7 @@ This deployment uses cloud resources to **quickly stand up a highly-available Cu
   │  ┌─────────┴────────┐       ┌───────────────┴─────┐    │
   │  │ Compute CVM ×N   │       │  TKE managed cluster      │
   │  │  Cubelet         │       │  cube-master (×1)         │
-  │  │  network-agent   │       │  cube-api (×1)            │
+  │  │  network runtime │       │  cube-api (×1)            │
   │  │  CubeEgress      │       │  cube-ops (×1)            │
   │  └──────────────────┘       │  cube-proxy (×1)          │
   │                             │  cube-lifecycle-manager   │
@@ -59,7 +59,7 @@ This deployment uses cloud resources to **quickly stand up a highly-available Cu
 | Jumpserver | CVM (public IP, SSH 443) | Build host (TCR mode) and bastion into the private VPC |
 | Load balancer | CLB (internal/public) | Fronts `cube-api` / `cube-proxy` / `cube-webui`; internal mode by default, user traffic entry point |
 | Control plane | Managed TKE cluster | Runs `cube-master` / `cube-api` / `cube-ops` / `cube-proxy` / `cube-lifecycle-manager` / `cube-webui` |
-| Compute node | CVM PVM | Runs `Cubelet` / `network-agent` / `CubeEgress`; **actually hosts sandboxes** |
+| Compute node | CVM PVM | Runs `Cubelet` with embedded network runtime and `CubeEgress`; **actually hosts sandboxes** |
 | Database | Cloud MySQL 8.0 + Redis 7.0 | VPC-internal only, no public access |
 | Shared storage | CFS (General Standard NFS, **optional**) | When `USE_CFS=true` and cubemaster has multiple replicas, ReadWriteMany share for `/data/CubeMaster/storage` |
 | Registry | TCR (basic, **optional**) | When `USE_TCR=true`; the jumpserver builds and pushes component images |
@@ -71,15 +71,17 @@ This deployment uses cloud resources to **quickly stand up a highly-available Cu
 Both default to `2` but serve completely different roles.
 :::
 
+Compute node count, instance type, Cubelet report frequency, quota, labels, and template replica availability all affect CubeMaster scheduling. For the complete configuration reference and the required `cubemastercli tpl redo` step after adding compute nodes, see [CubeMaster Scheduler Configuration](./cubemaster-scheduler-config.md).
+
 ## Default Deployment Mode
 
-Matching `env.example` / `variables.tf`, the **default is public images + single-replica control plane + no CFS** — a POC configuration:
+Matching `env.example` / `variables.tf`, the **default is public images + mostly single-replica control plane + no CFS** — a POC configuration:
 
 | Setting | Default | Notes |
 |---------|---------|-------|
 | `TENCENTCLOUD_USE_TCR` | `false` | No TCR; uses public pre-built images, no build on the jumpserver |
 | `TENCENTCLOUD_USE_CFS` | `false` | No CFS; cubemaster uses Pod-local storage |
-| `TENCENTCLOUD_CUBEMASTER_REPLICAS` etc. | `1` | Control-plane components default to single replica |
+| `TENCENTCLOUD_CUBEMASTER_REPLICAS` etc. | `1` | Control-plane components default to one replica; cube-ops and cube-lifecycle-manager run two |
 | `TENCENTCLOUD_COMPUTE_NODE_COUNT` | `2` | PVM compute nodes |
 | `TENCENTCLOUD_TKE_NODE_COUNT` | `2` | TKE workers (`worker_config.count`) |
 | `TENCENTCLOUD_ENABLE_PUBLIC_NETWORK` | `false` | cube-api / cube-proxy / cube-webui use VPC-internal CLBs |
@@ -290,8 +292,8 @@ export TENCENTCLOUD_TKE_NODE_COUNT=2                 # TKE worker nodes (control
 export TENCENTCLOUD_COMPUTE_INSTANCE_TYPE=SA9.MEDIUM8
 export TENCENTCLOUD_USE_TCR=false                    # default: public pre-built images
 export TENCENTCLOUD_USE_CFS=false                    # default: no CFS
-export TENCENTCLOUD_CUBE_IMAGE_TAG=v0.6.0
-export TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS=1
+export TENCENTCLOUD_CUBE_IMAGE_TAG=v0.7.2
+export TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS=2
 ```
 
 ### Common Variables
@@ -308,7 +310,7 @@ export TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS=1
 | `TENCENTCLOUD_TKE_WORKER_INSTANCE_TYPE` | `SA9.LARGE8` | TKE worker instance type (4C8G) |
 | `TENCENTCLOUD_COMPUTE_NODE_COUNT` | `2` | **PVM compute nodes** (run Cubelet / sandboxes) |
 | `TENCENTCLOUD_COMPUTE_DATA_DISK_SIZE` | `200` | CBS data disk size per compute node (GB, XFS, mounted at `/data/cubelet`). Sandbox image templates, snapshots and runtime data on the compute node all live under this directory — size it to your actual needs |
-| `TENCENTCLOUD_CUBELET_NODE_STATUS_UPDATE_FREQUENCY` | `1s` | Cubelet node status/resource reporting interval to CubeMaster. `create.sh` patches `Cubelet/config/config.toml` on each compute node |
+| `TENCENTCLOUD_CUBELET_NODE_STATUS_UPDATE_FREQUENCY` | `1s` | Cubelet node status/resource reporting interval to CubeOps. `create.sh` patches `Cubelet/config/config.toml` on each compute node |
 | `TENCENTCLOUD_TKE_NODE_COUNT` | `2` | **TKE workers** (run control-plane Pods; maps to `worker_config.count`) |
 | `TENCENTCLOUD_USE_TCR` | `false` | When `true`, create TCR and build/push images on the jumpserver; when `false`, use public pre-built images |
 | `TENCENTCLOUD_USE_CFS` | `false` | When `true` and cubemaster has multiple replicas, create CFS NFS shared storage |
@@ -318,13 +320,17 @@ export TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS=1
 | `TENCENTCLOUD_CUBE_DB` / `TENCENTCLOUD_CUBE_USER` / `TENCENTCLOUD_CUBE_PASSWORD` | `cube_mvp` / `cube` / demo | Application DB name / account / password |
 | `TENCENTCLOUD_CUBEMASTER_REPLICAS` | `1` | cube-master replica count |
 | `TENCENTCLOUD_CUBE_API_REPLICAS` | `1` | cube-api replica count |
-| `TENCENTCLOUD_CUBE_OPS_REPLICAS` | `1` | cube-ops replica count. cube-webui routes `/opsapi/` and `/cubeapi/v1/` through this internal service |
+| `TENCENTCLOUD_CUBE_OPS_REPLICAS` | `2` | cube-ops replica count. The default stack ships no object storage, so the component warehouse stays disabled until you wire COS (or other S3) into cube-ops (see [Component multi-version](/guide/component-multiversion)). cube-webui routes `/opsapi/` and `/cubeapi/v1/` through this internal service |
 | `TENCENTCLOUD_CUBE_PROXY_REPLICAS` | `1` | cube-proxy replica count. Values greater than `1` are supported; each replica registers in Redis for cube-lifecycle-manager discovery |
-| `TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS` | `1` | cube-lifecycle-manager replica count. Keep `1` unless CLM HA behavior has been validated for your deployment |
+| `TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS` | `2` | cube-lifecycle-manager replica count. Default two replicas run active-standby when leader election is enabled. Set to `1` only after also disabling `TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_ELECTION_ENABLED` |
 | `TENCENTCLOUD_CUBE_WEBUI_REPLICAS` | `1` | cube-webui replica count |
 | `TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DEFAULT_IDLE_TIMEOUT` | `5m` | Default idle timeout used when lifecycle metadata omits `TimeoutSeconds` |
 | `TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_HEARTBEAT_TTL` | `15s` | TTL for cube-proxy Redis registry heartbeats |
 | `TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DISCOVERY_REFRESH` | `3s` | Redis discovery scan interval for cube-lifecycle-manager |
+| `TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_ELECTION_ENABLED` | `true` | Run cube-lifecycle-manager as active-standby using a Redis lease. Requires `TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS` >= 2 |
+| `TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_LEASE_TTL` | `10s` | Redis lease TTL for cube-lifecycle-manager leader election |
+| `TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RENEW_INTERVAL` | `3s` | How often the leader renews its lease. Must be less than half of the lease TTL |
+| `TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RETRY_INTERVAL` | `1s` | How often a standby retries acquiring the lease. Must be greater than 0 and less than the lease TTL |
 | `TENCENTCLOUD_CUBE_PROXY_HEARTBEAT_INTERVAL_MS` | `5000` | cube-proxy registry heartbeat interval in milliseconds |
 | `TENCENTCLOUD_CUBE_ADMIN_TOKEN` | empty | Shared token for cube-lifecycle-manager -> cube-proxy `/admin/*` calls. Leave empty to auto-generate; custom values must be at least 16 characters |
 | `TENCENTCLOUD_ENABLE_PUBLIC_NETWORK` | `false` | Network exposure mode for cube-api / cube-proxy / cube-webui. **Default `false`**: VPC-internal CLBs, reachable only from inside the VPC (via jumpserver / VPN). Set to `true` for public CLBs reachable from the internet, with the security group opening `0.0.0.0/0` accordingly. cube-master always stays VPC-internal. Read [Hardening the Public-Facing Services](#hardening-the-public-facing-services) before enabling |
@@ -597,7 +603,7 @@ export E2B_API_URL=http://<cube-api-clb-vip>:3000
 export E2B_API_KEY=e2b_000000
 ```
 
-**Note:** sandbox traffic itself goes through `*.cube.app` → cube-proxy, so **cube.app DNS resolution and TLS certificates** are required — configuring `E2B_API_URL` alone is not enough. See also [Connecting to an Existing Cluster](./connect-existing-cluster.md).
+**Note:** sandbox traffic itself goes through `*.cube.app` → cube-proxy, so **cube.app DNS resolution and TLS certificates** are required — configuring `E2B_API_URL` alone is not enough. See also [Connect Clients to the Cluster](./multi-node-deploy.md#connect-clients-to-the-cluster).
 
 | Capability | Single-machine one-click | Terraform cluster |
 |------------|--------------------------|-------------------|

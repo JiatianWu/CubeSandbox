@@ -29,9 +29,12 @@ pytest --run-e2e -m "lifecycle and slow"
 | 文件 | 主要行为 | 能力/前提 | 风险与执行建议 |
 | --- | --- | --- | --- |
 | `cases/lifecycle/test_create.py` | 创建后的 `info`、Linux command smoke | `lifecycle` | P0/PR gate 候选 |
-| `cases/lifecycle/test_connect.py` | connect 既有实例、ID 与文件/命令可用性 | `lifecycle` | P1 |
+| `cases/lifecycle/test_connect.py` | connect 既有实例、ID 与文件/命令可用性，以及 running/paused sandbox 的显式 timeout 应用 | `lifecycle`；paused 用例还需 `pause_resume` | P1 |
 | `cases/lifecycle/test_create_options.py` | metadata、env vars、timeout 和创建参数后的 command | `lifecycle` | P1 |
 | `cases/lifecycle/test_pause_resume.py` | SDK pause、connect resume、文件/env/kernel 状态保留 | `pause_resume`，部分需 Code Interpreter | P1 |
+| `cases/lifecycle/test_pause_resume_network.py` | pause/resume 后仍保持出站 deny/allowlist 与限制公网访问 token | `pause_resume` + 网络能力；ingress token 用例需 CubeProxy | P1 + `requires_internet` |
+| `cases/lifecycle/test_rollback_clone.py` | rollback 异常/文件系统/kernel 状态，以及默认/并发 clone 和临时快照清理 | `rollback_clone`（仅 CubeSandbox），部分依赖 Code Interpreter | P1 |
+| `cases/lifecycle/test_negative_and_timeout.py` | create/connect 目标不存在、删除后 pause、在线更新 timeout | `lifecycle`、`pause_resume`、`set_timeout` | P1 |
 | `cases/lifecycle/test_kill.py` | kill 后不可连接、列表移除、重复 kill 终态语义 | `lifecycle` | P1 |
 | `cases/lifecycle/test_auto_lifecycle.py` | auto-pause、手动/自动恢复、重入、auto-kill、主动 pause 与 timeout 的交互 | `platform_lifecycle`、CubeProxy、lifecycle-manager；部分需 Code Interpreter | P1 + `slow`，每日运行 |
 
@@ -42,10 +45,8 @@ pytest --run-e2e -m "lifecycle and slow"
 本组用例纳入双 backend 覆盖。
 
 生命周期覆盖的强项是同时验证控制面 state、文件、kernel 状态和 command 数据面。
-需要注意主动 pause 后的 auto-kill 语义当前作为回归行为记录：实例在 timeout 后
-保持 `paused`。当服务端支持 timeout 回收主动 paused 实例后，应将该测试更新为
-预期 terminal 状态。清理侧的 `safe_kill` 目前需要先恢复 paused 实例；TODO 是
-待服务端支持直接删除 paused 实例后改为直接删除，并确认实例已从列表消失。
+主动 pause 后的 auto-kill 用例验证生命周期 timeout 会销毁 paused 实例，
+并确认实例已从 sandbox 列表中消失。
 
 ### 2.2 Commands
 
@@ -70,7 +71,14 @@ pytest --run-e2e -m "lifecycle and slow"
 - 文件 API 与 shell 双向互操作；
 - 读取不存在文件的错误语义。
 
-当前覆盖以文本文件为主，尚未覆盖目录、权限、二进制、原子覆盖与并发访问。
+`cases/filesystem/test_extended.py` 覆盖 SDK 文件 API 的文件和目录元数据、
+嵌套及空目录 list、exists、remove、rename 和 mkdir。
+
+`cases/filesystem/test_batch_and_watch.py` 覆盖两个 SDK backend 的批量文件写入，
+以及目录 create/write/remove 实时事件。
+
+当前内容覆盖仍以文本文件为主，尚未覆盖非 root 权限行为、二进制往返、
+原子替换和并发文件访问。
 
 ### 2.4 Run code
 
@@ -79,10 +87,10 @@ pytest --run-e2e -m "lifecycle and slow"
 - 表达式结果文本；
 - stdout 与 stderr 捕获；
 - Python 错误和语法错误；
+- 创建时环境变量继承与临时 per-call env 覆盖，仅在兼容 template 上设置 `SDK_E2E_RUN_CODE_ENV_INHERITANCE=true` 时启用；
 - stateful kernel 变量保留。
 
-这些场景要求 Code Interpreter 能力。它们验证的是框架归一化后的 `CodeResult`，
-而非单个 SDK 的内部响应格式。
+这些场景要求 Code Interpreter 能力。它们验证的是框架归一化后的 `CodeResult`，而非单个 SDK 的内部响应格式。环境变量继承用例默认跳过，因为默认 template 不一定提供该行为，必须显式开启。
 
 ### 2.5 Network
 
@@ -97,16 +105,59 @@ pytest --run-e2e -m "lifecycle and slow"
 - 限制公网 URL 访问时，缺失/错误 token 返回 403，`e2b-traffic-access-token`
   与 `cube-traffic-access-token` 携带正确 token 时均可访问。
 
+`cases/network/test_policy_update.py` 覆盖运行中沙箱的策略原地替换
+（`network_dynamic_update`，仅 CubeSandbox）：
+
+- 放通创建时被阻断的目标；
+- 传空策略即撤销全部——更新是整体替换而不是增量打补丁；
+- 替换 allow list 时访问权限是「转移」而不是「叠加」；
+- **被撤销的存量连接会被拆掉**——这一条是本功能与创建时策略的分界线：没有数据面
+  重判的话，已经打开的通道会一直沿用创建时的判决；
+- **更新后仍放行的存量连接不受影响**——上一条的必要配套，否则一个「任何更新都
+  杀光所有 session」的实现也能通过上一条；
+- 域名策略更新后 DNS 仍可用，守住那批由控制面注入、调用方从不书写、因而可能被
+  静默丢掉的 resolver 放行条目；
+- **clone 继承的是更新后的策略而不是创建时的策略**，这条同时覆盖 read-your-writes：
+  clone 在 update 返回后立刻做快照，spec 写入慢于响应就会失败；
+- **收紧型 update 之后的 clone 不会更宽松** —— 这是 spec 落后时会静默放大权限的方向；
+- **更新后的策略能扛过 pause/resume**，因为 pause 打包读的是 Cubelet 自己的 store，
+  不是 network runtime 的 state file；
+- 反复更新可收敛，守住增量 map diff 不漏删、不重复删。
+
+存量连接相关用例使用 `framework/network_probe.py` 里的 guest 侧 holder，它会
+刻意持续向对端发包：被撤销的流是在 guest 下一次发包时才被重判的，光挂着一个
+空闲 socket 观察不到任何现象。
+
+`cases/lifecycle/test_pause_resume_network.py` 覆盖 SDK pause + connect resume
+后同一批创建时策略仍生效：
+
+- `allow_internet_access=False` 与 `deny_out=0.0.0.0/0` 仍阻断出站；
+- allowlist（禁用公网 + `allow_out`）仍只放行列出的 target；
+- 限制公网访问在 resume 后仍要求 traffic access token（覆盖 CubeProxy
+  HostIP 改写路径）。
+
+共享 TCP / 公网访问探测 helper 在 `framework/network_probe.py`。
+
 当前以可配置的公共 TCP endpoint 验证 L3/L4 出站策略。用例带
 `requires_internet`，运行器没有稳定公网时应使用
 `SDK_E2E_SKIP_INTERNET_TESTS=true` 跳过。
 
-### 2.6 Concurrency
+### 2.6 Templates
+
+`cases/templates/test_alias.py` 覆盖 list/get/build/delete 和 alias 生命周期。
+此外会使用 writable layer 大小、暴露端口、HTTP probe 和环境变量构建模板，
+并从 CubeAPI 返回的模板详情中校验这些高级参数。模板操作仅支持 CubeSandbox。
+
+### 2.7 Concurrency
 
 `cases/concurrency/test_isolation.py` 目前覆盖两个 sandbox 同路径不同内容的文件
 隔离，第二个实例通过 `managed_control_sandbox` 创建和清理。
 
 它证明了基础实例隔离，但不等于并发压力、资源竞争或多 worker 安全性验证。
+
+### 2.8 Volume
+
+`cases/volume/` 覆盖 Volume Plugin CRUD、sandbox 绑定/解绑和绑定期间禁止删除。它还验证同一个 Volume 可以在一个沙箱中保持读写，同时在另一个沙箱中以只读方式挂载，包括正常读取，以及 create、write、rename、delete 均被拒绝。这些用例仅适用于 CubeSandbox，默认使用 S3 driver，随 `--run-e2e` 执行，除非设置 `SDK_E2E_VOLUME_PLUGIN=false`。
 
 ## 3. 覆盖边界
 

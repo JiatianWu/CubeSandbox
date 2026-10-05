@@ -16,8 +16,19 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
+
+// submitTemplateCommitFn indirects templatecenter.SubmitTemplateCommit so tests
+// can substitute a plain closure and capture every argument on any arch.
+// gomonkey cannot read a patched function's 6th+ argument on arm64 (register
+// ABI spills later args to the stack, which the trampoline forwards as raw
+// bytes), so swapping this seam instead of patching the function keeps arg
+// capture arch-independent.
+//
+// submitTemplateCommitFn must NOT be swapped concurrently: callers of
+// withCommitStub must not call t.Parallel() on any test that uses it.
+var submitTemplateCommitFn = templatecenter.SubmitTemplateCommit
 
 type commitTemplateRequest struct {
 	RequestID     string                      `json:"requestID,omitempty"`
@@ -128,7 +139,7 @@ func handleSandboxCommitAction(c *gin.Context) {
 		"SandboxID":   req.SandboxID,
 		"SandboxHost": hostIP,
 	}))
-	job, err := templatecenter.SubmitTemplateCommit(ctx, req.RequestID, req.SandboxID, hostID, hostIP, req.TemplateID, req.CreateRequest)
+	job, err := submitTemplateCommitFn(ctx, req.RequestID, req.SandboxID, hostID, hostIP, req.TemplateID, req.CreateRequest)
 	if err != nil {
 		code := commitTemplateErrorCode(err)
 		log.G(ctx).Errorf("submit template commit failed: %v", err)
@@ -200,9 +211,9 @@ func handleTemplateBuildStatusAction(c *gin.Context) {
 	}
 	job, err := templatecenter.GetTemplateImageJobInfo(c.Request.Context(), buildID)
 	if err != nil {
-		code := int(errorcode.ErrorCode_MasterInternalError)
-		if errors.Is(err, templatecenter.ErrTemplateStoreNotInitialized) {
-			code = int(errorcode.ErrorCode_DBError)
+		code := templateImageJobErrorCode(err)
+		if rt != nil {
+			rt.RetCode = int64(code)
 		}
 		common.WriteAPI(c, &templateBuildStatusResponse{
 			Res:     &types.Res{Ret: &types.Ret{RetCode: code, RetMsg: err.Error()}},

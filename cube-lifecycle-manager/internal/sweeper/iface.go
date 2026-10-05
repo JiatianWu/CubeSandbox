@@ -15,9 +15,16 @@ import (
 // satisfies this interface implicitly.
 type stateStore interface {
 	AcquireState(ctx context.Context, sandboxID, state string, ttl time.Duration) (bool, error)
+	// AcquireKill CAS-claims killing from empty or paused. state is the
+	// pre-CAS observation (paused or empty when acquired).
+	AcquireKill(ctx context.Context, sandboxID string, ttl time.Duration) (state string, acquired bool, err error)
 	SetState(ctx context.Context, sandboxID, state string, ttl time.Duration) error
 	ClearState(ctx context.Context, sandboxID string) error
 	GetState(ctx context.Context, sandboxID string) (string, bool, error)
+	// WriteState / ClearStateNotify are the notify-emitting equivalents.
+	// See internal/resumer/iface.go for the same contract.
+	WriteState(ctx context.Context, sandboxID, state string, ttl time.Duration) error
+	ClearStateNotify(ctx context.Context, sandboxID string) error
 }
 
 // pauseKiller is the subset of cubemasterclient.Client that the sweeper needs.

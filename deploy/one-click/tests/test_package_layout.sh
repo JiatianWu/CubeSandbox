@@ -61,6 +61,74 @@ test_component_build_inputs_exist() {
   if ! grep -q -F 'examples/volume/cos/install-deps.sh' "${BUNDLE_SH}"; then
     fail "build-release-bundle.sh must copy examples/volume/cos/install-deps.sh into CubeMaster/plugin and Cubelet/plugin"
   fi
+  require_file "${ROOT_DIR}/examples/volume/s3/install-deps.sh" \
+    "S3 volume install-deps.sh (examples source)"
+  if ! grep -q -F 'install-s3-deps.sh' "${BUNDLE_SH}"; then
+    fail "build-release-bundle.sh must copy the S3 install-deps.sh into CubeMaster/plugin and Cubelet/plugin as install-s3-deps.sh"
+  fi
+  # The S3 plugin is a Go binary compiled at pack time, not a copied script.
+  require_file "${ROOT_DIR}/examples/volume/s3/go.mod" "S3 volume plugin Go module"
+  require_file "${ROOT_DIR}/examples/volume/s3/cmd/cube-volume-s3/main.go" \
+    "S3 volume plugin entry point"
+  if [[ -e "${ROOT_DIR}/examples/volume/s3/binary" ]]; then
+    fail "examples/volume/s3/binary must be gone; the plugin is built from cmd/cube-volume-s3"
+  fi
+  if ! grep -q -F 'build_or_copy_go_binary' "${BUNDLE_SH}"; then
+    fail "build-release-bundle.sh must build Go binaries via build_or_copy_go_binary"
+  fi
+  if ! grep -q -F './cmd/cube-volume-s3' "${BUNDLE_SH}"; then
+    fail "build-release-bundle.sh must compile ./cmd/cube-volume-s3"
+  fi
+  if ! grep -q -F '${PACKAGE_ROOT}/CubeMaster/plugin/cube-volume-s3' "${BUNDLE_SH}"; then
+    fail "build-release-bundle.sh must install cube-volume-s3 into CubeMaster/plugin"
+  fi
+  if ! grep -q -F '${PACKAGE_ROOT}/Cubelet/plugin/cube-volume-s3' "${BUNDLE_SH}"; then
+    fail "build-release-bundle.sh must install cube-volume-s3 into Cubelet/plugin"
+  fi
+
+  # cube-volume-s3 must be statically linked (one-click hosts are Ubuntu 20.04 /
+  # glibc 2.31). A global CGO_ENABLED=0 on build_go_binary would compile cubelet
+  # without cubecow / nsenter.
+  local helper
+  helper="$(awk '/^build_go_binary\(\)/ {flag=1} flag {print} /^}$/ && flag {exit}' "${BUNDLE_SH}")"
+  if ! printf '%s\n' "${helper}" | grep -E 'go build -trimpath' | grep -v 'CGO_ENABLED=0' >/dev/null; then
+    fail "build_go_binary default path must not set CGO_ENABLED=0 (cubelet needs cgo)"
+  fi
+  if ! printf '%s\n' "${helper}" | grep -q 'CGO_ENABLED=0'; then
+    fail "build_go_binary static_linux path must set CGO_ENABLED=0"
+  fi
+  if ! grep -A12 './cmd/cube-volume-s3' "${BUNDLE_SH}" | grep -q 'static_linux'; then
+    fail "cube-volume-s3 must be built with static_linux (CGO_ENABLED=0)"
+  fi
+  if ! grep -q 'CGO_ENABLED=0.*go build' "${BUNDLE_SH}"; then
+    fail "cube-volume-s3 compile must use CGO_ENABLED=0 (build_go_binary static_linux branch)"
+  fi
+  if ! grep -B2 './cmd/cube-volume-s3' \
+        "${ROOT_DIR}/CubeMaster/docker/Dockerfile" | grep -q 'CGO_ENABLED=0'; then
+    fail "CubeMaster Dockerfile must compile cube-volume-s3 with CGO_ENABLED=0"
+  fi
+  if ! grep -B2 './cmd/cube-volume-s3' \
+        "${ROOT_DIR}/Cubelet/Dockerfile" | grep -q 'CGO_ENABLED=0'; then
+    fail "Cubelet Dockerfile must compile cube-volume-s3 with CGO_ENABLED=0"
+  fi
+
+  # The plugin has a built-in S3 client, so nothing may reintroduce the AWS CLI:
+  # it was ~100MB installed and ~60MB of zip inside the release bundle.
+  if [[ -e "${ONE_CLICK_DIR}/lib/awscli-bundle.sh" ]]; then
+    fail "lib/awscli-bundle.sh must be gone; the S3 plugin no longer needs the AWS CLI"
+  fi
+  if [[ -e "${ONE_CLICK_DIR}/assets/vendor/awscli" ]]; then
+    fail "assets/vendor/awscli must be gone; the S3 plugin no longer needs the AWS CLI"
+  fi
+  if grep -qi 'awscli' "${BUNDLE_SH}"; then
+    fail "build-release-bundle.sh must not reference the AWS CLI"
+  fi
+  if grep -qi 'awscli' "${ROOT_DIR}/deploy/scripts/docker-install-volume-deps.sh"; then
+    fail "docker-install-volume-deps.sh must not install the AWS CLI"
+  fi
+  if grep -q -- '--aws' "${ROOT_DIR}/examples/volume/s3/install-deps.sh"; then
+    fail "S3 install-deps.sh must not offer --aws"
+  fi
 }
 
 # 2) The component image base names must match between what build_images.sh
@@ -80,7 +148,9 @@ test_image_names_match() {
   # component image on one side but not the other is caught as drift. The `^`
   # anchor on build_images.sh skips its `#   CUBE_*_IMAGE=...` comment header.
   built="$(extract_image_names "${BUILD_IMAGES_SH}" '^CUBE_[A-Z0-9]+_IMAGE=')"
-  composed="$(extract_image_names "${TKE_ADDONS_TF}" 'cube_[a-z0-9]+_image[[:space:]]*=')"
+  # tke-addons.tf names its locals cube_*_image EXCEPT templatecenter_image
+  # (the TF variable is var.templatecenter_image), so both spellings match.
+  composed="$(extract_image_names "${TKE_ADDONS_TF}" '(cube_[a-z0-9]+_image|templatecenter_image)[[:space:]]*=')"
 
   if [[ -z "${built}" ]]; then
     fail "could not extract image names from build_images.sh"
@@ -91,8 +161,8 @@ test_image_names_match() {
   # Guard against a regex that silently matches too few/many lines.
   local built_n
   built_n="$(printf '%s\n' "${built}" | grep -c .)"
-  if [[ "${built_n}" -ne 6 ]]; then
-    fail "expected 6 component images in build_images.sh, found ${built_n}: $(echo "${built}" | tr '\n' ' ')"
+  if [[ "${built_n}" -ne 7 ]]; then
+    fail "expected 7 component images in build_images.sh, found ${built_n}: $(echo "${built}" | tr '\n' ' ')"
   fi
   if [[ "${built}" != "${composed}" ]]; then
     fail "image name drift between build_images.sh and tke-addons.tf:
@@ -151,14 +221,15 @@ test_cubeproxy_nginx_template_generation() {
     -e 's|^worker_processes [0-9]\+;|worker_processes auto;|' \
     -e 's|^\(\s*listen \)8081\( reuseport;\)|\1__CUBE_PROXY_HTTP_PORT__\2|' \
     -e 's|^\(\s*listen \)8080\( ssl reuseport;\)|\1__CUBE_PROXY_HTTPS_PORT__\2|' \
+    -e 's|^\(\s*listen \)9090\( http2 reuseport;\)|\1__CUBE_PROXY_GRPC_PORT__\2|' \
     -e 's|^\(\s*set \$host_proxy_port \)8081;|\1__CUBE_PROXY_HTTP_PORT__;|' \
     -e 's|^\(\s*set \$host_proxy_port \)8080;|\1__CUBE_PROXY_HTTPS_PORT__;|' \
-    -e 's|^\(\s*listen \)127\.0\.0\.1:8082;|\1__CUBE_PROXY_ADMIN_LISTEN__:8082;|' \
+    -e 's|^\(\s*listen \)127\.0\.0\.1:8082;|\1__CUBE_PROXY_ADMIN_LISTEN__:__CUBE_PROXY_ADMIN_PORT__;|' \
     -e 's|/usr/local/openresty/nginx/certs/cube\.app+3\.pem|/usr/local/openresty/nginx/certs/__CUBE_PROXY_SSL_CERT__|' \
     -e 's|/usr/local/openresty/nginx/certs/cube\.app+3-key\.pem|/usr/local/openresty/nginx/certs/__CUBE_PROXY_SSL_KEY__|' \
     "${src}" >"${tmp}"
 
-  for token in __CUBE_PROXY_HTTP_PORT__ __CUBE_PROXY_HTTPS_PORT__ __CUBE_PROXY_ADMIN_LISTEN__ __CUBE_PROXY_SSL_CERT__ __CUBE_PROXY_SSL_KEY__; do
+  for token in __CUBE_PROXY_HTTP_PORT__ __CUBE_PROXY_HTTPS_PORT__ __CUBE_PROXY_GRPC_PORT__ __CUBE_PROXY_ADMIN_LISTEN__ __CUBE_PROXY_ADMIN_PORT__ __CUBE_PROXY_SSL_CERT__ __CUBE_PROXY_SSL_KEY__; do
     grep -q -F "${token}" "${tmp}" || fail "cube-proxy nginx template generation is missing ${token}; CubeProxy/nginx.conf may have changed"
   done
   rm -f "${tmp}"
@@ -223,6 +294,13 @@ is_reinstall_cleanup_exception() {
     terraform)
       return 0
       ;;
+    # CubeS3lvol is installed into a versioned directory with the bare name as a
+    # symlink to it, and both are staged before this cleanup runs. Removing the
+    # bare name here would leave the service with nothing to start, and the
+    # versioned directories are what a rollback needs.
+    CubeS3lvol)
+      return 0
+      ;;
     *)
       return 1
       ;;
@@ -255,12 +333,79 @@ test_reinstall_cleanup_tracks_packaged_components() {
   fi
 }
 
+# 3g) Build-machine knobs live in build.env.example; the shipped env.example is
+#     deploy-only. The release bundle must copy env.example and must not ship
+#     build.env.example.
+test_env_templates_are_split() {
+  local env_example="${ONE_CLICK_DIR}/env.example"
+  local build_example="${ONE_CLICK_DIR}/build.env.example"
+  require_file "${env_example}" "deploy env.example"
+  require_file "${build_example}" "build.env.example"
+
+  if grep -E '^[[:space:]]*(#[[:space:]]*)?ONE_CLICK_[A-Z0-9_]+_BUILD_MODE=' "${env_example}" >/dev/null; then
+    fail "env.example must not contain ONE_CLICK_*_BUILD_MODE keys"
+  fi
+  if grep -E '^[[:space:]]*(#[[:space:]]*)?ONE_CLICK_[A-Z0-9_]+_BIN=' "${env_example}" >/dev/null; then
+    fail "env.example must not contain ONE_CLICK_*_BIN keys"
+  fi
+
+  grep -q '^ONE_CLICK_CUBEMASTER_BUILD_MODE=' "${build_example}" \
+    || fail "build.env.example missing ONE_CLICK_CUBEMASTER_BUILD_MODE"
+  grep -q 'ONE_CLICK_CUBEMASTER_BIN=' "${build_example}" \
+    || fail "build.env.example missing ONE_CLICK_CUBEMASTER_BIN"
+  grep -q 'ONE_CLICK_TEMPLATECENTER_BIN=' "${build_example}" \
+    || fail "build.env.example missing ONE_CLICK_TEMPLATECENTER_BIN"
+  grep -q 'ONE_CLICK_MKCERT_BIN=' "${build_example}" \
+    || fail "build.env.example missing ONE_CLICK_MKCERT_BIN"
+  grep -q 'ONE_CLICK_VOLUME_S3_BIN=' "${build_example}" \
+    || fail "build.env.example missing ONE_CLICK_VOLUME_S3_BIN"
+  grep -q 'ONE_CLICK_WEB_DIST_DIR=' "${build_example}" \
+    || fail "build.env.example missing ONE_CLICK_WEB_DIST_DIR"
+  if grep -qi 'awscli' "${build_example}"; then
+    fail "build.env.example must not reference the AWS CLI"
+  fi
+
+  grep -q 'copy_file "${SCRIPT_DIR}/env.example"' "${BUNDLE_SH}" \
+    || fail "build-release-bundle.sh must copy env.example into DIST_ROOT"
+  if grep -q 'build.env.example' "${BUNDLE_SH}"; then
+    fail "build-release-bundle.sh must not ship build.env.example"
+  fi
+}
+
 # 4) The build entrypoints AND every shipped Terraform deployer script must at
 #    least be syntactically valid — a cheap, cloud-free guard so a broken script
 #    fails here instead of only when a user runs it from the bundle.
+test_s3lvol_bucket_tool_is_packaged() {
+  require_file "${ROOT_DIR}/CubeS3lvol/test/tools/s3_bucket.py" \
+    "s3lvol ensure-bucket tool"
+  require_file "${ROOT_DIR}/CubeS3lvol/make_release.sh" "s3lvol make_release.sh"
+  if ! grep -q -F 's3_bucket.py' "${ROOT_DIR}/CubeS3lvol/make_release.sh"; then
+    fail "make_release.sh must install test/tools/s3_bucket.py into scripts/"
+  fi
+}
+
+test_s3lvol_rpc_launcher_is_packaged() {
+  require_file "${ROOT_DIR}/CubeS3lvol/scripts/rpc.py" "s3lvol rpc.py launcher"
+  require_file "${ROOT_DIR}/CubeS3lvol/scripts/rpc_compat.py" \
+    "s3lvol rpc.py 3.8 compat shim"
+  require_file "${ROOT_DIR}/CubeS3lvol/scripts/rcow_cpumask.sh" \
+    "s3lvol default CPU mask helper"
+  require_file "${ROOT_DIR}/CubeS3lvol/make_release.sh" "s3lvol make_release.sh"
+  if ! grep -q -F 'rcow_cpumask.sh' "${ROOT_DIR}/CubeS3lvol/make_release.sh"; then
+    fail "make_release.sh must install scripts/rcow_cpumask.sh"
+  fi
+  if ! grep -q -F 'scripts/spdk_rpc.py' "${ROOT_DIR}/CubeS3lvol/make_release.sh"; then
+    fail "make_release.sh must install SPDK rpc.py as scripts/spdk_rpc.py"
+  fi
+  if ! grep -q -F '${REPO_ROOT}/scripts/rpc.py' "${ROOT_DIR}/CubeS3lvol/make_release.sh"; then
+    fail "make_release.sh must install this repo's scripts/rpc.py launcher"
+  fi
+}
+
 test_build_scripts_parse() {
   local f
   for f in "${BUNDLE_SH}" "${BUILD_IMAGES_SH}" \
+    "${ROOT_DIR}/examples/volume/s3/install-deps.sh" \
     "${TF_DIR}/create.sh" "${TF_DIR}/destroy.sh" \
     "${TF_DIR}/lib-phases.sh" "${TF_DIR}/lib-state-sync.sh" "${TF_DIR}/validate.sh"; do
     bash -n "${f}" || fail "syntax error in ${f}"
@@ -275,6 +420,9 @@ test_cubeproxy_host_log_wiring
 test_tke_addons_network_config_key
 test_reinstall_cleanup_tracks_packaged_components
 test_terraform_deployer_files_present
+test_env_templates_are_split
+test_s3lvol_bucket_tool_is_packaged
+test_s3lvol_rpc_launcher_is_packaged
 test_build_scripts_parse
 
 if [[ "${failures}" -gt 0 ]]; then

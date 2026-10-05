@@ -36,11 +36,153 @@ use crate::{infof, warnf};
 pub const GUEST_DEV_SHM: &str = "/run/cube-containers/sandbox/shm";
 pub const ANNO_APP_SNAPSHOT_CONTAINER_ID: &str = "cube.appsnapshot.container.id";
 
+/// Upper bound on the dedicated vsock connect in start_log_forward.  It runs
+/// while holding log_forward_lifecycle, so an unbounded connect would serialize
+/// and stall all other log-forward lifecycle operations on this container.
+const LOG_FORWARD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Default)]
+struct LogForward {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    cancel: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+/// Shared, clone-safe owner of the init log-forwarding background task.
+///
+/// `Container` is `#[derive(Clone)]` and clones are pulled out of the map in
+/// paths like delete/wait, so the task must be owned through a single shared
+/// slot rather than a per-clone `Arc<JoinHandle>`.  `lifecycle` (permits = 1)
+/// serializes start/stop across all clones so exactly one caller drains the
+/// task to completion instead of falling back to `abort()`.
+#[derive(Clone)]
+struct LogForwardHandle {
+    slot: Arc<Mutex<LogForward>>,
+    lifecycle: Arc<tokio::sync::Semaphore>,
+}
+
+impl LogForwardHandle {
+    fn new() -> Self {
+        Self {
+            slot: Arc::new(Mutex::new(LogForward::default())),
+            lifecycle: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
+    /// Acquire the start/stop serialization permit.  Held for the whole
+    /// duration of a start or stop so the two never interleave across clones.
+    async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.lifecycle
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("log-forward lifecycle semaphore closed")
+    }
+
+    /// Cancel and await the current task to completion.  Caller must hold the
+    /// lifecycle permit.  The slot mutex is released before the `.await` so it
+    /// is never held across task termination.
+    ///
+    /// The `handle.await` is intentionally unbounded: draining instead of
+    /// aborting is the whole point of the fix, and a bounded drain + `abort()`
+    /// fallback would reintroduce the skipped-IO-drain hazard this removes.  In
+    /// the pathological case (the task stuck mid-`file.write_all` on a hung log
+    /// file rather than parked on `cancel.changed()`), this blocks while holding
+    /// the lifecycle permit.  On the `disconnect_agent`/`resume`/`kill_container`
+    /// paths the drain additionally runs under the sandbox `containers` mutex
+    /// (the map is iterated in place via `unset_client`, or the entry is borrowed
+    /// via `get_mut` in `kill_container` -> `signal_container`), so a wedged task
+    /// stalls every other lifecycle op on the sandbox.  On the clone path (`delete_container`,
+    /// which drains via `destroy_container` -> `signal_container`) the container
+    /// is cloned out of the map and the `containers` lock is released before the
+    /// drain — but the service layer still holds the sandbox-wide `Mutex<SandBox>`
+    /// across the whole RPC (task_srv serializes every op on it), so a wedged
+    /// drain freezes pause/resume/kill/delete for the whole sandbox on this path
+    /// too, and this path previously took the `abort()` fallback and returned
+    /// promptly, so draining is a deliberate *new* blocking point on it, not a
+    /// pre-existing one.  (`wait_container` clones out of the map too but never
+    /// drains.)  We accept it: the forwarding loops append to local log files
+    /// whose writes do not normally stall.
+    async fn drain(&self) {
+        let (cancel, handle) = {
+            let mut slot = self.slot.lock().await;
+            (slot.cancel.take(), slot.handle.take())
+        };
+        if let Some(tx) = cancel {
+            let _ = tx.send(true);
+        }
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+    }
+
+    /// Install a freshly started task.  Caller must hold the lifecycle permit
+    /// and must have already drained any previous task.
+    async fn store(
+        &self,
+        cancel: tokio::sync::watch::Sender<bool>,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        let mut slot = self.slot.lock().await;
+        slot.cancel = Some(cancel);
+        slot.handle = Some(handle);
+    }
+}
+
 fn validate_log_path_component(id: &str) -> CResult<()> {
     if id.is_empty() || id.contains('/') || id.contains("..") || id.contains('\0') {
         return Err(format!("invalid container id for log path: {}", id));
     }
     Ok(())
+}
+
+/// Host directory for regular-sandbox init logs. Template builds stay under
+/// `/data/log/template`. cubecli reads this path without entering a mount ns.
+pub const SANDBOX_LOG_ROOT: &str = "/data/cubelet/log";
+
+pub fn sandbox_log_dir(sandbox_id: &str) -> CResult<PathBuf> {
+    validate_log_path_component(sandbox_id)?;
+    Ok(PathBuf::from(SANDBOX_LOG_ROOT).join(sandbox_id))
+}
+
+pub async fn create_sandbox_log_paths(sandbox_id: &str) -> CResult<(String, String)> {
+    let dir = sandbox_log_dir(sandbox_id)?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("create log dir {}: {}", dir.display(), e))?;
+    let stdout = dir.join("stdout");
+    let stderr = dir.join("stderr");
+    // Pause reaps the previous shim via binary delete and removes this
+    // directory. Resume is a new shim and must recreate the files.
+    for path in [&stdout, &stderr] {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(path)
+            .await
+            .map_err(|e| format!("create log file {}: {}", path.display(), e))?;
+    }
+    Ok((
+        stdout.to_string_lossy().into_owned(),
+        stderr.to_string_lossy().into_owned(),
+    ))
+}
+
+/// Sync cleanup used by the shim `delete` subcommand (`clean_sandbox_resource`)
+/// so a crashed shim still drops `/data/cubelet/log/<id>` when containerd
+/// reaps the leftover task.
+pub fn remove_sandbox_log_dir_sync(sandbox_id: &str) -> CResult<()> {
+    let dir = sandbox_log_dir(sandbox_id)?;
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("del {} failed:{}", dir.display(), e)),
+    }
+}
+
+pub async fn remove_sandbox_log_dir(sandbox_id: &str, log: &Log) {
+    if let Err(e) = remove_sandbox_log_dir_sync(sandbox_id) {
+        warnf!(log, "remove sandbox log dir: {}", e);
+    }
 }
 
 #[derive(Clone)]
@@ -59,15 +201,11 @@ pub struct Container {
     execs: Arc<Mutex<HashMap<String, Exec>>>,
     app_snapshot: bool,
     /// Background task forwarding container stdout/stderr to log files.
-    /// Template creation: /data/log/template/<id>/stdout|stderr (755 dir).
-    /// Normal sandbox: ./stdout and ./stderr relative to the bundle directory.
-    /// Aborted on pause/snapshot/disconnect/kill/destroy; restarted on resume via start_log_forward.
-    log_forward_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
-    /// Cancel sender for the log-forwarding task.  Sending true on this watch
-    /// channel wakes both forward_stdout and forward_stderr select! loops so
-    /// they exit immediately; paired with log_forward_handle so callers can
-    /// await clean termination before proceeding with pause / snapshot.
-    log_forward_cancel: Option<tokio::sync::watch::Sender<bool>>,
+    /// Template creation: /data/log/template/<id>/stdout|stderr.
+    /// Normal sandbox: /data/cubelet/log/<sandbox-id>/stdout|stderr.
+    /// Clones share the task ownership so exactly one caller takes and awaits
+    /// it; start/stop are serialized across clones by an internal semaphore.
+    log_forward: LogForwardHandle,
 }
 
 impl Container {
@@ -109,8 +247,7 @@ impl Container {
             execs: Arc::new(Mutex::new(HashMap::new())),
             tx_containerd,
             app_snapshot,
-            log_forward_handle: None,
-            log_forward_cancel: None,
+            log_forward: LogForwardHandle::new(),
         };
         Ok(c)
     }
@@ -161,19 +298,8 @@ impl Container {
     /// forward_init_log_stdout/stderr and awaits the background task so vsock
     /// reads are finished before pause, snapshot, or destroy proceeds.
     pub async fn stop_log_forward(&mut self) {
-        if let Some(tx) = self.log_forward_cancel.take() {
-            let _ = tx.send(true);
-        }
-        if let Some(handle) = self.log_forward_handle.take() {
-            match Arc::try_unwrap(handle) {
-                Ok(h) => {
-                    let _ = h.await;
-                }
-                Err(h) => {
-                    h.abort();
-                }
-            }
-        }
+        let _lifecycle = self.log_forward.acquire().await;
+        self.log_forward.drain().await;
     }
 
     pub async fn unset_client(&mut self) {
@@ -434,12 +560,14 @@ impl Container {
         self.id == self.real_id
     }
 
-    /// Template creation writes stdout/stderr to regular files under
-    /// /data/log/template. Regular files cannot be registered with epoll, so
-    /// keep that path on the legacy RPC log forwarder even when passfd is the
-    /// sandbox default.
+    /// Passfd stays compiled in but is opt-in. Cubelet must set
+    /// `cube.use_passfd_io=true` and publish nonempty stdout/stderr paths.
+    /// Template builds and the default cubelet path keep the RPC log forwarder.
     fn passfd_io_enabled(&self) -> bool {
-        self.sb_conf.use_passfd_io && !self.sb_conf.app_snapshot_create
+        self.sb_conf.use_passfd_io
+            && !self.sb_conf.app_snapshot_create
+            && !self.info.stdout.is_empty()
+            && !self.info.stderr.is_empty()
     }
 
     pub async fn create_container(&mut self) -> CResult<()> {
@@ -565,8 +693,7 @@ impl Container {
     /// Spawn a background task that streams container stdout/stderr from the
     /// agent (via a fresh vsock connection) and appends them to log files.
     /// Template creation writes to `/data/log/template/<id>/stdout|stderr`;
-    /// normal sandbox restore writes to `./stdout` and `./stderr` relative
-    /// to the shim's current working directory (the bundle directory).
+    /// normal sandboxes write to `/data/cubelet/log/<sandbox-id>/stdout|stderr`.
     ///
     /// The task exits cleanly when `stop_log_forward` is called (pause /
     /// snapshot / kill / destroy): a watch cancel signal is sent first so the
@@ -575,30 +702,31 @@ impl Container {
     /// read has stopped before proceeding.
     pub async fn start_log_forward(&mut self) -> CResult<()> {
         // Cancel and await any previous instance before starting a new one.
-        if let Some(tx) = self.log_forward_cancel.take() {
-            let _ = tx.send(true);
-        }
-        if let Some(handle) = self.log_forward_handle.take() {
-            match Arc::try_unwrap(handle) {
-                Ok(h) => {
-                    let _ = h.await;
-                }
-                Err(h) => {
-                    h.abort();
-                }
-            }
-        }
+        let _lifecycle = self.log_forward.acquire().await;
+        self.log_forward.drain().await;
 
         // Open a dedicated vsock connection for streaming I/O so that the
         // main client connection used for control-plane RPCs is never blocked.
-        let log_conn = AsyncUtils::connect_agent(&self.sandbox_id)
-            .await
-            .map_err(|e| format!("connect agent for log forwarding failed:{}", e))?;
+        // Bound the connect: it runs while holding log_forward_lifecycle, so a
+        // hung agent would otherwise wedge every start/stop (pause, snapshot,
+        // kill, destroy) on this container and its clones indefinitely.
+        let log_conn = tokio::time::timeout(
+            LOG_FORWARD_CONNECT_TIMEOUT,
+            AsyncUtils::connect_agent(&self.sandbox_id),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "connect agent for log forwarding timed out after {}s",
+                LOG_FORWARD_CONNECT_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("connect agent for log forwarding failed:{}", e))?;
         let log_client = agent_ttrpc::AgentServiceClient::new(log_conn);
 
         // Write log files:
         //   - template creation: /data/log/template/<id>/stdout|stderr
-        //   - sandbox (restore): current working directory (bundle dir)
+        //   - regular sandbox: /data/cubelet/log/<sandbox-id>/stdout|stderr
         let (stdout_path, stderr_path) = if self.sb_conf.app_snapshot_create {
             validate_log_path_component(&self.info.id)?;
             let log_dir = format!("/data/log/template/{}", self.info.id);
@@ -611,7 +739,7 @@ impl Container {
             // already restrictive enough for log files.
             (format!("{}/stdout", log_dir), format!("{}/stderr", log_dir))
         } else {
-            ("stdout".to_string(), "stderr".to_string())
+            create_sandbox_log_paths(&self.sandbox_id).await?
         };
 
         // Init log forwarding is separate from exec I/O relay (forward_std).
@@ -637,16 +765,18 @@ impl Container {
             stderr_path
         );
 
-        // Create a watch cancel channel.  unset_client() sends true on the tx
-        // side; the rx is cloned into each of forward_stdout and forward_stderr
-        // so both loops wake and exit immediately via tokio::select!.
+        // Create a watch cancel channel.  The tx is stored in the log_forward
+        // slot; on stop (pause / snapshot / kill / destroy) `stop_log_forward`
+        // calls `LogForwardHandle::drain()`, which takes the tx and sends true.
+        // The rx is cloned into each of forward_init_log_stdout and
+        // forward_init_log_stderr so both loops wake and exit immediately via
+        // tokio::select!.
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let handle = log_exec
             .start_log_forward(log_client, self.log.clone(), cancel_rx)
             .await;
-        self.log_forward_handle = Some(Arc::new(handle));
-        self.log_forward_cancel = Some(cancel_tx);
+        self.log_forward.store(cancel_tx, handle).await;
 
         Ok(())
     }
@@ -1087,5 +1217,161 @@ impl Container {
 
     pub fn get_id(&self) -> String {
         self.id.clone()
+    }
+}
+
+#[cfg(test)]
+mod log_forward_tests {
+    use super::LogForwardHandle;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Spawn a task that mimics a log-forward loop: it runs until cancelled,
+    /// then records a clean exit.  This is what the pre-fix `abort()` fallback
+    /// used to skip.
+    async fn install_task(handle: &LogForwardHandle, drained: Arc<AtomicUsize>) {
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            loop {
+                if cancel_rx.changed().await.is_err() {
+                    return;
+                }
+                if *cancel_rx.borrow() {
+                    // Simulate the IO drain that pause/snapshot/destroy rely on.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    drained.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+        let _permit = handle.acquire().await;
+        handle.store(cancel_tx, task).await;
+    }
+
+    /// The core invariant of the fix: a task installed through the shared slot
+    /// is always drained to completion, even when a *clone* of the handle stops
+    /// it.  The pre-fix code fell back to `abort()` here and skipped the drain.
+    #[tokio::test]
+    async fn drain_completes_when_stopped_through_clone() {
+        let handle = LogForwardHandle::new();
+        let drained = Arc::new(AtomicUsize::new(0));
+
+        install_task(&handle, drained.clone()).await;
+
+        let clone = handle.clone();
+        let _permit = clone.acquire().await;
+        clone.drain().await;
+
+        assert_eq!(
+            drained.load(Ordering::SeqCst),
+            1,
+            "task must be awaited to a clean exit, not aborted"
+        );
+    }
+
+    /// Concurrent stops from two clones must serialize and both observe a clean
+    /// slot: exactly one drains the task, neither aborts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_stops_serialize_and_drain() {
+        let handle = LogForwardHandle::new();
+        let drained = Arc::new(AtomicUsize::new(0));
+
+        install_task(&handle, drained.clone()).await;
+
+        let a = handle.clone();
+        let b = handle.clone();
+        let stop_a = tokio::spawn(async move {
+            let _permit = a.acquire().await;
+            a.drain().await;
+        });
+        let stop_b = tokio::spawn(async move {
+            let _permit = b.acquire().await;
+            b.drain().await;
+        });
+        let (ra, rb) = tokio::join!(stop_a, stop_b);
+        ra.unwrap();
+        rb.unwrap();
+
+        assert_eq!(
+            drained.load(Ordering::SeqCst),
+            1,
+            "exactly one caller must drain the task to completion"
+        );
+    }
+
+    /// A stop arriving while a start holds the permit mid-connect must wait for
+    /// the start to install its task, then drain that task to completion — never
+    /// racing the half-built slot. This is the interleaving the semaphore
+    /// serializes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_waits_for_in_flight_start_then_drains() {
+        let handle = LogForwardHandle::new();
+        let drained = Arc::new(AtomicUsize::new(0));
+
+        // Simulate start_log_forward holding the permit through its connect
+        // before it stores a task: acquire the permit and keep it.
+        let start_permit = handle.acquire().await;
+
+        // A concurrent stop tries to acquire; it must block behind the start.
+        let stop_handle = handle.clone();
+        let stop_drained = drained.clone();
+        let stop = tokio::spawn(async move {
+            let _permit = stop_handle.acquire().await;
+            stop_handle.drain().await;
+            stop_drained.load(Ordering::SeqCst)
+        });
+
+        // Finish the start: install the task, then release the permit.
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let task_drained = drained.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                if cancel_rx.changed().await.is_err() {
+                    return;
+                }
+                if *cancel_rx.borrow() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    task_drained.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+        handle.store(cancel_tx, task).await;
+        drop(start_permit);
+
+        let observed = stop.await.unwrap();
+        assert_eq!(
+            observed, 1,
+            "stop must drain the task the start installed, not abort it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sandbox_log_path_tests {
+    use super::{sandbox_log_dir, SANDBOX_LOG_ROOT};
+
+    #[test]
+    fn sandbox_log_dir_joins_root() {
+        let dir = sandbox_log_dir("aabbccddeeff00112233445566778899").unwrap();
+        assert_eq!(
+            dir,
+            std::path::Path::new(SANDBOX_LOG_ROOT).join("aabbccddeeff00112233445566778899")
+        );
+    }
+
+    #[test]
+    fn sandbox_log_dir_rejects_traversal() {
+        assert!(sandbox_log_dir("../etc").is_err());
+        assert!(sandbox_log_dir("a/b").is_err());
+        assert!(sandbox_log_dir("").is_err());
+    }
+
+    #[test]
+    fn remove_sandbox_log_dir_sync_rejects_traversal() {
+        assert!(super::remove_sandbox_log_dir_sync("../etc").is_err());
+        assert!(super::remove_sandbox_log_dir_sync("a/b").is_err());
+        assert!(super::remove_sandbox_log_dir_sync("").is_err());
     }
 }
